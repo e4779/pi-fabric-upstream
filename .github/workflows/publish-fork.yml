@@ -23,8 +23,8 @@ jobs:
         run: bun install --frozen-lockfile
       - name: Install Bend (pinned, required by the prepack proof:check gate)
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.26/bend-2.0.26-linux-x64.tar.gz
-          echo "5edcc8e5c12d525655431ab02659ddf88e362aafbe7c7bb7f783a1ffaeb6165c  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.32/bend-2.0.32-linux-x64.tar.gz
+          echo "5c365ddb12954d0933cef751802e0f7d9875f842edcb80f9661f89cd1a9ff7b6  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
       - name: Set fork identity (@e4779/pi-fabric, version base-fork.<run_number>)
