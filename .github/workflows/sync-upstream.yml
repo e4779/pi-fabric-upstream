@@ -1,0 +1,43 @@
+name: Sync upstream
+
+# Keeps the fork current with upstream: merges upstream/main into the
+# fork's main on a daily schedule and pushes. The push then triggers
+# the existing "Publish fork" workflow, which republishes
+# @e4779/pi-fabric at the new upstream base version (-fork.<run_number>).
+# If the merge conflicts, this job fails red and needs a human.
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge upstream main (skip when already current)
+        run: |
+          git remote add upstream https://github.com/monotykamary/pi-fabric.git
+          git fetch upstream main
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          echo "upstream commits not in fork main: $BEHIND"
+          if [ "$BEHIND" = "0" ]; then
+            echo "Fork main is already current with upstream."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-edit upstream/main
+          git push origin main

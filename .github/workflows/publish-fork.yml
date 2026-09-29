@@ -1,0 +1,59 @@
+name: Publish fork
+
+# Publishes the fork to npm as @e4779/pi-fabric so pi can install a
+# prebuilt tarball (npm:@e4779/pi-fabric) instead of a git clone that
+# would need a manual build after every update. The unscoped name
+# "pi-fabric" belongs to upstream and cannot be published to.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+env:
+  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+      - name: Install Bend (pinned, required by the prepack proof:check gate)
+        run: |
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.26/bend-2.0.26-linux-x64.tar.gz
+          echo "5edcc8e5c12d525655431ab02659ddf88e362aafbe7c7bb7f783a1ffaeb6165c  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
+      - name: Set fork identity (@e4779/pi-fabric, version base-fork.<run_number>)
+        run: |
+          node -e "
+            const fs = require('fs');
+            const p = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            p.name = '@e4779/pi-fabric';
+            p.version = p.version + '-fork.${{ github.run_number }}';
+            fs.writeFileSync('package.json', JSON.stringify(p, null, 2));
+          "
+      - name: Publish (prepack runs typecheck + build)
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          npm publish --access public
+      - name: Verify the exact version landed in the registry
+        if: ${{ env.NPM_TOKEN != '' }}
+        run: |
+          V=$(node -e "console.log(JSON.parse(require('fs').readFileSync('package.json','utf8')).version)")
+          for i in $(seq 1 12); do
+            if npm view "@e4779/pi-fabric@$V" version --prefer-online 2>/dev/null | grep -q .; then
+              echo "verified: @e4779/pi-fabric@$V is in the registry"
+              exit 0
+            fi
+            echo "attempt $i: $V not visible yet; retrying in 60s"
+            sleep 60
+          done
+          echo "::error::@e4779/pi-fabric@$V not visible in the registry after 12 minutes"
+          exit 1
