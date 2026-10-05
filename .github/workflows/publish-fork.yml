@@ -18,13 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: package.json
       - uses: oven-sh/setup-bun@v2
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Install Bend (pinned, required by the prepack proof:check gate)
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.34/bend-2.0.34-linux-x64.tar.gz
-          echo "78106a97af242429dcc057258eb8d10f69cddebcd5e263022185a52d003e09bf  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
+          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.35/bend-2.0.35-linux-x64.tar.gz
+          echo "63039d1a119f716767ac5a7d8fe0717cfacf219c6c253c35192148e0dade722f  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
           tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
           echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
       - name: Set fork identity (@e4779/pi-fabric, version base-fork.<run_number>)
