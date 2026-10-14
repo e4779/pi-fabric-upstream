@@ -13,6 +13,9 @@ on:
 
 permissions:
   contents: write
+  # Sync merges may carry upstream changes to workflow files themselves;
+  # pushing those requires the workflows permission on top of contents.
+  workflows: write
 
 concurrency:
   group: sync-upstream
