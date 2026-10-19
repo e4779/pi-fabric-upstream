@@ -41,7 +41,7 @@ export class ActorMeshMonitor {
     }
     try {
       const watcher = fs.watch(this.mesh.root, { persistent: false }, (_event, filename) => {
-        const name = filename === null ? undefined : path.basename(filename.toString());
+        const name = filename == null ? undefined : path.basename(filename.toString());
         // schedules.json re-arms the due timer when another process schedules.
         if (name !== undefined && name !== "events.jsonl" && name !== "schedules.json") return;
         this.schedule();
