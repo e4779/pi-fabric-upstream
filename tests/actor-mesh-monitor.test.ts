@@ -51,6 +51,21 @@ describe("ActorMeshMonitor", () => {
     expect(JSON.parse(fs.readFileSync(s.cursorPath, "utf8"))).toEqual({ format: 1, cursor: 20 });
   });
 
+  it.skipIf(process.platform === "win32")("polls on a watch event without a filename, as Bun reports undefined", async () => {
+    const s = setup();
+    s.monitor.start();
+    await flush();
+    s.mesh.tail.mockClear();
+    // The mock records the (path, options, listener) overload the monitor calls.
+    const listener = (vi.mocked(fs.watch).mock.calls[0] as unknown[])[2] as (event: string, filename: string | null | undefined) => void;
+    expect(() => listener("rename", undefined)).not.toThrow();
+    await flush();
+    expect(s.mesh.tail).toHaveBeenCalledOnce();
+    listener("change", "unrelated.json");
+    await flush();
+    expect(s.mesh.tail).toHaveBeenCalledOnce();
+  });
+
   it.skipIf(process.platform === "win32")("falls back after watcher errors and closes timers and queued work", async () => {
     const s = setup();
     s.monitor.start();
