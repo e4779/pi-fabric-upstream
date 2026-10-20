@@ -12,10 +12,13 @@ on:
   workflow_dispatch: {}
 
 permissions:
+  # NOT `workflows: write`: that scope does not exist in workflow-file
+  # `permissions` (github/docs reusables/actions/github-token-available-permissions),
+  # and its presence made GitHub reject the whole file — every push got a
+  # zero-job "workflow file issue" failure (fcf4fe2..acade6d era). Merges that
+  # touch .github/workflows/ cannot be pushed by GITHUB_TOKEN at all; the
+  # merge step fails loudly for a human instead.
   contents: write
-  # Sync merges may carry upstream changes to workflow files themselves;
-  # pushing those requires the workflows permission on top of contents.
-  workflows: write
 
 concurrency:
   group: sync-upstream
@@ -43,4 +46,9 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git merge --no-edit upstream/main
+          if git diff --name-only ORIG_HEAD HEAD -- .github/workflows/ | grep -q .; then
+            echo "Merge touches .github/workflows/ — GITHUB_TOKEN cannot push workflow files."
+            echo "Sync manually: merge upstream/main on main and push from a machine with credentials."
+            exit 1
+          fi
           git push origin main
