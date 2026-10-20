@@ -2,6 +2,7 @@
 import { spawn } from "node:child_process";
 import module from "node:module";
 import { fileURLToPath } from "node:url";
+import { isOpenAiStreamingModuleUrl, patchOpenAiSseStreaming } from "./openai-sse-patch.js";
 import { parseDurableWorkerOptions } from "./worker-options.js";
 
 try {
@@ -35,6 +36,25 @@ try {
           return nextResolve(specifier, { ...context, parentURL: sdkEntry });
         }
         return nextResolve(specifier, context);
+      },
+      // Provider gateways in front of OpenAI-compatible endpoints (observed
+      // with GLM-5.2 behind ai-sbt-hub) send bare `data: \n\n` keepalives
+      // during long reasoning pauses; the SDK parses the empty payload and
+      // aborts the whole generation. Patch its streaming decoder in memory
+      // before it loads — no on-disk mutation.
+      load(url, context, nextLoad) {
+        const loaded = nextLoad(url, context);
+        if (loaded.source != null && isOpenAiStreamingModuleUrl(url)) {
+          try {
+            // The default load returns file contents as bytes, not a string.
+            const text = typeof loaded.source === "string" ? loaded.source : new TextDecoder().decode(loaded.source);
+            const patched = patchOpenAiSseStreaming(text);
+            if (patched.applied) loaded.source = patched.source;
+          } catch (error) {
+            process.stderr.write(`pi-fabric worker: openai SSE keepalive patch skipped: ${error instanceof Error ? error.message : String(error)}\n`);
+          }
+        }
+        return loaded;
       },
     });
     const { runDurableWorker } = await import("./worker-host.js");
