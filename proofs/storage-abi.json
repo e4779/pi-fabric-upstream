@@ -1,3 +1,0 @@
-{
-  "storageTransition": [["request", "StorageRequest"], ["slot", "StorageSlot"], "StoragePlan"]
-}

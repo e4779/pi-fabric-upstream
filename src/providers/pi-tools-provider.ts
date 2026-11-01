@@ -120,6 +120,8 @@ const MAX_REPLACE_ALL_FILE_CHARS = 2_000_000;
 
 interface PiToolsProviderHostCapabilities {
   requireCapturedOverrides?: boolean;
+  /** True when a host policy relies on Pi tool_call hooks; non-read tools then never run without them. */
+  requireToolHooks?: () => boolean;
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
   getShellHangMs?: () => number;
   shellJobs?: FabricShellJobStore;
@@ -257,6 +259,31 @@ const normalizeResult = (
 // Pi 0.99 reports ordinary shell exits through isError + structuredContent.
 type PiToolResult = AgentToolResult<unknown>;
 
+/**
+ * Emit a `tool_call` event for a nested call and throw when a hook blocks it.
+ * Hooks may mutate `input` in place. Shared by pi.* tools and by interactive
+ * sessions, so a command guard sees both through one code path.
+ */
+export async function emitToolCallPreflight(
+  runner: ExtensionRunner,
+  name: string,
+  input: Record<string, unknown>,
+  context: Pick<FabricInvocationContext, "signal" | "nestedToolCallId" | "parentToolCallId" | "updateArguments">,
+  blocked = `Pi tool ${name} was blocked`,
+): Promise<void> {
+  const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
+    type: "tool_call",
+    toolName: name,
+    toolCallId: context.nestedToolCallId,
+    parentToolCallId: context.parentToolCallId,
+    input,
+  }));
+  context.updateArguments?.(input);
+  if (preflight?.block) {
+    throw new Error(preflight.reason || blocked);
+  }
+}
+
 export class PiToolsProvider implements FabricProvider {
   readonly name = "pi";
   readonly #allowedTools = readChildToolAllowlist();
@@ -271,6 +298,7 @@ export class PiToolsProvider implements FabricProvider {
   readonly #shellJobs: FabricShellJobStore;
   readonly #ownsShellJobs: boolean;
   readonly #getShellHangMs: (() => number) | undefined;
+  readonly #requireToolHooks: (() => boolean) | undefined;
 
   constructor(
     cwd: string,
@@ -280,6 +308,7 @@ export class PiToolsProvider implements FabricProvider {
   ) {
     this.#cwd = cwd;
     this.#requireCapturedOverrides = hostCapabilities.requireCapturedOverrides === true;
+    this.#requireToolHooks = hostCapabilities.requireToolHooks;
     const powerShellFactory = hostCapabilities.powerShellToolDefinitionFactory;
     this.#powershellDefinitions = powerShellFactory
       ? new PowerShellCwdDefinitions(powerShellFactory)
@@ -417,6 +446,17 @@ export class PiToolsProvider implements FabricProvider {
       return expandReplaceAllEdit(this.#cwd, record, args.all === true);
     }
     return record;
+  }
+
+  /**
+   * Why a tool the parent has (built in or captured) is unavailable to this
+   * child, so the registry reports the allowlist instead of an unknown action.
+   */
+  notPermitted(name: string): string | undefined {
+    if (!this.#allowedTools || this.#allowedTools.has(name)) return undefined;
+    const known = (!this.#requireCapturedOverrides && this.#tools[name as PiCoreToolName] !== undefined)
+      || this.#catalog?.get(name) !== undefined;
+    return known ? `Pi tool ${name} is not permitted by this child's tool allowlist` : undefined;
   }
 
   #assertAllowed(name: string): void {
@@ -562,6 +602,10 @@ export class PiToolsProvider implements FabricProvider {
       throw error;
     }
     void job.readPid();
+    if (!background && context.extensionContext.mode === "tui") {
+      context.attachPreview?.({ shellBackgroundShortcut: true });
+      context.update(`${name}: running`);
+    }
     let spilled = false;
     const outcome = await raceShellHang({
       hangMs: background || context.nativeToolResult ? 0 : this.#shellHangMs(),
@@ -642,8 +686,9 @@ export class PiToolsProvider implements FabricProvider {
     // Running a mutating tool here would silently skip that preflight, so fail
     // closed for non-read tools and let the model retry once hooks are live.
     // The no-catalog path (tests, embeds) has no extension system to guard and
-    // keeps the direct-execute fallback below unchanged.
-    if (this.#catalog && !runner && !this.#requireCapturedOverrides && riskForTool(name) !== "read") {
+    // keeps the direct-execute fallback below unchanged, unless a host policy
+    // relies on those hooks: then a non-read tool never runs without them.
+    if ((this.#catalog || this.#requireToolHooks?.()) && !runner && !this.#requireCapturedOverrides && riskForTool(name) !== "read") {
       throw new Error(
         `Pi tool ${name} is unavailable until extension tool hooks initialize; retry once tools are ready`,
       );
@@ -725,17 +770,7 @@ export class PiToolsProvider implements FabricProvider {
     context: FabricInvocationContext,
     runner: ExtensionRunner,
   ): Promise<void> {
-    const preflight = await runAbortable(context.signal, () => runner.emitToolCall({
-      type: "tool_call",
-      toolName: name,
-      toolCallId: context.nestedToolCallId,
-      parentToolCallId: context.parentToolCallId,
-      input: args,
-    }));
-    context.updateArguments?.(args);
-    if (preflight?.block) {
-      throw new Error(preflight.reason || `Pi tool ${name} was blocked`);
-    }
+    await emitToolCallPreflight(runner, name, args, context);
   }
 
   // Replay the agent-core tool-execution lifecycle for a nested pi.* call, so
@@ -897,6 +932,9 @@ export class PiToolsProvider implements FabricProvider {
         : undefined;
     context.attachPreview?.({
       result: boundedProgress,
+      ...(isPiShellToolName(name) && context.extensionContext.mode === "tui" &&
+        args.background !== true && args.monitor === undefined && args.durable !== true
+        ? { shellBackgroundShortcut: true } : {}),
       ...(bashCommand !== undefined ? { bashCommand } : {}),
     });
     context.update(`${name}: ${boundedProgress.slice(-500) || "running"}`);

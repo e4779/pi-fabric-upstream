@@ -12,6 +12,14 @@ const defaults = {
   },
 };
 
+describe("holdQuestions", () => {
+  it("passes only a literal true through", () => {
+    expect(normalizeAgentRunRequest({ task: "t", holdQuestions: true }, defaults).holdQuestions).toBe(true);
+    expect(normalizeAgentRunRequest({ task: "t", holdQuestions: false }, defaults)).not.toHaveProperty("holdQuestions");
+    expect(normalizeAgentRunRequest({ task: "t" }, defaults)).not.toHaveProperty("holdQuestions");
+  });
+});
+
 describe("alias thinking levels", () => {
   it("applies an alias default when the run names the alias", () => {
     const request = normalizeAgentRunRequest({ task: "t", model: "shallow" }, defaults);

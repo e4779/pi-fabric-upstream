@@ -1,5 +1,9 @@
 import { defineConfig } from "vitest/config";
+import { clearInheritedFabricEnv } from "./scripts/test-env.js";
 import { isolatedTestTemp } from "./scripts/test-temp.js";
+
+// Workers fork from this process, so they never see a parent Fabric run.
+clearInheritedFabricEnv(process.env);
 
 export default defineConfig({
   test: {

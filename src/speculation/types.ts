@@ -19,6 +19,7 @@ export interface FabricSpeculationReplay {
   mediaNote?: string;
   updatedArgs?: Record<string, unknown>;
   preview?: unknown;
+  terminate?: true;
 }
 
 export interface FabricSpeculationStats {

@@ -12,23 +12,16 @@ export interface ShellTasksOptions {
   requestRender: () => void;
   rows: () => number;
   keys?: KeybindingsManager;
-  id?: string;
+  id: string;
 }
 
-const groupNames = ["Active", "Needs attention", "Finished"] as const;
-const taskGroup = (job: FabricShellJobInfo): number => job.finishedAt === undefined ? 0
-  : job.status === "failed" || job.status === "timed_out" ? 1 : 2;
 const elapsed = (job: FabricShellJobInfo): string => formatDuration((job.finishedAt ?? Date.now()) - job.startedAt) || "0s";
 const outputLine = (line: string): string => stripVTControlCharacters(line)
   .replace(/\t/g, "  ").replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "");
 
-/** Lazy inspector; the controller owns lifetime, this view owns no Pi runtime. */
+/** Lazy single-task detail. Task selection belongs to the footer list. */
 export class ShellTasksView implements Component {
-  #jobs: FabricShellJobInfo[] = [];
-  #selected: string | undefined;
-  #listStart = 0;
   #pageSize = 1;
-  #id: string | undefined;
   #output = "";
   #scroll = 0;
   #stopArmed: number | undefined;
@@ -39,24 +32,20 @@ export class ShellTasksView implements Component {
   #unsubscribe: () => void;
 
   constructor(readonly options: ShellTasksOptions) {
-    this.#id = options.id;
     this.#refresh();
-    if (!this.#id && this.#jobs.length === 1) this.#id = this.#jobs[0]!.id;
-    this.#selected = this.#id ?? this.#selected;
     this.#unsubscribe = options.jobs.subscribe(event => {
+      if (event.job.id !== options.id) return;
       this.#refresh();
-      if (event.job.id === this.#id) void this.#read();
+      void this.#read();
     });
     void this.#read();
   }
 
   #refresh(): void {
     if (this.#closed) return;
-    this.#jobs = this.options.jobs.list().filter(job => job.finishedAt === undefined || job.spilledAt !== undefined)
-      .sort((a, b) => taskGroup(a) - taskGroup(b) || b.startedAt - a.startedAt);
-    if (!this.#jobs.some(job => job.id === this.#selected)) this.#selected = this.#jobs[0]?.id;
-    const active = this.#jobs.some(job => job.finishedAt === undefined);
-    // Store events update metadata. Frames sample only the live in-memory tail, never disk logs.
+    const job = this.options.jobs.get(this.options.id)?.info();
+    const active = job !== undefined && job.finishedAt === undefined;
+    // Frames sample the selected task's live tail, never disk logs.
     if (active && !this.#timer) {
       this.#timer = setInterval(() => this.options.requestRender(), 250);
       this.#timer.unref?.();
@@ -68,17 +57,16 @@ export class ShellTasksView implements Component {
   }
 
   async #read(): Promise<void> {
-    const id = this.#id;
-    if (!id || this.#closed) return;
+    if (this.#closed) return;
     if (this.#reading) { this.#readAgain = true; return; }
-    const job = this.options.jobs.get(id);
+    const job = this.options.jobs.get(this.options.id);
     if (!job) { this.#output = "Task no longer retained."; return; }
     this.#reading = true;
     try {
       const output = await job.outputText();
-      if (!this.#closed && this.#id === id) this.#output = output;
+      if (!this.#closed) this.#output = output;
     } catch (error) {
-      if (!this.#closed && this.#id === id) this.#output = `Output unavailable: ${safeText(error instanceof Error ? error.message : error)}`;
+      if (!this.#closed) this.#output = `Output unavailable: ${safeText(error instanceof Error ? error.message : error)}`;
     } finally {
       this.#reading = false;
       if (!this.#closed) {
@@ -91,25 +79,10 @@ export class ShellTasksView implements Component {
   handleInput(data: string): void {
     if (this.#closed) return;
     const keys = this.options.keys ?? getKeybindings();
-    if (keys.matches(data, "tui.select.cancel")) {
-      if (!this.#id) { this.dispose(); this.options.done(); return; }
-      this.#id = undefined; this.#stopArmed = undefined; this.#refresh(); return;
-    }
-    if (!this.#id) {
-      const index = Math.max(0, this.#jobs.findIndex(job => job.id === this.#selected));
-      let next = index;
-      if (keys.matches(data, "tui.select.up")) next = index === 0 ? this.#jobs.length - 1 : index - 1;
-      else if (keys.matches(data, "tui.select.down")) next = index === this.#jobs.length - 1 ? 0 : index + 1;
-      else if (keys.matches(data, "tui.select.pageUp")) next = Math.max(0, index - this.#pageSize);
-      else if (keys.matches(data, "tui.select.pageDown")) next = Math.min(this.#jobs.length - 1, index + this.#pageSize);
-      else if (keys.matches(data, "tui.select.confirm") && this.#selected) {
-        this.#id = this.#selected; this.#output = ""; this.#scroll = 0; this.#stopArmed = undefined;
-        void this.#read();
-      }
-      this.#selected = this.#jobs[next]?.id;
-    } else if (data === "x") {
+    if (keys.matches(data, "tui.select.cancel")) { this.dispose(); this.options.done(); return; }
+    if (data === "x") {
       const now = Date.now();
-      const job = this.options.jobs.get(this.#id);
+      const job = this.options.jobs.get(this.options.id);
       if (job && !job.finished) {
         if (this.#stopArmed !== undefined && now - this.#stopArmed < 3000) { job.stop(); this.#stopArmed = undefined; }
         else this.#stopArmed = now;
@@ -126,52 +99,16 @@ export class ShellTasksView implements Component {
   }
 
   #status(job: FabricShellJobInfo): string {
-    const { theme } = this.options;
+    const failed = job.status === "failed" || job.status === "timed_out";
     const active = job.finishedAt === undefined;
-    const color = job.stopping ? "warning" : active ? "accent" : taskGroup(job) === 1 ? "error" : job.status === "exited" ? "success" : "dim";
-    const glyph = active ? spinnerFrame() : taskGroup(job) === 1 ? "✗" : job.status === "exited" ? "✓" : "■";
-    return theme.fg(color, `${glyph} ${job.stopping ? "stopping" : job.status}`);
+    const color = job.stopping ? "warning" : active ? "accent" : failed ? "error" : job.status === "exited" ? "success" : "dim";
+    const glyph = active ? spinnerFrame() : failed ? "✗" : job.status === "exited" ? "✓" : "■";
+    return this.options.theme.fg(color, `${glyph} ${job.stopping ? "stopping" : job.status}`);
   }
 
   #section(label: string, width: number): string {
     const title = truncateToWidth(` ${label} `, width);
     return this.options.theme.fg("borderMuted", title + "─".repeat(Math.max(0, width - visibleWidth(title))));
-  }
-
-  #overview(width: number, height: number): string[] {
-    const { theme } = this.options;
-    if (!this.#jobs.length) return [theme.fg("muted", "No background shell tasks."), theme.fg("dim", "Detached commands and monitors appear here.")].slice(0, height);
-    const selected = Math.max(0, this.#jobs.findIndex(job => job.id === this.#selected));
-    const counts = groupNames.map((_, group) => this.#jobs.filter(job => taskGroup(job) === group).length);
-    const compact = height < 4;
-    const rowSize = compact ? 1 : 2;
-    const window = (start: number): { rows: string[]; end: number } => {
-      const rows: string[] = [];
-      let previousGroup = -1, end = start;
-      for (let index = start; index < this.#jobs.length; index++) {
-        const job = this.#jobs[index]!;
-        const group = taskGroup(job);
-        const heading = !compact && group !== previousGroup;
-        if (rows.length + rowSize + Number(heading) > height) break;
-        if (heading) rows.push(this.#section(`${groupNames[group]} · ${counts[group]}`, width));
-        const chosen = job.id === this.#selected;
-        const title = safeText(job.description || job.command) || "Shell task";
-        const primary = `${chosen ? theme.fg("accent", "›") : " "} ${this.#status(job)}  ${theme.fg(chosen ? "accent" : "text", title)}`;
-        rows.push(chosen ? theme.bg("selectedBg", padToWidth(primary, width)) : truncateToWidth(primary, width));
-        if (!compact) {
-          const monitor = job.monitor ? ` · monitor:${job.monitor.delivery}` : "";
-          const exit = job.exitCode != null ? ` · exit ${job.exitCode}` : "";
-          rows.push(theme.fg("dim", `  ${job.id.slice(0, 8)} · ${job.tool} · ${elapsed(job)}${exit}${monitor}`));
-        }
-        previousGroup = group; end = index + 1;
-      }
-      return { rows, end };
-    };
-    this.#listStart = Math.min(this.#listStart, selected);
-    let page = window(this.#listStart);
-    while (page.end <= selected && this.#listStart < selected) page = window(++this.#listStart);
-    this.#pageSize = Math.max(1, page.end - this.#listStart);
-    return page.rows;
   }
 
   #detail(job: FabricShellJobInfo, width: number, height: number): string[] {
@@ -213,23 +150,22 @@ export class ShellTasksView implements Component {
     if (width <= 0) return [];
     const { theme } = this.options;
     const height = Math.max(1, Math.floor(this.options.rows() * 0.8));
-    const job = this.#id ? this.options.jobs.get(this.#id)?.info() : undefined;
-    const armed = job?.finishedAt === undefined && this.#stopArmed !== undefined && Date.now() - this.#stopArmed < 3000;
-    const hint = !this.#id ? "↑↓ select · enter inspect · esc close"
-      : armed ? "Press x again to stop this task · esc back"
-      : width < 70 ? `↑↓ · G tail${job?.finishedAt === undefined ? " · x×2 stop" : ""} · esc` : `↑↓/pg scroll · G tail${job?.finishedAt === undefined ? " · x twice stop" : ""} · esc tasks`;
-    if (width < 8 || height < 7) return ["Fabric · shell tasks", hint].slice(0, height).map(row => truncateToWidth(row, width));
+    const job = this.options.jobs.get(this.options.id)?.info();
+    const active = job !== undefined && job.finishedAt === undefined;
+    const armed = active && this.#stopArmed !== undefined && Date.now() - this.#stopArmed < 3000;
+    const hint = armed ? "Press x again to stop this task · esc close"
+      : width < 70 ? `↑↓ · G tail${active ? " · x×2 stop" : ""} · esc`
+      : `↑↓/pg scroll · G tail${active ? " · x twice stop" : ""} · esc close`;
+    const title = `Fabric · task ${this.options.id}`;
+    if (width < 8 || height < 7) return [title, hint].slice(0, height).map(row => truncateToWidth(row, width));
     const inner = width - 4;
     const border = (text: string) => theme.fg("borderMuted", text);
     const row = (text: string) => `${border("│")} ${padToWidth(text, inner)} ${border("│")}`;
-    const title = truncateToWidth(this.#id ? `Fabric · task ${this.#id}` : "Fabric · shell tasks", width - 6);
-    const top = border("╭─") + ` ${theme.fg("accent", title)} ` + border("─".repeat(Math.max(0, width - visibleWidth(title) - 6)) + "─╮");
-    const counts = groupNames.map((name, group) => `${this.#jobs.filter(task => taskGroup(task) === group).length} ${name.toLowerCase()}`);
-    const index = this.#jobs.findIndex(task => task.id === this.#selected);
-    const summary = this.#id ? job ? `${this.#status(job)} · Elapsed ${elapsed(job)}${job.exitCode !== undefined ? ` · exit ${job.exitCode}` : ""}` : "Task no longer retained."
-      : `${counts.join(" · ")}${index >= 0 ? ` · ${index + 1}/${this.#jobs.length}` : ""}`;
+    const heading = truncateToWidth(title, width - 6);
+    const top = border("╭─") + ` ${theme.fg("accent", heading)} ` + border("─".repeat(Math.max(0, width - visibleWidth(heading) - 6)) + "─╮");
+    const summary = job ? `${this.#status(job)} · Elapsed ${elapsed(job)}${job.exitCode !== undefined ? ` · exit ${job.exitCode}` : ""}` : "Task no longer retained.";
     const bodyHeight = height - 6;
-    const body = this.#id ? job ? this.#detail(job, inner, bodyHeight) : ["Task no longer retained."] : this.#overview(inner, bodyHeight);
+    const body = job ? this.#detail(job, inner, bodyHeight) : ["Task no longer retained."];
     while (body.length < bodyHeight) body.push("");
     const separator = border(`├${"─".repeat(width - 2)}┤`);
     return [top, row(summary), separator, ...body.map(row), separator, row(theme.fg(armed ? "warning" : "dim", hint)), border(`╰${"─".repeat(width - 2)}╯`)];

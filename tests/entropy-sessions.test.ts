@@ -157,12 +157,15 @@ describe("async session pipeline", () => {
     const files = machineSessionFiles(agentDir, "/repo");
     expect(await machineSessionFilesAsync(agentDir, "/repo")).toEqual(files);
     const expectedEvidence = sessionWindowEvidence(files);
+    // setImmediate runs after the event loop's next poll phase, so it fires
+    // exactly when the read yields to real I/O. A 0 ms timer has a 1 ms floor
+    // and loses that race whenever the reads finish within a millisecond.
     let eventLoopAdvanced = false;
-    const timer = setTimeout(() => {
+    const immediate = setImmediate(() => {
       eventLoopAdvanced = true;
-    }, 0);
+    });
     const evidence = await sessionWindowEvidenceAsync(files);
-    clearTimeout(timer);
+    clearImmediate(immediate);
     expect(eventLoopAdvanced).toBe(true);
     expect(evidence).toEqual(expectedEvidence);
     expect(await measureSessionCorpusAsync({ files })).toEqual(measureSessionCorpus({ files }));

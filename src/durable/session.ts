@@ -10,6 +10,7 @@ import {
   type CreateAgentSessionOptions, type ExtensionRunner,
 } from "@earendil-works/pi-coding-agent";
 import { DurableAgent } from "./agent.js";
+import { resolveNativeToolSelection } from "../core/child-tool-allowlist.js";
 
 const absolute = (path: string) => resolve(path === "~" ? homedir() : path.startsWith("~/") ? join(homedir(), path.slice(2)) : path);
 
@@ -21,7 +22,7 @@ const absolute = (path: string) => resolve(path === "~" ? homedir() : path.start
  * Storage is borrowed; close settles this host but does not close its storage.
  */
 export async function createDurableAgentSession(
-  options: CreateAgentSessionOptions & { storage: Storage; runId: string },
+  options: CreateAgentSessionOptions & { storage: Storage; runId: string; fabricJournalDirectory?: string },
 ): Promise<{ session: AgentSession; agent: DurableAgent; close(): Promise<void> }> {
   if (!options.runId.trim()) throw new Error("A durable session requires a non-empty runId");
   const cwd = absolute(options.cwd ?? options.sessionManager?.getCwd() ?? process.cwd());
@@ -136,21 +137,25 @@ export async function createDurableAgentSession(
       return typeof value === "function" ? value.bind(target) : value;
     },
   });
-  const agent = new DurableAgent({ ...agentOptions, models: modelRuntime, storage: borrowedStorage, runId: options.runId });
+  const agent = new DurableAgent({
+    ...agentOptions, models: modelRuntime, storage: borrowedStorage, runId: options.runId,
+    ...(options.fabricJournalDirectory ? { fabricJournalDirectory: options.fabricJournalDirectory } : {}),
+  });
   try {
     if (!hasHistory) sessionManager.appendModelChange(model.provider, model.id);
     if (!hasHistory || !hasThinking) sessionManager.appendThinkingLevelChange(thinkingLevel);
     const excluded = new Set(options.excludeTools);
+    const selection = resolveNativeToolSelection(options.tools,
+      settingsManager.getDefaultTools() ?? ["read", "bash", "edit", "write"], options.noTools);
     const session = new AgentSession({
       agent, cwd, sessionManager, settingsManager, resourceLoader, modelRuntime,
       extensionRunnerRef,
       ...(options.customTools ? { customTools: options.customTools } : {}),
       ...(options.scopedModels ? { scopedModels: options.scopedModels } : {}),
       ...(options.sessionStartEvent ? { sessionStartEvent: options.sessionStartEvent } : {}),
-      initialActiveToolNames: (options.tools ?? (options.noTools ? [] : settingsManager.getDefaultTools() ?? ["read", "bash", "edit", "write"]))
-        .filter(name => !excluded.has(name)),
+      initialActiveToolNames: selection.active.filter(name => !excluded.has(name)),
       usesDefaultTools: options.tools === undefined && !options.noTools,
-      ...(options.tools || options.noTools === "all" ? { allowedToolNames: options.tools ?? [] } : {}),
+      ...(selection.allowed ? { allowedToolNames: selection.allowed } : {}),
       ...(options.excludeTools ? { excludedToolNames: options.excludeTools } : {}),
     });
     agent.recoverHistory = messages => {

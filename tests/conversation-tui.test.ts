@@ -4,7 +4,7 @@ import { createInteractiveTuiReference } from "../node_modules/@earendil-works/p
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { Editor, Text, TuiAltScreen, TuiMainScreen, stripTerminalSequences, visibleWidth, type OverlayHandle, type Terminal } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
-import { FabricConversationState, FabricConversationView, type FabricConversationTarget } from "../src/ui/conversation.js";
+import { FabricConversationState, FabricConversationView } from "../src/ui/conversation.js";
 import { nativeTranscript, userMessage, assistantMessage } from "./fixtures/native-conversation.js";
 import { installFabricEscapeHalt } from "../src/ui/escape-halt.js";
 
@@ -40,59 +40,53 @@ const theme = {
 
 describe("conversation through the real Pi TUI", () => {
   it.each([["main screen", TuiMainScreen], ["alternate screen", TuiAltScreen]] as const)(
-    "keeps the grouped picker stable during live updates and reorders on reopening (%s)", async (_name, Renderer) => {
+    "selects footer text and double/triple-clicks chat without touching Main (%s)", async (_name, Renderer) => {
       initTheme("dark", false);
       const terminal = new ProbeTerminal();
+      terminal.columns = 140;
       const tui = new Renderer(terminal);
-      tui.addChild(new Text("PRIVATE MAIN"));
+      const main = new Text("PRIVATE MAIN RESPONSE");
+      tui.addChild(main);
+      const copy = vi.fn(async (_text: string) => {});
+      const target = { id: "child", name: "Child", kind: "agent" as const, status: "completed",
+        model: "openai/gpt-6.1-sol", thinking: "high", cwd: "/repo/child",
+        canSteer: false, canFollowUp: false, canStop: false };
       const state = new FabricConversationState();
-      const targets: FabricConversationTarget[] = [
-        { id: "main", name: "Main", kind: "main", status: "idle", updatedAt: 20, canSteer: false, canFollowUp: false, canStop: false },
-        { id: "child", name: "Child", kind: "agent", status: "running", updatedAt: 30, canSteer: true, canFollowUp: true, canStop: true },
-        { id: "other", name: "Other", kind: "agent", status: "completed", updatedAt: 40, canSteer: false, canFollowUp: false, canStop: false },
-      ];
-      const close = vi.fn();
       const view = new FabricConversationView(createInteractiveTuiReference(() => tui), theme, {
-        state, initialTargetId: "child", targets: () => targets,
-        transcript: () => nativeTranscript([]),
+        state, initialTargetId: "child", targets: () => [target],
+        transcript: () => nativeTranscript([assistantMessage("child response")]),
         loadOlder: () => false, loadNewer: () => false, loadLatest: () => false,
-        send: vi.fn(), stop: vi.fn(), close,
+        copyToClipboard: copy, send: vi.fn(), stop: vi.fn(), close: vi.fn(),
       });
-      const frame = () => view.render(terminal.columns).map(stripTerminalSequences);
       tui.start();
       const handle = tui.showOverlay(view, { width: "100%", maxHeight: "100%", anchor: "top-left", margin: 0 });
+      const pointer = (type: "press" | "release" | "drag", x: number, y: number) =>
+        terminal.input(`\x1b[<${type === "drag" ? 32 : 0};${x + 1};${y + 1}${type === "release" ? "m" : "M"}`);
       try {
-        terminal.input("\x0e");
-        await vi.waitFor(() => expect(terminal.output).toContain("Inactive"));
-        const before = frame();
-        const selectedRow = before.findIndex((line) => line.includes("→ Child"));
-        const inactiveRow = before.findIndex((line) => line.trim() === "Inactive");
-        expect(before.findIndex((line) => line.includes("Main (native session)"))).toBeLessThan(inactiveRow);
-        Object.assign(targets[1]!, { status: "completed", updatedAt: 100 });
-        Object.assign(targets[2]!, { status: "running", updatedAt: 200 });
-        expect(view.refresh()).toBe(true);
-        tui.requestRender();
-        const updated = frame();
-        expect(updated[selectedRow]).toContain("→ Child (agent · completed)");
-        expect(updated[inactiveRow]).toBe(before[inactiveRow]);
-        expect(updated.findIndex((line) => line.includes("Other (agent · running)"))).toBeGreaterThan(inactiveRow);
-        terminal.input("\x1b[B");
-        terminal.input("\x1b[B");
-        terminal.input("\r");
-        expect(state.selectedId).toBe("other");
-        terminal.input("\x0e");
-        const reopened = frame();
-        expect(reopened.findIndex((line) => line.includes("→ Other"))).toBeLessThan(reopened.findIndex((line) => line.trim() === "Inactive"));
-        expect(reopened.findIndex((line) => line.includes("Child (agent · completed)"))).toBeGreaterThan(reopened.findIndex((line) => line.trim() === "Inactive"));
-        terminal.input("main");
-        terminal.input("\r");
-        expect(close).toHaveBeenCalledTimes(1);
-      } finally {
-        view.dispose();
-        handle.hide();
-        state.clear();
-        tui.stop();
-      }
+        await vi.waitFor(() => expect(terminal.output).toContain("child response"));
+        const frame = view.render(terminal.columns).map(stripTerminalSequences);
+        const footerY = frame.findIndex(line => line.includes("(openai) gpt-6.1-sol"));
+        const footerX = frame[footerY]!.indexOf("(openai)");
+        pointer("press", footerX, footerY);
+        pointer("drag", footerX + 8, footerY);
+        pointer("release", footerX + 8, footerY);
+        await vi.waitFor(() => expect(copy).toHaveBeenCalledWith("(openai)"));
+        // A live footer update cannot change the pinned text being copied.
+        target.model = "another/model";
+        expect(view.render(terminal.columns).map(stripTerminalSequences)[footerY]).toContain("(openai)");
+        terminal.input("\x03");
+        await vi.waitFor(() => expect(copy).toHaveBeenCalledTimes(2));
+        terminal.input("\x1b");
+        const chatFrame = view.render(terminal.columns).map(stripTerminalSequences);
+        const chatY = chatFrame.findIndex(line => line.includes("child response"));
+        const chatX = chatFrame[chatY]!.indexOf("child response") + 1;
+        for (let i = 0; i < 2; i++) { pointer("press", chatX, chatY); pointer("release", chatX, chatY); }
+        await vi.waitFor(() => expect(copy).toHaveBeenCalledWith("child"));
+        pointer("press", chatX, chatY); pointer("release", chatX, chatY);
+        await vi.waitFor(() => expect(copy.mock.calls.some(([text]) => text.trim() === "child response")).toBe(true));
+        expect(copy.mock.calls.every(([text]) => !text.includes("PRIVATE MAIN"))).toBe(true);
+        expect(tui.children).toEqual([main]);
+      } finally { view.dispose(); handle.hide(); state.clear(); tui.stop(); }
     },
   );
   it.each([["main screen", TuiMainScreen], ["alternate screen", TuiAltScreen]] as const)(

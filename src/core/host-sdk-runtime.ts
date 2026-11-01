@@ -6,4 +6,4 @@ import { loadHostSdk } from "./host-sdk.js";
  * (see loadHostSdk); awaiting here keeps every importer's own scope
  * synchronous. Never reach this module from the startup graph.
  */
-export const PiCodingAgent = await loadHostSdk();
+export const PiCodingAgent: typeof import("@earendil-works/pi-coding-agent") = await loadHostSdk();

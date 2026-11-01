@@ -332,7 +332,7 @@ export class SchemaController {
       const baseline = snapshotWorkspace(this.cwd, [this.mesh.root]);
       const consumption = consume(certificate.status === "active");
       assertCertificateFacts([
-        { valid: consumption.fst, error: `Schema certificate is ${certificate.status}` },
+        { valid: consumption.released, error: `Schema certificate is ${certificate.status}` },
         { valid: certificate.hypothesisId === input.hypothesisId, error: "Schema certificate is bound to a different hypothesis" },
         { valid: certificate.parentToolCallId === context.parentToolCallId, error: "Schema artifact belongs to a different fabric_exec invocation" },
         { valid: Number.isFinite(certificate.expiresAt) && Date.now() <= certificate.expiresAt, error: "Schema certificate expired" },
@@ -378,7 +378,7 @@ export class SchemaController {
 
       await this.mesh.put({
         key: certificateEntry.key,
-        value: { ...certificate, status: consumption.snd ? "active" : "consumed", consumedAt: Date.now() },
+        value: { ...certificate, status: consumption.active ? "active" : "consumed", consumedAt: Date.now() },
         ifVersion: certificateEntry.version,
         identity: this.identity,
       });

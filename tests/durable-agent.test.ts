@@ -1,12 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdtemp, readdir, rm, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, mkdtemp, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import { fauxProvider, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai/providers/faux";
-import { Type, getCurrentTools } from "@earendil-works/pi-ai";
+import { Type, getCurrentTools, type ToolResultMessage } from "@earendil-works/pi-ai";
 import { MemoryStorage, type Storage } from "@earendil-works/pi-durable";
 import { openNodeJsonlStorage } from "@earendil-works/pi-durable/storage/jsonl/node";
 import { Agent, type AgentEvent, type AgentTool } from "@earendil-works/pi-agent-core";
@@ -16,14 +17,48 @@ const agents: DurableAgent[] = [];
 const dirs: string[] = [];
 afterEach(async () => { await Promise.all(agents.splice(0).map(a => a.close().catch(() => {}))); await Promise.all(dirs.splice(0).map(d => rm(d, { recursive: true, force: true }))); });
 function deferred() { let resolve!: () => void; const promise = new Promise<void>(r => { resolve = r; }); return { promise, resolve }; }
-function setup(storage: Storage = new MemoryStorage(), tools: AgentTool[] = [], tokenSize?: { min: number; max: number }) {
+function setup(storage: Storage = new MemoryStorage(), tools: AgentTool[] = [], tokenSize?: { min: number; max: number }, fabricJournalDirectory?: string) {
   const faux = fauxProvider({ tokensPerSecond: Infinity, ...(tokenSize ? { tokenSize } : {}) });
   const models = createModels(); models.setProvider(faux.provider);
-  const agent = new DurableAgent({ models, storage, runId: "run-one", streamFn: models.streamSimple.bind(models), initialState: { model: faux.getModel(), tools, systemPrompt: "Be helpful" } });
+  const agent = new DurableAgent({ models, storage, runId: "run-one", streamFn: models.streamSimple.bind(models), initialState: { model: faux.getModel(), tools, systemPrompt: "Be helpful" }, ...(fabricJournalDirectory ? { fabricJournalDirectory } : {}) });
   agents.push(agent);
   return { agent, faux, models };
 }
 const tool = (execute: AgentTool["execute"]): AgentTool => ({ name: "effect", label: "Effect", description: "effect", parameters: Type.Object({}), execute });
+// Fabric reads the fence through this process-global key, never through an import.
+type Fence = { toolCallId: string; accept(): Promise<void>; arm(): Promise<void>; journal?: { path: string; digest?: string; accept(digest: string): Promise<void> } };
+const fenceStore = () => (globalThis as { [key: symbol]: unknown })[Symbol.for("pi-fabric.durable-tool-fence.v1")] as AsyncLocalStorage<Fence> | undefined;
+// Interrupts the first `crashes` attempts of one fabric_exec call, then recovers.
+async function interruptFabricExec(step: (fence: Fence | undefined) => Promise<void>, crashes = 1, journals = false) {
+  const dir = await mkdtemp(join(tmpdir(), "durable-agent-")); dirs.push(dir);
+  const journalDirectory = journals ? join(dir, "fabric-journal") : undefined;
+  let entered = deferred(); const seen: (Fence | undefined)[] = [];
+  const program: AgentTool = { ...tool(async (_id, _args, signal) => {
+    seen.push(fenceStore()?.getStore());
+    if (seen.length > crashes) return { content: [{ type: "text", text: "rerun" }], details: {} };
+    await step(seen.at(-1)); entered.resolve();
+    await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }));
+    return { content: [{ type: "text", text: "late" }], details: {} };
+  }), name: "fabric_exec" };
+  const first = setup(await openNodeJsonlStorage(dir, BACKGROUND_CONTEXT), [program], undefined, journalDirectory);
+  first.faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", {}, { id: "program" }), { stopReason: "toolUse" })]);
+  const run = first.agent.prompt("do it").catch(() => {});
+  await entered.promise; await first.agent.close(); await run;
+  for (let attempt = 1; attempt < crashes; attempt++) {
+    entered = deferred();
+    const again = setup(await openNodeJsonlStorage(dir, BACKGROUND_CONTEXT), [program], undefined, journalDirectory);
+    again.faux.setResponses([fauxAssistantMessage("recovered")]);
+    const resumed = again.agent.prompt("do it").catch(() => {});
+    // A missing rerun settles the prompt instead of reaching the tool.
+    await Promise.race([entered.promise, resumed]); await again.agent.close(); await resumed;
+  }
+  const second = setup(await openNodeJsonlStorage(dir, BACKGROUND_CONTEXT), [program], undefined, journalDirectory);
+  second.faux.setResponses([fauxAssistantMessage("recovered")]);
+  await second.agent.prompt("do it");
+  const results = second.agent.state.messages.filter((m): m is ToolResultMessage => m.role === "toolResult");
+  await second.agent.close();
+  return { seen, results };
+}
 const journalBytes = async (dir: string) => {
   let total = 0;
   for (const name of await readdir(dir)) total += (await stat(join(dir, name))).size;
@@ -231,6 +266,29 @@ describe("DurableAgent", () => {
     expect(seen.filter(s => s === "finish")).toHaveLength(2);
   });
 
+  it("accepts request tools rebuilt as same-name objects and runs the registered one", async () => {
+    const stale = vi.fn(async () => ({ content: [{ type: "text" as const, text: "stale" }], details: {} }));
+    const current = vi.fn(async () => ({ content: [{ type: "text" as const, text: "current" }], details: {} }));
+    const { agent, faux } = setup(new MemoryStorage(), [tool(stale)]);
+    // A tool loadout refresh replaces every tool object while the request context still holds the old ones.
+    agent.prepareRequest = ({ context }) => { agent.state.tools = [tool(current)]; return { context }; };
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("effect", {}), { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+    await agent.prompt("go");
+    expect(agent.state.errorMessage).toBeUndefined();
+    expect(current).toHaveBeenCalledOnce();
+    expect(stale).not.toHaveBeenCalled();
+  });
+
+  it("refuses request tools whose name is not registered", async () => {
+    const { agent, faux } = setup(new MemoryStorage(), [tool(async () => ({ content: [], details: {} }))]);
+    const anonymous: AgentTool = { ...tool(async () => ({ content: [], details: {} })), name: "anonymous" };
+    agent.prepareRequest = ({ context }) => ({ context: { ...context, tools: [...(context.tools ?? []), anonymous] } });
+    faux.setResponses([fauxAssistantMessage("done")]);
+    await agent.prompt("go");
+    expect(agent.state.errorMessage).toBe("Durable request tools must be registered in agent.state.tools");
+    expect(faux.state.callCount).toBe(0);
+  });
+
   it("steers after tools and drains followups before idle", async () => {
     const { agent, faux } = setup();
     let n = 0;
@@ -269,6 +327,114 @@ describe("DurableAgent", () => {
     expect(second.agent.state.messages.filter(m => m.role === "user")).toHaveLength(1);
     expect(second.agent.state.messages.some(m => m.role === "toolResult" && m.isError)).toBe(true);
     await second.agent.close();
+  });
+
+  it("reruns an interrupted fabric_exec that accepted its fence and never armed it", async () => {
+    const { seen, results } = await interruptFabricExec(async fence => { await fence!.accept(); });
+    expect(seen).toHaveLength(2);
+    expect(seen[0]).toMatchObject({ toolCallId: "program" });
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "rerun" }] });
+  });
+
+  it("never reruns an interrupted fabric_exec after it armed its fence", async () => {
+    const { seen, results } = await interruptFabricExec(async fence => { await fence!.accept(); await fence!.arm(); });
+    expect(seen).toHaveLength(1);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ isError: true, details: { interrupted: true } });
+  });
+
+  it("never reruns an interrupted fabric_exec that did not accept its fence", async () => {
+    const { seen, results } = await interruptFabricExec(async () => {});
+    expect(seen[0]).toMatchObject({ toolCallId: "program" });
+    expect(seen).toHaveLength(1);
+    expect(results[0]).toMatchObject({ isError: true, details: { interrupted: true } });
+  });
+
+  it("reruns an interrupted fabric_exec at most once", async () => {
+    const { seen, results } = await interruptFabricExec(async fence => { await fence!.accept(); }, 2);
+    expect(seen).toHaveLength(2);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ isError: true, details: { interrupted: true } });
+  });
+
+  it("offers fabric_exec a private journal path and resumes it with the recorded digest", async () => {
+    const digest = "d".repeat(64);
+    const { seen, results } = await interruptFabricExec(async fence => { await fence!.accept(); await fence!.journal!.accept(digest); }, 1, true);
+    expect(seen).toHaveLength(2);
+    const [first, second] = seen;
+    expect(first!.journal).toMatchObject({ path: expect.stringMatching(/fabric-journal[/\\][0-9a-f]{32}\.jsonl$/) });
+    expect(first!.journal!.digest).toBeUndefined();
+    expect(second!.journal).toMatchObject({ path: first!.journal!.path, digest });
+    // A Fabric that cannot resume from a journal must not rerun the program from the start.
+    await expect(second!.accept()).rejects.toThrow("cannot resume an interrupted fabric_exec from its journal");
+    expect(results[0]).toMatchObject({ isError: false, content: [{ type: "text", text: "rerun" }] });
+  });
+
+  it("resumes a journaled fabric_exec even after it armed, but at most three times", async () => {
+    // Like Fabric: accept and record a journal on the first attempt, resume from it after.
+    const armed = async (fence: Fence | undefined) => {
+      if (fence!.journal!.digest === undefined) { await fence!.accept(); await fence!.journal!.accept("e".repeat(64)); }
+      await fence!.arm();
+    };
+    const resumed = await interruptFabricExec(armed, 3, true);
+    expect(resumed.seen).toHaveLength(4);
+    expect(resumed.results[0]).toMatchObject({ isError: false });
+    const exhausted = await interruptFabricExec(armed, 4, true);
+    expect(exhausted.seen).toHaveLength(4);
+    expect(exhausted.results[0]).toMatchObject({ isError: true, details: { interrupted: true } });
+  });
+
+  it("deletes the fabric_exec journal once its result is committed, on success and after a resume", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "durable-agent-")); dirs.push(dir);
+    const journalDirectory = join(dir, "fabric-journal");
+    const paths: string[] = [];
+    const program: AgentTool = { ...tool(async () => {
+      const offer = fenceStore()!.getStore()!.journal!;
+      paths.push(offer.path);
+      await mkdir(journalDirectory, { recursive: true }); await writeFile(offer.path, "secret tool output\n");
+      return { content: [{ type: "text", text: "done" }], details: {} };
+    }), name: "fabric_exec" };
+    const { agent, faux } = setup(await openNodeJsonlStorage(dir, BACKGROUND_CONTEXT), [program], undefined, journalDirectory);
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", {}, { id: "program" }), { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+    await agent.prompt("go");
+    expect(paths).toHaveLength(1);
+    expect(existsSync(paths[0]!)).toBe(false);
+
+    // An interrupted call keeps its journal until the resumed result commits.
+    const resumed = await interruptFabricExec(async fence => {
+      await fence!.accept(); await fence!.journal!.accept("d".repeat(64));
+      await mkdir(join(fence!.journal!.path, ".."), { recursive: true }); await writeFile(fence!.journal!.path, "secret\n");
+      paths.push(fence!.journal!.path);
+    }, 1, true);
+    expect(resumed.seen[1]!.journal).toMatchObject({ path: paths[1], digest: "d".repeat(64) });
+    expect(resumed.results).toHaveLength(1);
+    expect(existsSync(paths[1]!)).toBe(false);
+  });
+
+  it("deletes the fabric_exec journal when the call is aborted", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "durable-agent-")); dirs.push(dir);
+    const journalDirectory = join(dir, "fabric-journal");
+    const entered = deferred(); let file = "";
+    const program: AgentTool = { ...tool(async (_id, _args, signal) => {
+      file = fenceStore()!.getStore()!.journal!.path;
+      await mkdir(journalDirectory, { recursive: true }); await writeFile(file, "secret tool output\n");
+      entered.resolve(); await new Promise<void>(r => signal?.addEventListener("abort", () => r(), { once: true }));
+      return { content: [], details: {} };
+    }), name: "fabric_exec" };
+    const { agent, faux } = setup(await openNodeJsonlStorage(dir, BACKGROUND_CONTEXT), [program], undefined, journalDirectory);
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("fabric_exec", {}, { id: "program" }), { stopReason: "toolUse" })]);
+    const run = agent.prompt("go"); await entered.promise; agent.abort(); await run; await agent.waitForIdle();
+    expect(file).not.toBe("");
+    expect(existsSync(file)).toBe(false);
+  });
+
+  it("offers the rerun fence only to fabric_exec", async () => {
+    let offered: Fence | undefined | "unseen" = "unseen";
+    const { agent, faux } = setup(new MemoryStorage(), [tool(async () => { offered = fenceStore()?.getStore(); return { content: [], details: {} }; })]);
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("effect", {}), { stopReason: "toolUse" }), fauxAssistantMessage("done")]);
+    await agent.prompt("go");
+    expect(offered).toBeUndefined();
   });
 
   it("journals streaming updates linearly while delivering every full partial (#229)", async () => {
@@ -319,6 +485,28 @@ describe("DurableAgent", () => {
     expect(agent.state.isStreaming).toBe(false);
     expect(agent.state.pendingToolCalls.size).toBe(0);
     expect(agent.state.messages.some(m => m.role === "toolResult")).toBe(true);
+    expect(agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
+  });
+
+  it("settles abort() and close() while a turn is still preparing", async () => {
+    const { agent, faux } = setup(new MemoryStorage(), [tool(async () => ({ content: [], details: {} }))]);
+    faux.setResponses([fauxAssistantMessage(fauxToolCall("effect", {}), { stopReason: "toolUse" }), fauxAssistantMessage("never")]);
+    const preparing = deferred(); const release = deferred(); let turns = 0;
+    // The second turn's prepare phase commits turn_start itself and then waits for its delivery, so stalling that
+    // delivery holds the run invocation before its admission wait while abort lands.
+    agent.subscribe(async event => { if (event.type === "turn_start" && ++turns === 2) { preparing.resolve(); await release.promise; } });
+    const run = agent.prompt("go").catch(() => {});
+    await preparing.promise;
+    agent.abort();
+    const closing = agent.close();
+    release.resolve();
+    // The engine abort joins the running invocation; close() waits on the abort. Neither may wait on the other.
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("abort/close deadlocked: close() did not settle within 2s")), 2_000); });
+    try {
+      await Promise.race([Promise.all([closing, run, agent.waitForIdle()]), timeout]);
+    } finally { clearTimeout(timer); }
+    expect(agent.state.isStreaming).toBe(false);
     expect(agent.state.messages.at(-1)).toMatchObject({ role: "assistant", stopReason: "aborted" });
   });
 });

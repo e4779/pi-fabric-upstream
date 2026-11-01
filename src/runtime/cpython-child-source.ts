@@ -7,18 +7,24 @@ if sys.implementation.name != "cpython" or sys.version_info < (3, 10):
 
 import ast
 import asyncio
+import builtins
 import json
+import keyword
 import math
 import os
+import re
 import socket
 import sys
 import traceback
 
 _MAX_FRAME = 16 * 1024 * 1024
 _MAX_INTEGER = 9007199254740991
+_PROVIDER_GLOBAL = re.compile(r"[a-z][a-z0-9_]{0,63}")
 _pending = {}
 _next_id = 0
 _writer = None
+# Registered providers exposed as globals; their calls are tools.call host calls.
+_provider_globals = set()
 
 
 def _json_value(value):
@@ -129,6 +135,10 @@ class _Proxy:
     async def __call__(self, *positional, **keywords):
         ref = self._ref
         args = _arguments(ref, positional, keywords)
+        if ref.split(".", 1)[0] in _provider_globals:
+            if "." not in ref:
+                raise TypeError("Call a Fabric provider action, not a namespace")
+            return await _call("fabric.$call", {"ref": ref, "args": args})
         if ref == "pi.edit" and "edits" not in args and ("oldText" in args or "newText" in args):
             args["edits"] = [{key: args.pop(key) for key in ("oldText", "newText") if key in args}]
         if ref.startswith("tools."):
@@ -260,6 +270,11 @@ async def _main():
         namespace = {name: _Proxy(name) for name in ("pi", "tools", "mcp", "extensions", "memory", "state", "schema", "components", "compact", "cache", "thinking", "decisions", "programs", "prewalk", "agents", "mesh")}
         payloads = _Payloads(request.get("strings", {}))
         namespace.update({"π": payloads, "payloads": payloads, "asyncio": asyncio, "__name__": "__fabric_guest__"})
+        for name in request.get("providerGlobals", [])[:64]:
+            if (isinstance(name, str) and _PROVIDER_GLOBAL.fullmatch(name) and name not in namespace
+                    and not keyword.iskeyword(name) and not keyword.issoftkeyword(name) and not hasattr(builtins, name)):
+                _provider_globals.add(name)
+                namespace[name] = _Proxy(name)
         exec(compile(program, "fabric-exec.py", "exec"), namespace)
         value = await namespace["__fabric_program"]()
         sys.stdout.flush()

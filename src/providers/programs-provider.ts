@@ -6,7 +6,7 @@ import type {
   FabricProvider,
   FabricProviderListRequest,
 } from "../protocol.js";
-import { programSourceWithInput } from "../programs/source.js";
+import { callerCodeProgram, programSourceWithInput } from "../programs/source.js";
 import {
   MAX_PROGRAM_CODE_CHARS,
   MAX_PROGRAM_DESCRIPTION_CHARS,
@@ -150,6 +150,17 @@ export class ProgramsProvider implements FabricProvider {
   async #run(args: Record<string, unknown>, context: FabricInvocationContext): Promise<unknown> {
     const runner = this.nestedRunner(context.parentToolCallId);
     if (!runner) throw new Error("programs.run runs only inside a fabric_exec program or a host program run");
+    const caller = runner.callerProgram;
+    if (caller && args.ref === callerCodeProgram(caller.sha256)) {
+      // Caller code takes the saved-program path from here: same authorization
+      // and approval, nested trace operation, input and kernel rules.
+      const label = callerCodeProgram(caller.sha256);
+      const input = normalizeProgramInput(args.input);
+      if (runner.kernel !== "typescript") {
+        throw new Error(`Program ${label} is a typescript program; this session's kernel is ${runner.kernel}`);
+      }
+      return runner.run({ program: label, code: programSourceWithInput(caller.code, "typescript", input) }, context.signal);
+    }
     const record = await this.store.resolve(args.ref, { requirePromoted: args.requirePromoted === true });
     const label = programRef(record, true);
     if (record.status === "retired") throw new Error(`Program ${label} is retired; a user can promote it again with /fabric programs promote`);

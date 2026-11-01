@@ -8,21 +8,24 @@ import {
 } from "../core/atomic-write.js";
 import type { FabricActorInfo, FabricActorRequest } from "../actors/types.js";
 import type { FabricAgentLog, AgentHandleInfo, AgentRunRecord, AgentRunRequest, AgentRunResult } from "../agents/types.js";
-import { readChildToolAllowlist } from "../core/child-tool-allowlist.js";
+import { constrainChildToolSelection, readChildToolAllowlist } from "../core/child-tool-allowlist.js";
 import { resolveAgentCwd } from "../agents/manager.js";
 import { BUILT_IN_RUNNER_IDS, requireAgentRunner } from "../agents/runner-registry.js";
 import { isFabricWorktreePath } from "../agents/worktree-paths.js";
+import { hasWorkerRecovery } from "../agents/worker-recovery.js";
 import { executeFile, processIsAlive, spawnDetached } from "../agents/transports/process-utils.js";
 import { readJsonlPage } from "../log-tail.js";
 import type { FabricOwnedModelGuidance } from "../components/model-guidance.js";
 import type { FabricMainAgentTarget } from "../main-agent.js";
 import { MeshStore, type MeshStateEntry } from "../mesh/store.js";
 import type { FabricParticipantSource } from "../topology/types.js";
+import { scopeCovers, sessionScope, type FabricScope } from "../scope.js";
 import {
   abandonResidentRequest,
   RESIDENT_HOST_FORMAT,
   residentDeliveryPrefix,
   residentHostId,
+  residentRoot,
   sleepUnlessAborted,
   type ResidentAgentMetadata,
   type ResidentCommand,
@@ -39,6 +42,9 @@ import {
 const STARTUP_TIMEOUT_MS = 30_000;
 const COMMAND_TIMEOUT_MS = 30_000;
 const STATUS_POLL_MS = 100;
+// One wait restarts a dead resident host at most this many times, so a host
+// that keeps dying fails the wait instead of spinning launchers.
+const MAX_WAIT_HOST_STARTS = 3;
 const AGENT_ID_PATTERN = /^[a-f0-9]{32}$/;
 
 const delay = (ms: number): Promise<void> =>
@@ -54,6 +60,17 @@ const readJson = <T>(filePath: string): T | undefined => {
   } catch {
     return undefined;
   }
+};
+
+const untilAborted = <T>(promise: Promise<T>, signal: AbortSignal | undefined, aborted: () => Error): Promise<T> => {
+  if (!signal) return promise;
+  promise.catch(() => undefined);
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(aborted());
+    if (signal.aborted) return onAbort();
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+  });
 };
 
 const terminal = (status: string): status is AgentRunResult["status"] =>
@@ -101,6 +118,15 @@ export interface ResidencyClientOptions {
   onBackgroundComplete?: (result: AgentRunResult, delivered: () => void) => void;
   onResultConsumed?: (id: string) => void;
   hostPath?: string;
+  /** This session's scope; defaults to the issued session scope. */
+  callerScope?: () => FabricScope | undefined;
+}
+
+/** A durable run that another root session of this project spawned. */
+interface ProjectAgent {
+  metadata: ResidentAgentMetadata;
+  residencyRoot: string;
+  hostId: string;
 }
 
 export class ResidencyClient {
@@ -118,6 +144,7 @@ export class ResidencyClient {
   #modelGuidanceJson: string | undefined;
   #drainingDeliveries = false;
   #closed = false;
+  #hostStart: Promise<ResidentHostOwner> | undefined;
 
   constructor(readonly options: ResidencyClientOptions) {
     this.hostId = residentHostId(options.config.rootId);
@@ -174,6 +201,15 @@ export class ResidencyClient {
     atomicWrite(this.#configPath, this.options.config);
     const existing = this.#liveOwner();
     if (existing) return existing;
+    // Concurrent callers in this process share one launch. Across processes the
+    // host's start lock admits one owner; a losing launcher exits quietly.
+    this.#hostStart ??= this.#startHost().finally(() => {
+      this.#hostStart = undefined;
+    });
+    return this.#hostStart;
+  }
+
+  async #startHost(): Promise<ResidentHostOwner> {
     fs.rmSync(this.#errorPath, { force: true });
     await spawnDetached(
       this.#hostPath,
@@ -243,8 +279,15 @@ export class ResidencyClient {
     }
     // Freeze inherited optional-tool authority before transferring to an existing host.
     const allowedTools = this.#inheritedToolAllowlist;
+    const requested = request.tools ?? this.options.config.agents.defaultTools;
     const tools = allowedTools === undefined ? undefined
-      : (request.tools ?? this.options.config.agents.defaultTools).filter((tool) => allowedTools.has(tool));
+      : runner === "pi" || runner === "pi-durable"
+        ? constrainChildToolSelection(requested, allowedTools)
+        : requested.filter((tool) => allowedTools.has(tool));
+    // This is attenuation, not an assertion of authority: even a malformed or
+    // user-supplied value can only deny. Never forward an "allow" capability.
+    const denyRecursiveTool = request.recursiveToolAuthority !== undefined ||
+      (allowedTools !== undefined && !allowedTools.fabricExec) || requested.includes("-fabric_exec");
     await this.ensureHost();
     const response = await this.#command(
       {
@@ -252,7 +295,8 @@ export class ResidencyClient {
         operation: "spawn",
         requestId: randomUUID(),
         rootId: this.options.config.rootId,
-        request: { ...resolvedRequest, ...(tools ? { tools } : {}), residency: "durable" },
+        request: { ...resolvedRequest, ...(tools ? { tools } : {}),
+          ...(denyRecursiveTool ? { recursiveToolAuthority: "deny" as const } : {}), residency: "durable" },
         ...(runnerModule ? { runnerModule } : {}),
         createdAt: Date.now(),
       },
@@ -267,9 +311,21 @@ export class ResidencyClient {
     return AGENT_ID_PATTERN.test(id) && fs.existsSync(this.#metadataPath(id));
   }
 
+  /**
+   * True for a durable run that another root session of this project spawned
+   * and that this session may read. See `#projectAgent` for the boundary.
+   */
+  hasProjectAgent(id: string): boolean {
+    return !this.hasAgent(id) && this.#projectAgent(id) !== undefined;
+  }
+
   statusAgent(id: string): AgentRunRecord | AgentHandleInfo {
-    const metadata = this.#metadata(id);
+    const metadata = this.#metadata(id) ?? this.#projectAgent(id)?.metadata;
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
+    return this.#statusFrom(metadata);
+  }
+
+  #statusFrom(metadata: ResidentAgentMetadata): AgentRunRecord | AgentHandleInfo {
     const record = readJson<AgentRunRecord>(path.join(metadata.runDirectory, "status.json"));
     if (!record || record.id !== metadata.id) return structuredClone(metadata.handle);
     return {
@@ -311,20 +367,105 @@ export class ResidencyClient {
     this.options.onResultConsumed?.(id);
   }
 
+  #workerStopNeedsRecovery(id: string, status: AgentRunRecord | AgentHandleInfo): boolean {
+    const directory = this.#metadata(id)?.runDirectory;
+    // A worker can write stopped before exiting. Only the host's settlement
+    // (which removes the marker first) makes that stop consumable.
+    return status.runner === "pi-durable" && status.status === "stopped" &&
+      typeof directory === "string" && hasWorkerRecovery(directory);
+  }
+
   async waitAgent(id: string, signal?: AbortSignal): Promise<AgentRunResult> {
+    const aborted = (): Error => new Error(`Waiting for durable Fabric agent ${id} was aborted`);
+    let hostStarts = 0;
     while (true) {
-      if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
+      if (signal?.aborted) throw aborted();
       const status = this.statusAgent(id);
-      if (terminal(status.status) && "startedAt" in status) {
+      if (terminal(status.status) && "startedAt" in status && !this.#workerStopNeedsRecovery(id, status)) {
         this.acknowledgeCompletion(id);
         return status as AgentRunResult;
+      }
+      // Only the resident host settles its runs. With no live owner nothing will,
+      // so restart it: the new host re-attaches the run. Re-read the status first
+      // in case the host settled the run and exited between the two reads.
+      if (!this.#liveOwner()) {
+        const current = this.statusAgent(id);
+        if (terminal(current.status) && "startedAt" in current && !this.#workerStopNeedsRecovery(id, current)) continue;
+        // A new host reattaches hosted runs and opted-in durable workers.
+        // Preserve main's explicit settlement for runs with no recovery owner.
+        const runDirectory = this.#metadata(id)?.runDirectory;
+        const recoverableWorker = typeof runDirectory === "string" && hasWorkerRecovery(runDirectory);
+        if (!("hosted" in current && current.hosted) && !recoverableWorker) {
+          const error = `Durable Fabric agent ${id} (runner ${current.runner}) cannot finish: its resident host ${this.hostId} stopped, and a new host re-attaches only hosted runs`;
+          this.#settleIndeterminate(id, error);
+          throw new Error(error);
+        }
+        if (hostStarts >= MAX_WAIT_HOST_STARTS) {
+          throw new Error(
+            `Fabric resident host ${this.hostId} stopped ${hostStarts} times while durable Fabric agent ${id} was unfinished`,
+          );
+        }
+        hostStarts += 1;
+        // A start failure rejects the wait. An aborted wait stops waiting; the
+        // host start itself runs on and the next host idles out if unused.
+        await untilAborted(this.ensureHost(), signal, aborted);
+        continue;
+      }
+      await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Settle an unfinished run that nothing else will settle: failed, with
+   * outcome "indeterminate" because Fabric cannot confirm what the run did.
+   * A run without a run record, or one that settled meanwhile, is left alone.
+   */
+  #settleIndeterminate(id: string, error: string): void {
+    const metadata = this.#metadata(id);
+    if (!metadata) return;
+    const statusFile = path.join(metadata.runDirectory, "status.json");
+    const record = readJson<AgentRunRecord>(statusFile);
+    if (!record || record.id !== id || terminal(record.status)) return;
+    const now = Date.now();
+    const { currentTool: _tool, blockedOn: _blocked, sleeping: _sleeping, ...rest } = record;
+    atomicWrite(statusFile, { ...rest, status: "failed", error, outcome: "indeterminate", finishedAt: now, updatedAt: now });
+  }
+
+  /**
+   * Wait for a durable run another root session of this project spawned. Only
+   * that session's resident host settles the run, so the wait fails when the
+   * host is not running. It reads only: the completion receipt stays with the
+   * owning session.
+   */
+  async waitProjectAgent(id: string, signal?: AbortSignal): Promise<AgentRunResult> {
+    const settled = (metadata: ResidentAgentMetadata): AgentRunResult | undefined => {
+      const status = this.#statusFrom(metadata);
+      return terminal(status.status) && "startedAt" in status ? status as AgentRunResult : undefined;
+    };
+    // Find the owning root once; each poll re-reads and re-checks the record there.
+    const found = this.#projectAgent(id);
+    while (true) {
+      if (signal?.aborted) throw new Error(`Waiting for durable Fabric agent ${id} was aborted`);
+      const project = found && this.#projectAgentAt(found.residencyRoot, id);
+      if (!project) throw new Error(`Unknown durable Fabric agent: ${id}`);
+      const result = settled(project.metadata);
+      if (result) return result;
+      if (!this.#liveOwner(path.join(project.residencyRoot, "owner.json"), project.hostId)) {
+        // The host may have settled the run and exited between the two reads.
+        const late = settled(project.metadata);
+        if (late) return late;
+        // A restarted host re-attaches only hosted runs (see waitAgent).
+        const current = this.#statusFrom(project.metadata);
+        throw new Error("hosted" in current && current.hosted
+          ? `Durable Fabric agent ${id} is unfinished and the resident host of the session that started it is not running; resume that session to re-attach it`
+          : `Durable Fabric agent ${id} is unfinished and the resident host of the session that started it is not running, so it cannot finish`);
       }
       await sleepUnlessAborted(STATUS_POLL_MS, signal).catch(() => undefined);
     }
   }
 
   readAgentLog(id: string, options: { lines?: number; before?: number } = {}): FabricAgentLog {
-    const metadata = this.#metadata(id);
+    const metadata = this.#metadata(id) ?? this.#projectAgent(id)?.metadata;
     if (!metadata) throw new Error(`Unknown durable Fabric agent: ${id}`);
     const logFile = path.join(metadata.runDirectory, "events.jsonl");
     const page = readJsonlPage(logFile, Math.max(1, Math.min(options.lines ?? 200, 5_000)), options.before);
@@ -458,15 +599,81 @@ export class ResidencyClient {
 
   #metadata(id: string): ResidentAgentMetadata | undefined {
     if (!AGENT_ID_PATTERN.test(id)) return undefined;
-    const metadata = readJson<ResidentAgentMetadata>(this.#metadataPath(id));
+    return this.#validMetadata(
+      readJson<ResidentAgentMetadata>(this.#metadataPath(id)),
+      id,
+      this.options.config.rootId,
+      this.options.config.residencyRoot,
+    );
+  }
+
+  /**
+   * Find a run that another root session spawned. The boundary is this
+   * project's mesh root (one OS user, as for the rest of the mesh): only
+   * residency directories under it are searched, and each record must be bound
+   * to the directory holding it. A scoped session reads only runs whose scope it
+   * covers (same principal, every grant); an unscoped session has host
+   * authority. Anything else stays unknown.
+   */
+  #projectAgent(id: string): ProjectAgent | undefined {
+    if (!AGENT_ID_PATTERN.test(id)) return undefined;
+    const base = path.join(this.options.config.meshRoot, "residency");
+    const own = path.resolve(this.options.config.residencyRoot);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(base, { withFileTypes: true });
+    } catch {
+      return undefined;
+    }
+    for (const entry of entries) {
+      // Dirent does not follow symbolic links, so a linked directory is skipped.
+      if (!entry.isDirectory() || !/^[a-f0-9]{64}$/.test(entry.name)) continue;
+      const residencyRoot = path.join(base, entry.name);
+      if (path.resolve(residencyRoot) === own) continue;
+      const project = this.#projectAgentAt(residencyRoot, id);
+      if (project) return project;
+    }
+    return undefined;
+  }
+
+  /** The run `id` in one residency directory of another root, if this session may read it. */
+  #projectAgentAt(residencyRoot: string, id: string): ProjectAgent | undefined {
+    let caller: FabricScope | undefined;
+    try {
+      caller = (this.options.callerScope ?? sessionScope)();
+    } catch {
+      return undefined;
+    }
+    const raw = readJson<ResidentAgentMetadata>(path.join(residencyRoot, "agents", `${id}.json`));
+    if (typeof raw?.rootId !== "string") return undefined;
+    if (path.resolve(residentRoot(this.options.config.meshRoot, raw.rootId)) !== path.resolve(residencyRoot)) return undefined;
+    const metadata = this.#validMetadata(raw, id, raw.rootId, residencyRoot);
+    if (!metadata) return undefined;
+    if (caller) {
+      try {
+        if (!metadata.scope || !scopeCovers(caller, metadata.scope)) return undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    return { metadata, residencyRoot, hostId: residentHostId(raw.rootId) };
+  }
+
+  #validMetadata(
+    metadata: ResidentAgentMetadata | undefined,
+    id: string,
+    rootId: string,
+    residencyRoot: string,
+  ): ResidentAgentMetadata | undefined {
     if (
       metadata?.format !== RESIDENT_HOST_FORMAT ||
-      metadata.rootId !== this.options.config.rootId ||
+      metadata.rootId !== rootId ||
       metadata.id !== id ||
-      metadata.handle.id !== id ||
+      metadata.handle?.id !== id ||
+      typeof metadata.runDirectory !== "string" ||
       (metadata.worktreeGitRoot !== undefined && typeof metadata.worktreeGitRoot !== "string") ||
       path.resolve(metadata.runDirectory) !==
-        path.resolve(this.options.config.residencyRoot, "runs", id)
+        path.resolve(residencyRoot, "runs", id)
     ) {
       return undefined;
     }
@@ -483,11 +690,11 @@ export class ResidencyClient {
     return metadata;
   }
 
-  #liveOwner(): ResidentHostOwner | undefined {
-    const owner = readJson<ResidentHostOwner>(this.#ownerPath);
+  #liveOwner(ownerPath = this.#ownerPath, hostId = this.hostId): ResidentHostOwner | undefined {
+    const owner = readJson<ResidentHostOwner>(ownerPath);
     if (
       owner?.format !== RESIDENT_HOST_FORMAT ||
-      owner.hostId !== this.hostId ||
+      owner.hostId !== hostId ||
       !Number.isSafeInteger(owner.pid) ||
       // A host in another PID namespace is judged by its heartbeat.
       recordOwnerLiveness(owner, { legacyAlive: processIsAlive }) === "dead"

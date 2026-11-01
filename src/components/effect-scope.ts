@@ -1,4 +1,5 @@
-import { boundedEffectResources, cleanupState, consume } from "../verified/policy.js";
+import { cleanupState, consume } from "../verified/policy.js";
+import { boundedEffectResources } from "../verified/resources.js";
 import type {
   FabricComponentDisposer,
   FabricComponentEffect,
@@ -255,8 +256,8 @@ export class FabricEffectScope {
     let disposal: Promise<void> | undefined;
     record.dispose = async () => {
       const release = consume(!record.disposed);
-      if (!release.fst) return disposal;
-      record.disposed = !release.snd;
+      if (!release.released) return disposal;
+      record.disposed = !release.active;
       record.armed = false;
       disposal = (async () => {
         await record.setup.catch(() => undefined);
@@ -328,8 +329,8 @@ export class FabricEffectScope {
     let disposal: Promise<void> | undefined;
     record.dispose = async () => {
       const release = consume(!record.disposed);
-      if (!release.fst) return disposal;
-      record.disposed = !release.snd;
+      if (!release.released) return disposal;
+      record.disposed = !release.active;
       record.armed = false;
       disposal = (async () => {
         const failures: unknown[] = [];

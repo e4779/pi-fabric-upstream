@@ -4,6 +4,7 @@ import type {
   SessionMessageEntry,
 } from "@earendil-works/pi-coding-agent";
 import type { FabricAgentRunner, FabricAgentTransport, FabricPythonRuntime } from "../config.js";
+import type { FabricModelMatch } from "../core/model-resolution.js";
 import type { FabricKernel } from "../runtime/kernel.js";
 import type { FabricScope, FabricScopeGrant } from "../protocol.js";
 import type { ThinkingTransferInput } from "./thinking-transfer.js";
@@ -64,12 +65,29 @@ export interface AgentRunRequest {
   pythonRuntime?: FabricPythonRuntime;
   transport?: FabricAgentTransport;
   model?: string;
+  /** "exact": Pi only; select a visible provider/id without aliases or fuzzy matching. This is not final-dispatch enforcement: later hooks, unknown APIs, providers or extension calls can route data elsewhere. */
+  modelMatch?: FabricModelMatch;
+  /**
+   * A routed question from this run waits for a person: it is raised as a
+   * root-held decision with the store's longest deadline (30 days), and only this run waits.
+   * A dialog that sets its own timeout keeps it. Needs agents.childQuestions
+   * "route" and a runner that declares questions; the run's own timeoutMs still applies.
+   */
+  holdQuestions?: true;
+  /**
+   * agents.spawn only: return a "queued" handle at once instead of waiting
+   * inside the call for a free agents.maxConcurrent slot. The run starts when
+   * a slot frees; agents.stop before then cancels it without launching.
+   */
+  queue?: true;
   /** Veda persona name; only used when runner is "veda". */
   persona?: string;
   thinking?: FabricThinking;
   /** Child thinking bounds; must lie inside the caller's effective bounds. */
   thinkingBounds?: FabricThinkingBounds;
   tools?: string[];
+  /** Host-only attenuation across resident dispatch. Presence can only deny, never grant. */
+  recursiveToolAuthority?: "deny";
   timeoutMs?: number;
   extensions?: boolean;
   recursive?: boolean;
@@ -92,6 +110,13 @@ export interface AgentRunRequest {
   residency?: FabricParticipantResidency;
   schema?: Record<string, unknown>;
   systemPrompt?: string;
+  /**
+   * Host-only skills resolved from the caller's `skills` option (see
+   * src/agents/child-skills.ts); never a provider argument. `catalog` holds the
+   * skill files the child loads instead of its own discovery; `preload` is the
+   * system prompt block with the listed skills in full.
+   */
+  childSkills?: { catalog: string[]; preload?: string };
   /** Opt in to Claude Code transcript persistence for hook-based observability. */
   persistSession?: boolean;
   sessionFile?: string;
@@ -179,6 +204,8 @@ export interface AgentRunRecord {
   updatedAt: number;
   finishedAt?: number;
   currentTool?: string;
+  /** Latest declared fabric_exec display name; it holds until the next declaration. */
+  milestone?: string;
   turns: number;
   toolCalls: number;
   text: string;
@@ -274,8 +301,14 @@ export interface AgentWorkerOptions {
   /** Serialized effective bounds forwarded as PI_FABRIC_THINKING_BOUNDS. */
   thinkingBounds?: string;
   systemPrompt?: string;
+  /** Skill files a Pi child loads with --no-skills and one --skill each; absent keeps Pi's discovery. */
+  skills?: string[];
   persistSession?: boolean;
+  /** pi-durable only (agents.durableWorkerSession): keep a session file in the run directory. */
+  durableSession?: boolean;
   modelAdmission?: "strict" | "permissive";
+  /** "exact": strict admission and a pin guard, not final-dispatch enforcement; later hooks, unknown APIs, providers or extension calls can route data elsewhere. */
+  modelMatch?: FabricModelMatch;
   sessionFile?: string;
   sessionExportFile?: string;
   actorId?: string;
@@ -291,6 +324,8 @@ export interface AgentWorkerOptions {
   steerFile?: string;
   /** Present when agents.childQuestions is "route": child dialogs go to the parent with this default deadline. */
   childQuestionTimeoutMs?: number;
+  /** With childQuestionTimeoutMs: a question with no timeout of its own never times out in the worker. */
+  childQuestionHold?: true;
   transport: FabricAgentTransport;
   sessionId?: string;
   attachCommand?: string;
@@ -375,12 +410,26 @@ export interface AgentSteerEntry {
   ts: number;
 }
 
+/** One unsettled run, as `AgentManager.activity()` reports it to status displays. */
+export interface AgentActivity {
+  id: string;
+  /** The actor name for an actor activation, otherwise the run name. */
+  name: string;
+  /** Title of a routed child question waiting on the user. */
+  question?: string;
+}
+
 /** A routed child dialog (agents.childQuestions "route"); `question` is the raw worker payload. */
 export interface AgentChildQuestionRequest {
   runId: string;
   name: string;
   actorId?: string;
   question: Record<string, unknown>;
+  /**
+   * Set by the manager, never by the child: the run asked to hold questions and
+   * this one has no deadline. The router raises a decision with the longest deadline.
+   */
+  hold?: true;
   /** Aborted when the run settles; the router must stop asking. */
   signal: AbortSignal;
   /** Report the durable decision backing a headless question. */

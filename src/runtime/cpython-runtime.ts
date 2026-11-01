@@ -9,6 +9,7 @@ import { StringDecoder } from "node:string_decoder";
 import { runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { isPiShellRef } from "../core/pi-tools.js";
+import { providerGlobalNames } from "../provider-globals.js";
 import type { FabricHostCall, FabricKernelRuntime, FabricSandboxOptions, FabricSandboxResult } from "./kernel.js";
 import { CPYTHON_CHILD_SOURCE } from "./cpython-child-source.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
@@ -16,6 +17,7 @@ import { linuxCPythonNetworkFilter } from "./cpython-linux-sandbox.js";
 
 const MAX_FRAME_BYTES = 16 * 1024 * 1024;
 const HOST_SETTLE_MS = 250;
+const TRANSPORT_DIAGNOSTIC_MS = 250;
 // No blanket mach* allowance: Mach services can broker effects outside the
 // file/network policy. CPython's standard-library startup needs none here.
 const MACOS_PROFILE = "(version 1) (deny default) (allow process-exec) (allow process-fork) (allow file-read*) (allow sysctl-read)";
@@ -109,6 +111,8 @@ export class CPythonRuntime implements FabricKernelRuntime {
       return failure("runtime_error", "CPython memory limit must be a positive safe integer");
     }
     if (!Number.isFinite(options.timeoutMs) || options.timeoutMs < 1) return failure("runtime_error", "CPython timeout must be positive");
+    // The child rechecks each name against its own keywords, builtins and namespace.
+    const providerGlobals = providerGlobalNames(options.providerGlobals ?? []);
     const startedAt = Date.now();
     let command: Awaited<ReturnType<typeof launch>>;
     try { command = await launch(this.binary, this.enforce, options.cwd ?? process.cwd()); }
@@ -131,6 +135,8 @@ export class CPythonRuntime implements FabricKernelRuntime {
       let settled = false;
       let finishing = false;
       let deadline: NodeJS.Timeout | undefined;
+      let transportDeadline: NodeJS.Timeout | undefined;
+      let transportError: string | undefined;
       let deadlineAt = startedAt + options.timeoutMs;
       let buffer = Buffer.alloc(0);
       let child: ReturnType<typeof spawn>;
@@ -167,6 +173,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         for (let index = 0; index < decoders.length; index++) appendLog(index, decoders[index]!.end());
         settled = true;
         if (deadline) clearTimeout(deadline);
+        if (transportDeadline) clearTimeout(transportDeadline);
         options.signal?.removeEventListener("abort", abort);
         if (!hostAbort.signal.aborted) hostAbort.abort(new Error(result.error ?? "CPython execution ended"));
         channel?.destroy();
@@ -192,9 +199,21 @@ export class CPythonRuntime implements FabricKernelRuntime {
       };
       const abort = (): void => void finish({ value: undefined, terminationReason: "aborted", error: "Execution cancelled" });
       const fail = (message: string): void => void finish({ value: undefined, terminationReason: "runtime_error", error: message });
+      const failTransport = (message: string): void => {
+        if (settled || finishing || transportError) return;
+        transportError = message;
+        // A startup failure can reset fd 3 (or break the seccomp pipe) before
+        // stderr/close arrives. Stop host work now, but give the child's natural
+        // close a bounded chance to supply the real exit status and diagnostics.
+        hostAbort.abort(new Error(message));
+        transportDeadline = setTimeout(() => fail(message), TRANSPORT_DIAGNOSTIC_MS);
+        transportDeadline.unref?.();
+      };
       const scheduleDeadline = (): void => {
         if (deadline) clearTimeout(deadline);
-        if (settled || !Number.isFinite(deadlineAt)) return;
+        if (settled) return;
+        options.onDeadline?.(Number.isFinite(deadlineAt) ? deadlineAt : undefined);
+        if (!Number.isFinite(deadlineAt)) return;
         deadline = setTimeout(() => void finish({
           value: undefined, terminationReason: "timed_out", error: `Execution timed out after ${deadlineAt - startedAt}ms`,
         }), Math.max(0, deadlineAt - Date.now()));
@@ -205,6 +224,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         suspend: () => {
           if (deadline) clearTimeout(deadline);
           deadlineAt = Infinity;
+          options.onDeadline?.(undefined);
         },
         resume: (remainingMs) => {
           deadlineAt = Date.now() + remainingMs;
@@ -214,7 +234,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
       const send = (message: unknown): void => {
         // A terminal guest result closes its reply channel while issued host
         // work may still be settling. Its late replies are no longer consumed.
-        if (settled || finishing || !channel || channel.destroyed) return;
+        if (settled || finishing || transportError || !channel || channel.destroyed) return;
         try {
           const frame = JSON.stringify(message) + "\n";
           const bytes = Buffer.byteLength(frame);
@@ -222,11 +242,11 @@ export class CPythonRuntime implements FabricKernelRuntime {
             fail("CPython IPC frame or write buffer exceeds its 16 MiB frame limit");
             return;
           }
-          channel.write(frame, (error) => { if (error && !settled && !finishing) fail(`CPython IPC failed: ${error.message}`); });
+          channel.write(frame, (error) => { if (error) failTransport(`CPython IPC failed: ${error.message}`); });
         } catch (error) { fail(`CPython IPC serialization failed: ${errorText(error)}`); }
       };
       const handleMessage = (message: unknown): void => {
-        if (settled || finishing) return;
+        if (settled || finishing || transportError) return;
         if (!record(message)) { fail("Invalid CPython IPC message"); return; }
         if (message.type === "result") {
           const result = message.result;
@@ -274,7 +294,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
           waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
         } catch (error) { fail(`CPython deadline policy failed: ${errorText(error)}`); return; }
         if (waitsForHuman) humanWait.enter();
-        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal)).finally(() => {
+        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal, (wait) => humanWait.run(wait))).finally(() => {
           if (waitsForHuman) humanWait.leave();
         }).then(
           (value) => send({ type: "response", id, ok: true, value }),
@@ -283,7 +303,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         hostTasks.add(task);
       };
       const onData = (chunk: Buffer): void => {
-        if (settled || finishing) return;
+        if (settled || finishing || transportError) return;
         buffer = Buffer.concat([buffer, chunk]);
         if (expectedToken !== undefined) {
           const handshake = buffer.indexOf(10);
@@ -299,8 +319,8 @@ export class CPythonRuntime implements FabricKernelRuntime {
           if (!verified) { fail("Invalid CPython IPC handshake"); return; }
           buffer = buffer.subarray(handshake + 1);
           expectedToken = undefined;
-          send({ type: "execute", code, strings: options.strings ?? {}, memoryLimitBytes: options.memoryLimitBytes });
-          if (settled || finishing) return;
+          send({ type: "execute", code, strings: options.strings ?? {}, memoryLimitBytes: options.memoryLimitBytes, providerGlobals });
+          if (settled || finishing || transportError) return;
         }
         let newline: number;
         while ((newline = buffer.indexOf(10)) !== -1) {
@@ -309,7 +329,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
           buffer = buffer.subarray(newline + 1);
           try { handleMessage(JSON.parse(frame)); }
           catch (error) { fail(`Invalid CPython IPC: ${errorText(error)}`); return; }
-          if (settled || finishing) return;
+          if (settled || finishing || transportError) return;
         }
         if (buffer.length > MAX_FRAME_BYTES) fail("CPython IPC frame exceeds 16 MiB");
       };
@@ -317,7 +337,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         channel = socket;
         if (socket instanceof net.Socket) socket.setNoDelay(true);
         socket.on("data", onData);
-        socket.on("error", (error) => { if (!settled && !finishing) fail(`CPython IPC failed: ${error.message}`); });
+        socket.on("error", (error) => failTransport(`CPython IPC failed: ${error.message}`));
       };
       child.stdout?.on("data", (chunk: Buffer) => appendLog(0, decoders[0]!.write(chunk)));
       child.stderr?.on("data", (chunk: Buffer) => appendLog(1, decoders[1]!.write(chunk)));
@@ -325,13 +345,13 @@ export class CPythonRuntime implements FabricKernelRuntime {
       child.on("close", (exitCode, signal) => {
         if (settled || finishing) return;
         const diagnostics = [...logs, ...partialLogs].join("\n").slice(-4000);
-        fail(`CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
+        fail(`CPython ${this.enforce ? "sandbox " : ""}process exited before returning a result (${signal ?? exitCode}).${this.enforce ? " Verify OS sandbox availability/user namespaces; no unsandboxed fallback is permitted." : ""}${transportError ? `\n${transportError}` : ""}${diagnostics ? `\n${diagnostics}` : ""}`);
       });
       options.signal?.addEventListener("abort", abort, { once: true });
       if (options.signal?.aborted) { abort(); return; }
       if (command.seccomp) {
         const filterPipe = child.stdio[4] as Duplex;
-        filterPipe.on("error", (error) => { if (!settled) fail(`CPython sandbox filter failed: ${error.message}`); });
+        filterPipe.on("error", (error) => failTransport(`CPython sandbox filter failed: ${error.message}`));
         filterPipe.end(command.seccomp);
       }
       scheduleDeadline();
@@ -344,7 +364,7 @@ export class CPythonRuntime implements FabricKernelRuntime {
         });
       } else {
         attach(child.stdio[3] as Duplex);
-        send({ type: "execute", code, strings: options.strings ?? {}, memoryLimitBytes: options.memoryLimitBytes });
+        send({ type: "execute", code, strings: options.strings ?? {}, memoryLimitBytes: options.memoryLimitBytes, providerGlobals });
       }
     });
   }

@@ -4,13 +4,14 @@ import path from "node:path";
 import { MeshStore } from "../mesh/store.js";
 import { decisionEscalation, DecisionStore, type DecisionRecord, type DecisionStatus } from "../decisions/store.js";
 
-// `pi-fabric decisions list|answer`: answer durable Fabric decisions from
+// `pi-fabric decisions list|answer|cancel`: answer or cancel durable Fabric decisions from
 // outside any Pi session. Authority is local file access to the mesh root
 // (one OS user); answers record `via: "cli"` and the OS user name.
 
 const USAGE = `Usage:
   pi-fabric decisions list --root <meshRoot> [--status open|answered|expired|cancelled|all] [--holder <h>] [--limit <n>] [--json]
   pi-fabric decisions answer --root <meshRoot> <id> (--option <optionId> | --text <text>) [--json]
+  pi-fabric decisions cancel --root <meshRoot> <id> [--json]
 
 --root defaults to $PI_FABRIC_MESH_ROOT.`;
 
@@ -119,6 +120,14 @@ export const runDecisionsCli = async (
         ...(typeof option === "string" ? { optionId: option } : {}),
         ...(typeof text === "string" ? { text } : {}),
       }, { answeredBy: user, via: "cli" });
+      io.stdout.write(json ? `${JSON.stringify(record, null, 2)}\n` : `${line(record)}\n`);
+      return 0;
+    }
+    if (command === "cancel") {
+      const [id, extra] = positionals;
+      if (!id || extra !== undefined) throw new UsageError("cancel takes exactly one decision id");
+      if (flags.has("option") || flags.has("text")) throw new UsageError("cancel takes no --option or --text");
+      const record = await store.cancel(id, { answeredBy: user, via: "cli" });
       io.stdout.write(json ? `${JSON.stringify(record, null, 2)}\n` : `${line(record)}\n`);
       return 0;
     }

@@ -12,8 +12,11 @@ const task = fs.readFileSync(taskFile, "utf8");
 const marker = path.join(path.dirname(statusFile), "startup-attempts");
 const attempts = fs.existsSync(marker) ? Number(fs.readFileSync(marker, "utf8")) + 1 : 1;
 fs.writeFileSync(marker, String(attempts));
+// One line per launch attempt: the argv the manager (re)built for this worker.
+fs.appendFileSync(path.join(path.dirname(statusFile), "worker-args.jsonl"), JSON.stringify(process.argv.slice(2)) + "\n");
 const now = Date.now();
-const retryable = task !== "Reject startup";
+const pinViolation = task === "Pin violation";
+const retryable = task !== "Reject startup" && !pinViolation;
 const failed = retryable ? attempts === 1 : true;
 fs.writeFileSync(
   statusFile,
@@ -32,9 +35,14 @@ fs.writeFileSync(
     toolCalls: 0,
     text: failed ? "" : "startup retry recovered",
     ...(failed
-      ? { error: retryable ? "No API key found for openai-codex" : "provider rejected the prompt" }
+      ? {
+          error: pinViolation
+            // The text a pin violation really carries, whose model id spells a credential error.
+            ? "Fabric exact model pin violated: only lab/pinned may run, but lab/missing credentials was about to run. The provider call was stopped before any request was sent."
+            : retryable ? "No API key found for openai-codex" : "provider rejected the prompt",
+        }
       : {}),
-    exitCode: 0,
+    exitCode: pinViolation ? 71 : 0,
     usage: failed
       ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
       : { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, cost: 0 },

@@ -16,7 +16,7 @@ import { nativeToolCatalog, resolveNativeTool } from "../src/native-tool-catalog
 
 const cleanups: (() => void)[] = [];
 afterEach(() => cleanups.splice(0).forEach(cleanup => cleanup()));
-function fixture(profile: "additive" | "native" = "additive", runtime: "quickjs" | "node-process" | "bun-process" = "quickjs") {
+function fixture(profile: "additive" | "native" = "additive", runtime: "quickjs" | "node-process" | "bun-process" = "quickjs", extra: ReturnType<typeof defineTool>[] = []) {
   const cwd = mkdtempSync(join(tmpdir(), "fabric-native-test-"));
   cleanups.push(() => rmSync(cwd, {recursive: true, force: true}));
   writeFileSync(join(cwd, "input.txt"), "hello");
@@ -30,6 +30,7 @@ function fixture(profile: "additive" | "native" = "additive", runtime: "quickjs"
   const definitions = [
     defineTool({name: "echo", label: "Echo", description: "Structured example", parameters: Type.Object({fail: Type.Optional(Type.Boolean())}), outputSchema: Type.Object({answer: Type.Number()}), namespace: {name: "examples", instructions: "Example namespace"}, execute: echo}),
     defineTool({name: "search", label: "Search", description: "Native search tool", parameters: Type.Object({}), async execute() { return {content: [{type: "text" as const, text: "native search"}], details: {}}; }}),
+    ...extra,
   ];
   const runner = {createContext: () => ({cwd}), getActiveTools: () => definitions.map(d => d.name), emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined), emitToolResult: vi.fn(async () => undefined)} as unknown as ExtensionRunner;
   const captured = new CapturedToolCatalog();
@@ -77,6 +78,61 @@ describe.each(["additive", "native"] as const)("%s native tool compatibility", p
     const result = await f.run(`return {one:await ${prefix}describeTool("echo"), ns:await ${prefix}describeNamespace("examples"), hits:await ${prefix}searchTools("structured example"), all:${profile === "native" ? "ALL_TOOLS" : "nativeDiscovery.ALL_TOOLS"}};`);
     expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
     expect(result.value).toMatchObject({one:expect.stringContaining("answer"),ns:{name:"examples",instructions:"Example namespace",tools:["echo"]},hits:expect.arrayContaining([expect.objectContaining({name:"echo"})]),all:expect.arrayContaining([expect.objectContaining({name:"read"})])});
+  });
+
+  it.each(["enum", "anyOf"] as const)("keeps all 13 %s alternatives visible and dispatchable", async kind => {
+    const values = Array.from({length: 13}, (_, i) => `operation_${i}`);
+    const parameters = Type.Object({choice: Type.Unsafe(kind === "enum" ? {type: "string", enum: values} : {anyOf: values.map(value => ({const: value}))})});
+    const execute = vi.fn(async (_id: string, args: {choice: unknown}) => ({content: [{type: "text" as const, text: String(args.choice)}], details: {}}));
+    const f = fixture(profile, "quickjs", [defineTool({
+      name: "choose_value", label: "Choose value", description: "Choose a sample operation", parameters, execute,
+    })]);
+    const prefix = profile === "native" ? "" : "nativeDiscovery.";
+    const result = await f.run(`return {preview: await ${prefix}describeTool("choose_value"), hits: await ${prefix}searchTools("sample operation"), raw: await fabric.tools.describe({ref: "extensions.choose_value"}), result: await nativeTools.choose_value({choice:"operation_12"})};`);
+    expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
+    const value = result.value as {preview: string; hits: unknown; raw: {inputSchema: unknown}; result: string};
+    for (const operation of values) {
+      expect(value.preview).toContain(operation);
+      expect(JSON.stringify(value.hits)).toContain(operation);
+    }
+    expect(value.preview).not.toContain("truncated");
+    expect(value.raw.inputSchema).toEqual(parameters);
+    expect(value.result).toBe("operation_12");
+    const invalid = await f.run('return await nativeTools.choose_value({choice: ("not_authorized" as any)});');
+    expect(invalid.success).toBe(false);
+    expect(execute).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps field guidance and large contracts visible through actual discovery", async () => {
+    const guidance = Type.Object({
+      page_number: Type.Optional(Type.Number({description: "Initial page is zero; omit for the initial read."})),
+      reference: Type.Object({id: Type.Number({description: "Record ID from the current account lookup receipt."})}),
+    });
+    const large = Type.Object({project_id: Type.Number(), record: Type.Object({
+      title: Type.String({description: "Preserve the requested title and selected resource scope. ".repeat(300)}),
+      steps: Type.Array(Type.Object({name: Type.String(), expectedResult: Type.String()})),
+      mode: Type.Literal("MANUAL"),
+    })});
+    const f = fixture(profile, "quickjs", [guidance, large].map((parameters, i) => defineTool({
+      name: `sample_contract_${i}`, label: "Sample contract", description: "Sample contract discovery",
+      parameters,
+      async execute() { return {content: [{type: "text" as const, text: "ok"}], details: {}}; },
+    })));
+    const prefix = profile === "native" ? "" : "nativeDiscovery.";
+    const result = await f.run(`return {guidance:await ${prefix}describeTool("sample_contract_0"), large:await ${prefix}describeTool("sample_contract_1"), hits:await ${prefix}searchTools("Sample contract discovery"), raw:await fabric.tools.describe({ref:"extensions.sample_contract_1"}), invoked:await nativeTools.sample_contract_1({project_id:1,record:{title:"sample",steps:[{name:"step",expectedResult:"done"}],mode:"MANUAL"}})};`);
+    expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
+    const value = result.value as {guidance: string; large: string; hits: unknown; raw: {inputSchema: unknown}; invoked: string};
+    for (const text of ["Initial page is zero; omit for the initial read.", "Record ID from the current account lookup receipt."]) {
+      expect(value.guidance).toContain(text);
+      expect(JSON.stringify(value.hits)).toContain(text);
+    }
+    expect(value.guidance).toContain("page_number?: number");
+    expect(value.guidance).toContain("reference: { /** Record ID from the current account lookup receipt. */ id: number");
+    for (const text of ["project_id: number", "expectedResult: string", 'mode: "MANUAL"', "fabric.tools.describe"]) expect(value.large).toContain(text);
+    expect(value.large).not.toContain("(args: unknown)");
+    expect(JSON.stringify(value.hits)).toContain("expectedResult: string");
+    expect(value.raw.inputSchema).toEqual(large);
+    expect(value.invoked).toBe("ok");
   });
 
   it("preserves content-only redaction instead of restoring structured data", async () => {
@@ -172,3 +228,49 @@ it("normalizes the opt-in profile without changing existing defaults", () => {
   expect(normalizeFabricConfig({executor:{codemodeProfile:"native"}}).executor.codemodeProfile).toBe("native");
   expect(normalizeFabricConfig({executor:{codemodeProfile:"invalid"}}).executor.codemodeProfile).toBe("additive");
 });
+
+it.skipIf(process.platform === "win32")("exposes the task id of a detached native shell call", async () => {
+  const f = fixture("native");
+  const result = await f.run('const r = await tools.bash({command:"printf hi", background:true}); return {r, id: typeof r === "object" && r ? r.taskId : undefined};');
+  expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
+  const value = result.value as {r: {output: string; taskId: string}; id: string};
+  expect(value.id).toMatch(/^[0-9a-f-]{36}$/);
+  expect(value.r.output).toContain(`[Task ${value.id};`);
+});
+
+it("resolves an overridden core tool to the single active definition", () => {
+  const read = {name: "read", label: "Read", description: "override", parameters: {type: "object", properties: {}}} as any;
+  const actions = [
+    {provider: "pi", ref: "pi.read", name: "read", description: "core", inputSchema: {}, risk: "read" as const},
+    {provider: "extensions", ref: "extensions.read", name: "read", description: "override", inputSchema: {}, risk: "read" as const},
+  ];
+  const entries = nativeToolCatalog(actions, [read], nativeMcpIdentity);
+  expect(entries.map(entry => entry.ref)).toEqual(["pi.read"]);
+  expect(resolveNativeTool(entries, "read").ref).toBe("pi.read");
+});
+
+it("keeps a non-core extension tool whose name matches no core tool", () => {
+  const actions = [{provider: "extensions", ref: "extensions.echo", name: "echo", description: "e", inputSchema: {}, risk: "read" as const}];
+  expect(resolveNativeTool(nativeToolCatalog(actions, [], nativeMcpIdentity), "echo").ref).toBe("extensions.echo");
+});
+
+describe("an extension override of a core tool", () => {
+  const override = () => defineTool({name: "read", label: "Read", description: "Hash-anchored read", parameters: Type.Object({path: Type.String()}), async execute() { return {content: [{type: "text" as const, text: "override read"}], details: {}}; }});
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it.each(["additive", "native"] as const)("runs the override through nativeTools.read in the %s profile", async profile => {
+    const f = fixture(profile, "quickjs", [override()]);
+    const result = await f.run('return await nativeTools.read({path: "input.txt"});');
+    expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
+    expect(result.value).toBe("override read");
+  });
+
+  it("stays unreachable when the child allowlist hides it", async () => {
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", JSON.stringify(["echo"]));
+    const f = fixture("native", "quickjs", [override()]);
+    const result = await f.run('return await nativeTools.read({path: "input.txt"});');
+    expect(result.success).toBe(false);
+    expect(JSON.stringify(result)).not.toContain("override read");
+  });
+});
+

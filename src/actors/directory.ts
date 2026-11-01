@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import type { FabricActorInfo, FabricActorRequest, FabricActorStorageScope } from "./types.js";
 import { ActorManager } from "./manager.js";
+import { actorNameDecision } from "./name-policy.js";
 
 export interface ActorDirectoryRoots {
   project: string;
@@ -10,6 +11,7 @@ export interface ActorDirectoryRoots {
 export class ActorDirectory extends ActorManager {
   readonly #secondary: ActorManager;
   readonly #defaultScope: FabricActorStorageScope;
+  #directoryCreateTail: Promise<void> = Promise.resolve();
 
   constructor(
     base: ConstructorParameters<typeof ActorManager>,
@@ -68,6 +70,19 @@ export class ActorDirectory extends ActorManager {
 
   override retryCapabilityWaiters(): void { super.retryCapabilityWaiters(); this.#secondary.retryCapabilityWaiters(); }
   override async create(request: FabricActorRequest, options: { asRegistryOwner?: boolean } = {}): Promise<FabricActorInfo> {
+    // Separate from each manager's create queue: super.create must not reacquire
+    // the directory lock. This only serializes callers of this instance.
+    const previous = this.#directoryCreateTail;
+    let release!: () => void;
+    this.#directoryCreateTail = new Promise<void>((resolve) => { release = resolve; });
+    await previous;
+    try {
+      return await this.#createInScope(request, options);
+    } finally {
+      release();
+    }
+  }
+  async #createInScope(request: FabricActorRequest, options: { asRegistryOwner?: boolean }): Promise<FabricActorInfo> {
     const scope = request.scope ?? this.#defaultScope;
     if (scope !== "project" && scope !== "session") {
       throw new Error(`Invalid Fabric actor storage scope: ${String(scope)}`);
@@ -75,8 +90,9 @@ export class ActorDirectory extends ActorManager {
     const name = request.name.trim();
     const sameName = this.list().filter((actor) => actor.name === name);
     const existing = sameName.find((actor) => actor.status !== "stopped");
-    if (existing) throw new Error(`A Fabric actor named ${name} is already active (${existing.id})`);
-    for (const actor of sameName) await this.remove(actor.id);
+    const decision = actorNameDecision(Boolean(existing), sameName.some((actor) => actor.status === "stopped"));
+    if (decision === "active") throw new Error(`A Fabric actor named ${name} is already active (${existing!.id})`);
+    if (decision === "stopped") throw new Error(`A stopped Fabric actor named ${name} already exists (${sameName[0]!.id}); remove it explicitly before creating another`);
     return scope === this.#defaultScope
       ? super.create(request, options)
       : this.#secondary.create(request, options);
@@ -119,5 +135,10 @@ export class ActorDirectory extends ActorManager {
   override get halted(): boolean { return super.halted && this.#secondary.halted; }
   override haltAll(): { halted: number } { const first = super.haltAll(); const second = this.#secondary.haltAll(); return { halted: first.halted + second.halted }; }
   override remove(...args: Parameters<ActorManager["remove"]>): ReturnType<ActorManager["remove"]> { return this.#isPrimary(args[0]) ? super.remove(...args) : this.#secondary.remove(...args); }
-  override async close(): Promise<void> { await Promise.all([super.close(), this.#secondary.close()]); }
+  override async close(): Promise<void> {
+    // Both scopes finish closing before a failure from either is reported.
+    const [primary, secondary] = await Promise.allSettled([super.close(), this.#secondary.close()]);
+    if (primary.status === "rejected") throw primary.reason;
+    if (secondary.status === "rejected") throw secondary.reason;
+  }
 }

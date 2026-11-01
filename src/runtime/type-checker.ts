@@ -1,5 +1,9 @@
 import path from "node:path";
 import ts from "typescript";
+import { wrapFabricGuestCode } from "./transpile.js";
+
+// The Worker-safe half (no node:path) lives in transpile.ts; re-exported for existing importers.
+export { transpileFabricCodeWithSourceMap, wrapFabricGuestCode, type FabricTranspileResult } from "./transpile.js";
 
 export interface FabricTypeError {
   line: number;
@@ -44,9 +48,6 @@ let nextCheckerId = 0;
 export const normalizeTypeScriptPath = (fileName: string): string =>
   fileName.replaceAll("\\", "/");
 
-/** Guest programs execute inside this wrapper; user code starts on wrapped line 2. */
-export const wrapFabricGuestCode = (code: string): string =>
-  `async function __piFabricMain() {\n${code}\n}\n`;
 
 class FabricTypeChecker {
   readonly #guestFile: string;
@@ -180,24 +181,6 @@ const checkerFor = (declarations: string): FabricTypeChecker => {
   return checker;
 };
 
-export interface FabricTranspileResult {
-  code: string;
-  sourceMap?: string;
-}
-
-export const transpileFabricCodeWithSourceMap = (code: string): FabricTranspileResult => {
-  const result = ts.transpileModule(wrapFabricGuestCode(code), {
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2022,
-      module: ts.ModuleKind.ESNext,
-      sourceMap: true,
-    },
-  });
-  return {
-    code: result.outputText,
-    ...(result.sourceMapText ? { sourceMap: result.sourceMapText } : {}),
-  };
-};
 
 export const typeCheckFabricCode = (
   code: string,

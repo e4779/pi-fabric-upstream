@@ -678,4 +678,109 @@ describe("/fabric command", () => {
     expect(notify).toHaveBeenCalledWith(expect.stringContaining("prewalk is disabled"), "error");
   });
 
+  describe("actor targets", () => {
+    const ALPHA = "abc12345-0000-4000-8000-000000000001";
+    const BRAVO = "def67890-0000-4000-8000-000000000002";
+    const ALPHA_TWIN = "abc99999-0000-4000-8000-000000000003";
+
+    function setup(actors: Array<{ id: string; name: string }>) {
+      let handler: ((argumentsText: string, context: ExtensionContext) => Promise<void>) | undefined;
+      const pi = {
+        registerCommand: vi.fn((_name: string, definition: { handler: typeof handler }) => {
+          handler = definition.handler;
+        }),
+      } as unknown as ExtensionAPI;
+      const remove = vi.fn(async () => ({ removed: true }));
+      const stop = vi.fn(async () => ({}));
+      const definition = vi.fn((id: string) => ({ name: id }));
+      const agentStop = vi.fn(async () => {});
+      const createTemplate = vi.fn((def: { name: string }) => ({ name: def.name }));
+      const state = {
+        ensure: vi.fn().mockResolvedValue(undefined),
+        actors: { list: () => actors, remove, stop, definition },
+        agents: { list: () => [], stop: agentStop, cleanup: vi.fn(async () => {}) },
+        globalActors: { create: createTemplate },
+      } as unknown as FabricState;
+      const notify = vi.fn();
+      const context = { ui: { notify } } as unknown as ExtensionContext;
+      registerFabricCommand(pi, {
+        state,
+        fabricUi: {} as FabricUiController,
+        capturedTools: {} as CapturedToolCatalog,
+        applyFabricMode: vi.fn(),
+        suspendToolCapture: vi.fn(),
+        autoArmPrewalk: vi.fn(async () => {}),
+      });
+      return { run: (text: string) => handler!(text, context), remove, stop, definition, agentStop, notify };
+    }
+
+    // The actor named "abc" comes second in list order, after an actor whose
+    // id starts with "abc": the exact name must still win.
+    const nameVersusPrefix = [
+      { id: ALPHA, name: "worker" },
+      { id: BRAVO, name: "abc" },
+    ];
+
+    it("remove prefers an exact name over another actor's id prefix", async () => {
+      const { run, remove } = setup(nameVersusPrefix);
+      await run("remove abc");
+      expect(remove).toHaveBeenCalledOnce();
+      expect(remove).toHaveBeenCalledWith(BRAVO);
+    });
+
+    it("stop prefers an exact name over another actor's id prefix", async () => {
+      const { run, stop } = setup(nameVersusPrefix);
+      await run("stop abc");
+      expect(stop).toHaveBeenCalledOnce();
+      expect(stop).toHaveBeenCalledWith(BRAVO);
+    });
+
+    it("export prefers an exact name over another actor's id prefix", async () => {
+      const { run, definition } = setup(nameVersusPrefix);
+      await run("export abc");
+      expect(definition).toHaveBeenCalledOnce();
+      expect(definition).toHaveBeenCalledWith(BRAVO);
+    });
+
+    it("prefers an exact id over an exact name", async () => {
+      const { run, remove } = setup([
+        { id: BRAVO, name: ALPHA },
+        { id: ALPHA, name: "worker" },
+      ]);
+      await run(`remove ${ALPHA}`);
+      expect(remove).toHaveBeenCalledWith(ALPHA);
+    });
+
+    it("accepts a unique id prefix", async () => {
+      const { run, remove } = setup(nameVersusPrefix);
+      await run("remove def6");
+      expect(remove).toHaveBeenCalledWith(BRAVO);
+    });
+
+    it("refuses an ambiguous id prefix, lists the candidates, and removes nothing", async () => {
+      const { run, remove, agentStop, notify } = setup([
+        { id: ALPHA, name: "worker" },
+        { id: ALPHA_TWIN, name: "twin" },
+      ]);
+      await run("remove abc");
+      expect(remove).not.toHaveBeenCalled();
+      expect(agentStop).not.toHaveBeenCalled();
+      expect(notify).toHaveBeenCalledOnce();
+      const [message, level] = notify.mock.calls[0]!;
+      expect(level).toBe("error");
+      expect(message).toContain("Ambiguous");
+      expect(message).toContain("abc12345 (worker)");
+      expect(message).toContain("abc99999 (twin)");
+    });
+
+    it("stop refuses an ambiguous id prefix", async () => {
+      const { run, stop, notify } = setup([
+        { id: ALPHA, name: "worker" },
+        { id: ALPHA_TWIN, name: "twin" },
+      ]);
+      await run("stop abc");
+      expect(stop).not.toHaveBeenCalled();
+      expect(notify).toHaveBeenCalledWith(expect.stringContaining("Ambiguous"), "error");
+    });
+  });
 });

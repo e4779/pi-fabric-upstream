@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { FabricState } from "../src/fabric-state.js";
-import { createFabricPersistedExecutionDetails } from "../src/audit/index.js";
+import { createFabricPersistedExecutionDetails, FabricExecutionTraceRecorder } from "../src/audit/index.js";
 import { createFabricExecTool } from "../src/fabric-exec-tool.js";
 import { defaultCodePreviewSettings } from "../src/ui/code-preview.js";
 import { FabricToolDisplayController } from "../src/ui/tool-display.js";
@@ -94,6 +94,35 @@ const renderResult = (
 const nestedRows = (rendered: string): string[] => rendered.split("\n").slice(1);
 
 describe("registered fabric_exec compact transcript rendering", () => {
+  it("retains trimmed failure counts on a resumed compact card", () => {
+    const recorder = new FabricExecutionTraceRecorder();
+    const details = createFabricPersistedExecutionDetails({
+      success: true, trace: recorder.seal("succeeded", []),
+      audits: [
+        { ref: "ok", success: true },
+        { ref: "failed", success: false, result: "x".repeat(600_000) },
+      ],
+    });
+    expect(details.omittedCalls).toEqual({ count: 1, done: 1, failed: 1 });
+    expect(Buffer.byteLength(JSON.stringify(details))).toBeLessThanOrEqual(512 * 1024);
+    const resumed = JSON.parse(JSON.stringify(details));
+    const card = renderResult(toolFor(stateFor("compact")), { code: "return 1" }, resumed, "1", { theme: semanticTheme });
+    expect(card).toContain("<error>✗ Tools</error>");
+    expect(card).toContain("2 calls · 1 failed");
+  });
+  it("keeps the shell background hint visible during streamed output, only while waiting", () => {
+    const tool = toolFor(stateFor("full"));
+    const args = { code: "await pi.bash({cmd:'build'})" };
+    const shell = { ref: "pi.bash", provider: "pi", tool: "bash", args: { command: "build" }, preview: { result: "streamed output", shellBackgroundShortcut: true } };
+    const details = { audits: [shell], phases: [], progress: "bash: streamed output" };
+    for (const expanded of [false, true]) {
+      expect(renderResult(tool, args, details, "", { partial: true, expanded })).toContain("Ctrl+B twice");
+      expect(renderResult(tool, args, { ...details, audits: [shell, { ref: "pi.read", tool: "read", success: true }] }, "", { partial: true, expanded })).toContain("Ctrl+B twice");
+    }
+    expect(renderResult(tool, args, { ...details, audits: [{ ...shell, success: true }] }, "", { partial: true })).not.toContain("Ctrl+B twice");
+    expect(renderResult(tool, args, details, "", { partial: false })).not.toContain("Ctrl+B twice");
+    expect(renderResult(tool, args, { ...details, audits: [{ ...shell, preview: { result: "streamed output" } }] }, "", { partial: true })).not.toContain("Ctrl+B twice");
+  });
   it("infers Python compact titles while preserving explicit intent and neutral fallbacks", () => {
     const state = stateFor("compact");
     state.config.executor = { kernel: "python" } as FabricState["config"]["executor"];
@@ -409,6 +438,45 @@ describe("registered fabric_exec compact transcript rendering", () => {
     const expanded = renderResult(toolFor(stateFor("full")), args, persisted, "", { expanded: true });
     expect(expanded).toContain("alpha");
     expect(expanded).toContain("hunk");
+  });
+
+  it("counts resumed audits the size bound dropped from the session record", () => {
+    const args = { code: "return 1" };
+    const audits = Array.from({ length: 40 }, (_, index) => ({
+      ref: "pi.read",
+      provider: "pi",
+      tool: "read",
+      args: { path: `file-${index}.ts` },
+      success: true,
+      result: "y".repeat(30_000),
+    }));
+    const trace = {
+      kind: "pi-fabric.execution",
+      version: 1,
+      outcome: "succeeded",
+      phases: [],
+      operations: audits.map((audit, sequence) => ({
+        type: "call",
+        sequence,
+        ref: audit.ref,
+        provider: audit.provider,
+        action: audit.tool,
+        args: { path: audit.args.path },
+        outcome: "succeeded",
+      })),
+      counts: { droppedValues: 0, truncatedValues: 0, redactedValues: 0, droppedOperations: 0 },
+    };
+    const persisted = JSON.parse(
+      JSON.stringify(createFabricPersistedExecutionDetails({ success: true, trace: trace as never, audits })),
+    ) as { audits: unknown[] };
+    // The 512 KiB bound keeps fewer than 40 audits.
+    expect(persisted.audits.length).toBeLessThan(40);
+
+    const resumed = renderResult(toolFor(stateFor("full")), args, persisted, "", { expanded: true });
+    expect(resumed).toContain("40 nested calls");
+    expect(resumed).toContain(`${40 - persisted.audits.length} nested calls hidden`);
+    const compact = renderResult(toolFor(stateFor("compact")), args, persisted, "");
+    expect(compact).toContain("40 calls");
   });
 
   it("marks trace-only resumed audits instead of fabricating empty content", () => {

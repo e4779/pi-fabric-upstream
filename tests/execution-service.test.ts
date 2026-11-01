@@ -12,6 +12,26 @@ import { PiToolsProvider } from "../src/providers/pi-tools-provider.js";
 import type { FabricActionDescriptor, FabricProvider } from "../src/protocol.js";
 
 describe("FabricExecutionService", () => {
+  it("enforces configured uninterrupted CPU slices without changing the unlimited default", async () => {
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    const service = new FabricExecutionService(new ActionRegistry(), config);
+    const run = (code: string) => service.execute({
+      code, signal: undefined, parentToolCallId: "cpu-slice",
+      context: { cwd: process.cwd(), hasUI: false } as ExtensionContext,
+      onPartial() {},
+    });
+    const busy = 'const end = Date.now() + 100; while (Date.now() < end) {} return "done";';
+    const unlimited = await run(busy);
+    expect(unlimited.success, unlimited.error).toBe(true);
+    expect(unlimited.value).toBe("done");
+    config.executor.maxCpuSliceMs = 20;
+    const bounded = await run(busy);
+    expect(bounded.success).toBe(false);
+    expect(bounded.error).toContain("uninterrupted CPU");
+    const yielding = await run('await new Promise(resolve => setTimeout(resolve, 100)); return "done";');
+    expect(yielding.success, yielding.error).toBe(true);
+    expect(yielding.value).toBe("done");
+  });
   it("defers explicit handoff and completes every later call in the same program", async () => {
     const registry = new ActionRegistry();
     const demoDescriptor = {
@@ -353,6 +373,36 @@ return "complete outer result";
 
     await expect(execution).resolves.toMatchObject({ success: true, value: true });
     expect(activity.get("reset-during-stream")).toBeUndefined();
+  });
+
+  it("marks a run cancelled from the abort signal, not from its error text", async () => {
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.fullCodeMode = false;
+    const activity = new FabricActivityStore();
+    const service = new FabricExecutionService(new ActionRegistry(), config, activity);
+    const context = { cwd: process.cwd(), hasUI: false } as ExtensionContext;
+
+    const failed = await service.execute({
+      code: 'throw new Error("order was cancelled upstream");',
+      signal: undefined,
+      parentToolCallId: "error-mentions-cancel",
+      context,
+      onPartial() {},
+    });
+    expect(failed.success).toBe(false);
+    expect(activity.get("error-mentions-cancel")?.status).toBe("failed");
+
+    const controller = new AbortController();
+    const aborted = service.execute({
+      code: "await new Promise(() => {});",
+      signal: controller.signal,
+      parentToolCallId: "aborted-run",
+      context,
+      onPartial() {},
+    });
+    queueMicrotask(() => controller.abort());
+    await aborted.catch(() => undefined);
+    expect(activity.get("aborted-run")?.status).toBe("cancelled");
   });
 
   it("throttles continuous nested progress without starving intermediate snapshots", async () => {

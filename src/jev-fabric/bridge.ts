@@ -46,18 +46,36 @@ type Modules = {
   resolve: typeof import("./resolve.js");
 };
 
+const DEFAULT_HOME = ".jev-fabric-native";
+
 /**
  * jev-fabric rejects storage paths with symlink components (macOS `/var`,
  * `/tmp`), so canonicalize the deepest existing ancestor and keep the rest.
  */
 export const resolveJevFabricHome = (settings: DurableShellSettings, cwd: string): string => {
-  const requested = path.resolve(cwd, settings.home || process.env.JEV_FABRIC_HOME || ".jev-fabric-native");
+  const requested = path.resolve(cwd, settings.home || process.env.JEV_FABRIC_HOME || DEFAULT_HOME);
   const rest: string[] = [];
   for (let current = requested; ; current = path.dirname(current)) {
     try { return path.join(fs.realpathSync.native(current), ...rest); } catch {
       if (path.dirname(current) === current) return requested;
       rest.unshift(path.basename(current));
     }
+  }
+};
+
+/**
+ * The default store lives in the working directory, often a Git checkout. Give
+ * it a `*` .gitignore before jev-fabric creates anything, so job folders and
+ * stop markers never show as untracked files. A configured home is left alone.
+ */
+const ignoreDefaultJevFabricHome =(settings: DurableShellSettings, cwd: string): void => {
+  if (settings.home || process.env.JEV_FABRIC_HOME) return;
+  const home = resolveJevFabricHome(settings, cwd);
+  try {
+    fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(home, ".gitignore"), "*\n", { flag: "wx", mode: 0o600 });
+  } catch {
+    // Exists already, or the directory is not writable; jev-fabric reports the latter itself.
   }
 };
 
@@ -101,7 +119,13 @@ export class DurableShellBridge {
       pending.catch(() => this.#resolutions.delete(key));
       this.#resolutions.set(key, pending);
     }
-    return pending;
+    // Durable jobs and sessions resolve before they create the store; Jev decisions
+    // never write it, and a failed resolution leaves the working directory alone.
+    if (requirement !== "durable" && requirement !== "sessions") return pending;
+    return pending.then(resolution => {
+      ignoreDefaultJevFabricHome(this.options.settings(), this.options.cwd);
+      return resolution;
+    });
   }
 
   async #cli(): Promise<JevFabricCli> {

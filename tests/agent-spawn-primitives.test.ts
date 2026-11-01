@@ -339,6 +339,79 @@ describe("agent manager spawning primitives", () => {
     expect(readAgentLineage(secondArgs.lineage)).toMatchObject({ runId: second.id, childIndex: 1 });
   });
 
+  it("grants the routed question tool to Pi children only when dialogs route", async () => {
+    const cwd = tempRoot("pi-fabric-question-tool-");
+    const launchedTools = async (
+      config: Partial<typeof DEFAULT_FABRIC_CONFIG.agents>,
+      request: Partial<AgentRunRequest> = {},
+    ): Promise<string[]> => {
+      const { manager, runRoot } = createManager(cwd, {}, config);
+      const result = await manager.run({ task: "x", transport: "process", ...request });
+      return JSON.parse(launchArgs(runRoot, result.id).tools!) as string[];
+    };
+    const defaults = DEFAULT_FABRIC_CONFIG.agents.defaultTools;
+    expect(await launchedTools({})).toEqual(defaults);
+    expect(await launchedTools({ childQuestions: "route" })).toEqual([...defaults, "ask"]);
+    expect(await launchedTools({ childQuestions: "route" }, { tools: ["read"] })).toEqual(["read", "ask"]);
+    expect(await launchedTools({ childQuestions: "route" }, { tools: ["read", "ask"] })).toEqual(["read", "ask"]);
+    expect(await launchedTools({ childQuestions: "route" }, { tools: ["read"], runner: "pi-durable" }))
+      .toEqual(["read", "ask"]);
+    expect(await launchedTools({ childQuestions: "route", childQuestionTools: ["question"] }, { tools: ["read"] }))
+      .toEqual(["read", "question"]);
+    expect(await launchedTools({ childQuestions: "route", childQuestionTools: [] }, { tools: ["read"] }))
+      .toEqual(["read"]);
+    expect(await launchedTools({ childQuestions: "route" }, { tools: ["read"], extensions: false }))
+      .toEqual(["read"]);
+    // An explicit empty list means no tools, and Pi refuses a plain name
+    // mixed into a +name/-name list.
+    expect(await launchedTools({ childQuestions: "route" }, { tools: [] })).toEqual([]);
+    expect(await launchedTools({ childQuestions: "route" }, { tools: ["+grep", "-write"] }))
+      .toEqual(["+grep", "-write"]);
+  });
+
+  it("never widens an inherited tool allowlist with the question tool", async () => {
+    const cwd = tempRoot("pi-fabric-question-tool-nested-");
+    const launchedTools = async (tools = ["read"]): Promise<string[]> => {
+      const { manager, runRoot } = createManager(cwd, {}, { childQuestions: "route" });
+      const result = await manager.run({ task: "x", transport: "process", tools });
+      return JSON.parse(launchArgs(runRoot, result.id).tools!) as string[];
+    };
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", JSON.stringify(["read"]));
+    expect(await launchedTools()).toEqual(["read"]);
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", JSON.stringify(["read", "ask"]));
+    expect(await launchedTools()).toEqual(["read", "ask"]);
+    // The inherited filter drops the -ask modifier; the caller's exclusion
+    // still holds.
+    expect(await launchedTools(["-ask"])).not.toContain("ask");
+  });
+
+  it("never gives a child fabric_exec its parent was not allowed", async () => {
+    const cwd = tempRoot("pi-fabric-fabric-exec-nested-");
+    const launchedTools = async (
+      request: Partial<AgentRunRequest>,
+      options: ConstructorParameters<typeof AgentManager>[2] = {},
+    ): Promise<string[]> => {
+      const { manager, runRoot } = createManager(cwd, options);
+      const result = await manager.run({ task: "x", transport: "process", tools: ["read"], ...request });
+      return JSON.parse(launchArgs(runRoot, result.id).tools!) as string[];
+    };
+    // A parent launched without fabric_exec: neither recursion, full code
+    // mode nor a Fabric kernel may hand its child the tool.
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", JSON.stringify(["read"]));
+    expect(await launchedTools({ recursive: true })).toEqual(["read"]);
+    expect(await launchedTools({ extensions: true }, { fullCodeMode: true })).toEqual(["read"]);
+    expect(await launchedTools({ extensions: true, kernel: "typescript" })).toEqual(["read"]);
+    // A catch-all pattern does not cover fabric_exec either.
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", JSON.stringify(["*"]));
+    expect(await launchedTools({ recursive: true })).toEqual(["read"]);
+    // A parent that holds fabric_exec still passes it on.
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", JSON.stringify(["read", "fabric_exec"]));
+    expect(await launchedTools({ recursive: true })).toEqual(["read", "fabric_exec"]);
+    // The host (no inherited allowlist) is unrestricted.
+    vi.stubEnv("PI_FABRIC_TOOL_ALLOWLIST", undefined);
+    expect(await launchedTools({ recursive: true })).toEqual(["read", "fabric_exec"]);
+  });
+
   it("inherits lineage roots and the caller policy in nested managers", async () => {
     const cwd = tempRoot("pi-fabric-wp7-nested-");
     fs.mkdirSync(path.join(cwd, "inside"));
@@ -427,6 +500,27 @@ describe("agent manager spawning primitives", () => {
         : "echo installing; echo broken >&2; exit 3",
     })).rejects.toThrow(/Worktree setup command exited with 3:\n[\s\S]*broken/);
     expect(git(repository, "worktree", "list", "--porcelain")).toBe(before);
+  });
+
+  it("reports recovery coordinates when spawn rollback fails", async () => {
+    const repository = initRepository();
+    const { WorktreeManager } = await import("../src/agents/worktree-manager.js");
+    const spy = vi.spyOn(WorktreeManager.prototype, "cleanup").mockRejectedValueOnce(new Error("injected cleanup failure"));
+    try {
+      const { manager } = createManager(repository);
+      const error = await manager.spawn({ task: "never launched", transport: "process", worktree: true,
+        worktreeSetup: process.platform === "win32" ? "echo broken 1>&2 & exit 3" : "echo broken >&2; exit 3" }).catch((e) => e);
+      expect(error).toBeInstanceOf(AggregateError);
+      expect(error.message).toContain("Worktree setup command exited with 3");
+      expect(error.message).toContain("injected cleanup failure");
+      expect(error.message).toContain(JSON.stringify(fs.realpathSync.native(repository)));
+      const worktree = git(repository, "worktree", "list", "--porcelain").split("\n").filter((line) => line.startsWith("worktree "))[1]!.slice(9);
+      const branch = git(repository, "branch", "--list", "pi-fabric/*").trim().replace(/^\*?\+?\s*/, "");
+      expect(error.message).toContain(JSON.stringify(fs.realpathSync.native(worktree)));
+      expect(error.message).toContain(branch);
+      git(repository, "worktree", "remove", "--force", worktree);
+      git(repository, "branch", "-D", branch);
+    } finally { spy.mockRestore(); }
   });
 
   it("parses the new worker arguments", () => {

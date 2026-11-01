@@ -32,13 +32,38 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 `agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop.
 
+### Queued spawns
+
+By default `agents.spawn` waits inside the call for a free `agents.maxConcurrent` slot. A program that spawns more children than the limit blocks there, and if its deadline passes first, the waiting spawns never launch and the program cannot return the ids of the runs that did.
+
+`agents.spawn({ ..., queue: true })` returns at once with `status: "queued"` and the run's `id`. The run starts when a slot frees, first come first served, even after the program that spawned it has ended. Its `timeoutMs` counts from its start, not from the spawn call. Meanwhile `agents.wait`, `agents.status`, and `agents.list` accept the id and report `queued`; `wait` resolves with the final result once the run starts and finishes. `agents.stop` on a queued run cancels it without launching and returns a `stopped` result. `agents.cleanup` removes a cancelled queued run; a queued run must be stopped first. `agents.steer`, `agents.followUp`, and `agents.log` need a started run and throw until then. If the launch fails after admission (an unavailable model, a worktree error), the run ends `failed` with that error and a detached run reports it like any other completion. Request validation errors still reject the `spawn` call itself. `queue` is not available with `residency: "durable"`. A [background program](background-tasks.md) (`fabric_exec` with `background: true`) is the other way to keep a long spawn loop from blocking Main, but each spawn in it still waits for a slot.
+
+```ts
+const handles = await Promise.all(tasks.map((task) => agents.spawn({ task, queue: true })));
+return handles.map((handle) => handle.id);
+```
+
 Durable spawns use the same inbox. Undelivered envelopes survive disconnects; receipts survive reconnects. Escape or an errored Main turn parks pending results until new input; Main does not restart immediately. Explicit lifecycle subscriptions, actor messages, and trajectory handoffs retain their separate delivery policies. A terminal run can still report incomplete work; Main must inspect its result.
 
 ### Stalled Pi error recovery
 
 After a failed or aborted assistant response (including `Error: Terminated`), Fabric allows Pi's own retries to recover. If no recovery output arrives for 60 seconds, the worker fails the run with the original error and terminates the child, escalating from SIGTERM to SIGKILL after another 5 seconds. Repeated retry announcements, errors, or lifecycle events do not extend this deadline. Nonempty text/thinking/tool-call deltas refresh it; a successful assistant response clears it. Healthy inference and tool execution are not subject to this recovery timer, and the overall run deadline still applies.
 
-Fabric handles exhausted retries explicitly without waiting forever on an earlier `willRetry` flag. Child shutdown after RPC stdin closes is also bounded: 5 seconds for graceful exit, then SIGTERM and a further 5 seconds before SIGKILL. These failures settle `agents.wait`/`join` and notify detached callers normally; they do not automatically replay potentially side-effecting work. Already-running workers must be stopped and respawned to use the fix.
+Fabric handles exhausted retries explicitly without waiting forever on an earlier `willRetry` flag. Child shutdown after RPC stdin closes is also bounded: 5 seconds for graceful exit, then SIGTERM and a further 5 seconds before SIGKILL. When the child already gave its final answer, a slow exit does not fail the run: it stays `completed` with that answer, and the run log records a `fabric_exit_warning` event. Without a final answer (an error, or a last message that stopped on a tool call), the run fails. These failures settle `agents.wait`/`join` and notify detached callers normally; they do not automatically replay potentially side-effecting work. Already-running workers must be stopped and respawned to use the fix.
+
+### Stalled Pi stream
+
+A Pi turn that goes silent fails; it does not stay `running`. If no model, tool or turn event arrives for 30 minutes while the turn is waiting on the model, the worker fails the run with `Pi stream stalled` and terminates the child as above. That frees the run's concurrency slot. Extension widget and status requests and queue updates do not count as events, because a stalled child can still send several of them a second. The timer does not run while a tool call runs, while the session compacts, while a child question waits for the parent, or between turns. A slow tool or a long human answer therefore never triggers it. 30 minutes is longer than any single model response we have measured.
+
+The worker also enforces each `fabric_exec` call's program deadline from outside the child. The child's progress updates for the call carry the current deadline in `details.deadlineAt`. The update clears the field while a human wait pauses the deadline. If the call is still running 5 minutes after the last reported deadline, the worker fails the run with a message that names the tool call and terminates the child. A host call that never settles cannot hold the run past its deadline this way.
+
+### Pi task consumed without a turn
+
+A Pi extension can take the first task prompt without starting a turn, for example an `input` hook that returns `handled`. Pi then answers the prompt with `disposition: "handled"` and sends no `agent_start`. The worker sends the task with the id `fabric-task` and follows only that reply. If the reply says `handled` and no turn starts within 60 seconds, or the child exits first, the run fails with `Pi handled the task without starting a turn; terminating child`. The wait covers an extension command that handled the prompt and then starts its own turn. The failure also carries the last warning or error notice the child sent before the reply, flattened and limited to 500 characters, so the parent sees why the task was refused. If the reply carries an absent disposition (an older Pi host) and the child starts no turn within 300 seconds, the run also fails with a message that starts `Pi acknowledged the task`. Later steer, follow-up and operator commands are not tracked. The task is not replayed.
+
+### Pi run that ends on a tool call
+
+A tool can end a Pi run by returning `terminate: true`, as a compaction tool may do. Pi then stops after that tool batch, and the run's last assistant message is the tool call, with no final answer after it. The `pi` and `pi-durable` runners settle such a run `failed` with `Pi ended the run after a tool call without a final answer (tool: <name>)`. Any text the model wrote before the tool call stays in `text`. Work the tool planned to run afterwards, such as a follow-up prompt after compaction, does not happen in a child, because the worker closes the child once it settles. Leave tools that end the run out of a child's `tools` allowlist.
 
 ### Image-heavy lifecycle events
 
@@ -50,7 +75,36 @@ The 4,194,304-character guard still applies to other event data, including a sin
 
 Use `agents.models({ runner: "pi" })` and copy the returned `key` verbatim, or use an explicitly configured `models.aliases` name. Reuse the `model` returned by a successful spawn. Do not reconstruct it from an agent's display name. For example, an agent named “Sol” need not share the version number of one named “Astra”. Prior success with one key does not validate a different key.
 
-`provider/model` selectors prefer an exact visible match. A near-miss ID resolves to the closest available model on the **same provider**, using Fabric's existing similarity ranking; ties prefer recent usage, then canonical key order. For example, `openai-codex/gpt-6-sol` resolves to `openai-codex/gpt-5.6-sol` when that is the closest visible model. The returned handle's `model` and the worker's `requestedModel` contain the canonical selection. Unknown providers and names without sufficient resemblance still fail before launch. Model IDs containing `/` stay provider-scoped. Configured aliases keep their ordered, exact-target fallback chains.
+To check one known key without reading the whole list, pass it as `model`: `agents.models({ runner: "pi", model: "provider/id" })` returns only the entries whose `key` equals that string exactly and case-sensitively, so a missing model gives `[]`. This lookup does not resolve aliases or near matches, and it filters the Claude, Veda, and registered-runner lists the same way.
+
+`provider/model` selectors prefer an exact visible match. A near-miss ID resolves to the closest available model on the **same provider**, using Fabric's existing similarity ranking; ties prefer recent usage, then canonical key order. For example, `openai-codex/gpt-6-sol` resolves to `openai-codex/gpt-5.6-sol` when that is the closest visible model. The returned handle's `model` and the worker's `requestedModel` contain the canonical selection. Unknown providers and names without sufficient resemblance still fail before launch. Model IDs containing `/` stay provider-scoped. Configured aliases keep their ordered, exact-target fallback chains. To turn the alias and near-miss steps off, see [exact model match](#exact-model-match).
+
+### Exact model match
+
+Set `modelMatch: "exact"` on `agents.run` or `agents.spawn` to select a named model without fallback. **This is not a security guarantee or final-dispatch enforcement.** Later hooks, unknown API payloads, providers, and extension-made calls can route data elsewhere; attribution may detect drift only after a call. Do not rely on this mode to prevent data disclosure. `model` is then required and must be a `provider/id` that `agents.models({ runner: "pi" })` lists. Fabric skips the `models.aliases` step (an alias named like the model is ignored), the closest-match step, and the fuzzy step, and it applies no alias `thinking` level. Matching ignores case, as it does for other exact lookups, and the handle reports the registry's own spelling. When two registry entries differ only by case, the identical spelling wins, and Fabric authenticates that same entry. Without `modelMatch`, resolution is unchanged.
+
+Fabric refuses these requests before any child starts:
+
+- `model` is missing or not in `provider/id` form: `modelMatch "exact" requires model in provider/id form, as listed by agents.models({ runner: "pi" }).`
+- The model is not in the visible registry: the usual `Model "<selector>" is not available to this Pi session.` error, which names `agents.models({ runner: "pi" })`.
+- The runner is not `pi` or `pi-durable`: `modelMatch "exact" is supported only by the pi and pi-durable runners.` Claude, Veda, and registered runners forward `model` to a backend that can apply its own aliases, so Fabric cannot promise that model and refuses the request.
+- The value is not `"exact"`: the input schema rejects it, and a direct request fails with `Invalid Fabric agent modelMatch`.
+
+The mode holds on every launch path, including a retry or resume of the same run and `residency: "durable"`, where the resident host resolves the model again with the same mode. It is not accepted by `agents.handoff`, `agents.create`, actor activations, or the hosted `AgentService`; their schemas reject it.
+
+What `modelMatch: "exact"` does (subject to the limitations above):
+
+1. **Fabric picks the listed `provider/id` and nothing else.** There is no alias, closest-match or fuzzy step, and no `thinking` level comes from an alias. A model that `agents.models({ runner: "pi" })` does not list is refused before any child starts.
+2. **Admission is strict.** An exact request always uses strict model admission, whatever `agents.modelAdmission` says. This covers the first launch, a startup retry, a resume, and the resident host. Permissive admission accepts a child that reports a different model after selection, and an exact run never does.
+3. **The guard checks observable model changes and requests.** When it detects a different session model or a known payload model mismatch, it stops the child at that check and the run fails with `Fabric exact model pin violated: only <pin> may run, but <actual> was about to run. The provider call was stopped before any request was sent.` The worker loads the `model-pin-guard` Pi extension into the child with `-e`, the same way it loads the write guard, and it loads even with `extensions: false`. The guard knows the pinned `provider/id` and checks three things:
+   - **Model switches.** On the `model_select` event, any model other than the pin ends the run. This detects emitted switches and stops the child, including when Pi's own compaction or branch summaries use the changed session model; independent calls and provider routing remain outside the guard. Pi emits `model_select` only when the model changes. The launch with `--model <pin>`, Fabric's startup `set_model` to the same pin, and a different default model in settings never reach the guard as a switch.
+   - **The current model before each request.** The `context`, `context_with_system` and `before_provider_request` events must show the pin as Pi's current model.
+   - **The outgoing payload.** In `before_provider_request`, the guard compares the model id inside the payload with the registry `id` of the pin, which is the value Pi sends. It does this only for APIs whose payload shape carries the model id in a known field: `model` for `openai-completions`, `openai-responses`, `openai-codex-responses`, `anthropic-messages`, `mistral-conversations`, `google-generative-ai`, `google-vertex` and `pi-messages`, and `modelId` for `bedrock-converse-stream`. It skips Azure OpenAI Responses, whose payload names a deployment, virtual models, APIs that extensions register, and any payload without a string in that field. A rewrite made by a handler that is loaded before the guard is caught. A rewrite made by a handler that runs after the guard is not.
+
+   On a detected violation the guard writes one `[pi-fabric] model-pin-violation` line to stderr and ends the child process with status 71 at that check. The error's pre-send wording refers to the intercepted request, not to prior calls or undetected rerouting. Pi ignores an exception thrown by an extension handler. `ctx.abort()` also stopped the call in Pi 1.0.4 probes, because credential lookup ahead of the provider honours the aborted signal, but the run would then fail as a plain abort with no fixed reason. Ending the process depends on neither behaviour. A pin failure is final: Fabric neither retries nor resumes it, whatever words the model ids contain.
+4. **The guard is not final-dispatch enforcement.** A guard inside the child process cannot stop extension code in that process from calling another model. This covers nested model calls from tools, custom compaction that summarizes with another model, a provider that an extension re-registers under the pinned name so that it forwards to another model, and a payload rewrite by a handler that runs after the guard. The strict attribution check on assistant messages stays as a second line of defence: it fails the run afterwards where a reply names another model, after the call has been made.
+
+A project extension that emits a detected model switch at `before_agent_start`, between turns, inside a tool, or inside a `context` handler causes the guard to end the run; this does not rule out other calls or later rerouting. This also holds at `session_start`: an extension that switches the model there and relied on Fabric to switch it back now fails an exact run, because the guard cannot tell that switch from one that is followed by a summary on the other model. Run such an extension with a default request, or set `extensions: false` for the exact run.
 
 For independent launches, await `Promise.allSettled` and inspect every result. An uncaught `Promise.all` rejection ends the Fabric program and can abort sibling calls still in flight; it does not prove every requested model was unavailable. Already completed calls are not rolled back, so retain successful handles and retry only failed launches.
 
@@ -60,6 +114,83 @@ return results.map(result => result.status === "fulfilled"
   ? { ok: true, handle: result.value }
   : { ok: false, error: String(result.reason) });
 ```
+
+### Child system prompt
+
+`systemPrompt` on `agents.run` or `agents.spawn` adds text to the child's system prompt. Fabric joins it ahead of any [component model guidance](components.md), and Pi and Claude children append the result to their system prompt with `--append-system-prompt`. A Veda child receives it as a `<system_instructions>` block in its prompt. A blank value is ignored, and durable `agents.spawn` refuses it.
+
+### Child skills
+
+`skills` on `agents.run` or `agents.spawn` chooses the child's Pi skills by name. Fabric looks up each name among the skills this session has loaded, as Pi lists them in its `skill:` commands. A child never gets a skill this session does not have, and a path in place of a name is refused.
+
+| Value | The child gets |
+| --- | --- |
+| omitted | Pi's own skill discovery, as before. |
+| `false` | No skills. |
+| `["writing", "review"]` | Those skills preloaded in full, plus this session's other skills in its skill list. |
+| `{ preload: ["writing"], inherit: false }` | Only the preloaded skills. |
+
+A preloaded skill is placed in the child's system prompt in full, in the `<skill>` block Pi uses for `/skill:name`, after any `systemPrompt` and ahead of component model guidance. Fabric starts the child with `--no-skills` and one `--skill` for each skill it may still list, so it does not run its own discovery. Fabric's bundled skills come from the parent's list too; a child with `skills: false` has none of them.
+
+An unknown name fails before any child starts. The error lists this session's skill names and suggests the closest one. A listed skill whose file cannot be read also fails. Only the `pi` and `pi-durable` runners accept `skills`; Claude and Veda children refuse it before launch, including `skills: false`. `extensions: false` children accept it, because Pi loads skills without extensions. Durable `agents.spawn` refuses it, like `systemPrompt`.
+
+### Named agent files
+
+A named agent file saves the settings of a child agent in a Markdown file with YAML frontmatter. Pass its name as `agent` to `agents.run` or `agents.spawn` and Fabric fills the request from the file. Files written for Claude Code subagents and for Pi agent profiles load unchanged.
+
+```ts
+const reviewer = await agents.run({ agent: "reviewer", task: "Review the diff on this branch" });
+// A field you pass on the call wins over the file.
+const quick = await agents.run({ agent: "reviewer", task: "Skim the diff", thinking: "low" });
+```
+
+An agent file looks like this:
+
+```md
+---
+name: reviewer
+description: Reviews a diff for defects
+tools: Read, Grep, Glob
+model: cheap
+effort: high
+runtimes:
+  fabric:
+    timeoutMs: 1800000
+---
+
+You review diffs. Report defects only.
+```
+
+**Where Fabric looks.** Fabric reads the visible `*.md` files directly inside two folders, with no recursion. It skips names that start with a dot. From lowest to highest precedence:
+
+1. `agents/` inside the Pi agent directory (`~/.pi/agent/agents` unless `PI_CODING_AGENT_DIR` says otherwise).
+2. `.pi/agents` at the project root Fabric uses for the mesh.
+
+A project file shadows a user file with the same `name`. Fabric reads the project folder only when the host trusts the project, and says so when it skips a folder that exists. The folder list is the `AGENT_FILE_FOLDERS` constant in `src/agents/agent-files.ts`.
+
+**Fields.**
+
+| Frontmatter | Becomes | Notes |
+| --- | --- | --- |
+| `name` | the run name | Required. 1 to 64 characters from letters, digits, `.`, `_` and `-`, starting with a letter or digit. The call's `name` wins. |
+| `description` | nothing | Shown by `agents.definitions()`. |
+| body | `systemPrompt` | The text after the frontmatter. It is handled exactly like a `systemPrompt` passed on the call (see [Child system prompt](#child-system-prompt)): Fabric joins it ahead of any component model guidance. |
+| `model` | `model` | Resolved like a call's `model`, so `models.aliases` names and their thinking levels apply. `inherit` or no value sets nothing. |
+| `tools` | `tools` | A YAML list or a comma-separated string. Claude Code names map to Pi names without regard to case: `Read` to `read`, `Grep` to `grep`, `Glob` to `find`, `LS` to `ls`, `Bash` to `bash`, `Edit`, `MultiEdit` to `edit`, `Write` to `write`. Other names stay as written. No value means the default allowlist. |
+| `thinking` or `effort` | `thinking` | One of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Writing both is an error. |
+| `skills` | `skills` | Skill names to preload (see [Child skills](#child-skills)), as a YAML list or a comma-separated string. An entry can also be `{ name, required }`; a missing skill with `required: false` is skipped with a warning. `source` and `version` load with a warning and are not used. A path is an error. An empty list preloads nothing. |
+| `context.skills` | `skills.inherit` | `true` (the default) keeps this session's other skills in the child's skill list; `false` leaves only the preloaded ones. Other `context` keys are ignored with a warning. |
+| `runtimes.fabric` | request fields | Fabric-only settings under their request field names: `runner`, `kernel`, `model`, `thinking`, `tools`, `timeoutMs`, `readOnly`. They win over the shared fields above. An unknown key is an error. |
+
+Any other top-level field, such as `color`, `delegate` or `permissionMode`, is ignored. Fabric reports each one as a warning in `agents.definitions()` and in the run's progress notice. It never fails the run, so a file written for another tool keeps loading. Pi agent profiles accept only seven keys, so a file in `.pi/agents` that you share with that tool must keep to them. Put Fabric-only settings under `runtimes.fabric` only in a folder that tool does not read.
+
+**Override rule.** Fabric fills a request field from the file only when the call leaves it out. A field passed on the call, including an empty list, always wins. `agents.spawn` with `residency: "durable"` refuses a file that has a body, because a durable spawn does not accept `systemPrompt`.
+
+**Errors.** An unknown name fails before any child starts. The message lists the available names and suggests the closest one. A file Fabric cannot read fails with the file path and the line, for example a missing closing `---`, a duplicate key, an unknown thinking level, or an unknown `runtimes.fabric` key. A broken project file never falls back to a user file of the same name.
+
+**Listing.** `agents.definitions()` returns `{ name, description, path, scope, shadows?, warnings, error? }[]` with `scope` set to `"user"` or `"project"`. `shadows` is the path of the user file a project file replaces. A file that cannot be read appears with an `error`. The call reads the folders each time and starts no child.
+
+Fabric does not read actor templates from files (they stay in `global-actors.json`), and does not look in `.claude/agents`. Fabric loads the file reader and its YAML parser on first use, so a session that never names an agent does not pay for them.
 
 ### Requested models are authoritative
 
@@ -71,7 +202,7 @@ Startup waits for a correlated RPC readiness response. Startup, model admission,
 
 Selectors with no available match, rejected/malformed RPC responses, or a remaining model mismatch fail the run without sending its task. A startup or admission stall exhausts the overall deadline with `timed_out`, also without sending the task. Queued controls wait for admission too. After parent-side selector resolution, the worker must use that canonical model: it does not substitute an MRU model or fall back during admission. Standalone `AgentManager` callers can also supply a unique exact bare model ID; ambiguous IDs must be provider-qualified.
 
-`requestedModel` preserves launch intent in run records; `model` follows verified child state and actual assistant attribution. The manager and participant UI preserve that observed value; the launch label cannot overwrite it. If assistant attribution drifts after admission, Fabric terminates the child and reports both requested and observed models in the failure. This verifies Pi's local provider/model identity, not a remote provider's internal routing.
+`requestedModel` in run records is the model Fabric selected at launch, after alias and near-miss resolution, not the caller's selector (with `modelMatch: "exact"` the two name the same model); `model` follows verified child state and actual assistant attribution. The manager and participant UI preserve that observed value; the launch label cannot overwrite it. If assistant attribution drifts after admission, Fabric terminates the child and reports both requested and observed models in the failure. This verifies Pi's local provider/model identity, not a remote provider's internal routing.
 
 Existing workers are not retroactively changed by rebuilding or reloading the parent. Stop and respawn affected workers to apply model admission.
 
@@ -134,7 +265,9 @@ Set `cwd` on `agents.run()` or `agents.spawn()` to choose a leaf or recursive Pi
 
 For Pi children, selecting `cwd` neither grants nor requires project trust. Fabric adds no trust gate and passes neither `--approve` nor `--no-approve`; Pi loads `AGENTS.override.md`, `AGENTS.md`, and `CLAUDE.md` under its normal context rules, while protected project resources remain governed by Pi's saved decisions and `defaultProjectTrust`. Each runner keeps its native startup behavior. A generated worktree is evaluated at its own canonical path.
 
-Extension-enabled Pi children inherit the parent’s full-code mode, including ordinary non-recursive leaves. They retain `fabric_exec` as the outer tool, and their optional `tools` allowlist also constrains nested Pi and captured-tool calls. `extensions: false` explicitly opts out; Claude/Veda and parents outside full-code mode keep their existing tool surfaces. Recursive children additionally receive only the delegated `agent` risk. An inherited optional-tool allowlist is intersected with requested/default descendant tools before launch (including durable transfer); malformed inherited allowlists fail closed. Selecting another cwd cannot restore filtered tools. This is not filesystem isolation: enabled tools, trusted extensions, and native execution retain their normal host privileges. A launch-policy change requires `/reload` and newly launched children; it does not hot-swap an already running worker’s tools.
+Extension-enabled Pi children inherit the parent’s full-code mode, including ordinary non-recursive leaves. They retain `fabric_exec` as the outer tool, and their optional `tools` allowlist also constrains nested Pi and captured-tool calls. `extensions: false` explicitly opts out; Claude/Veda and parents outside full-code mode keep their existing tool surfaces. Recursive children additionally receive only the delegated `agent` risk. An inherited optional-tool allowlist is intersected with requested/default descendant tools before launch (including durable transfer); malformed inherited allowlists fail closed. Selecting another cwd cannot restore filtered tools. Recursive `fabric_exec` authority requires an exact inherited entry: `*` and signed selectors cannot grant it. Resident transfers carry `AgentRunRequest.recursiveToolAuthority?: "deny"`, a host-only attenuation field omitted from public provider arguments (a caller cannot use it to grant permission), and both Pi runners exclude `fabric_exec` at native wildcard expansion when it was not explicitly granted by launch policy. Relative `+name`/`-name` selectors under an inherited restriction retain only explicitly added, permitted names; they cannot restore unknown target defaults. This is not filesystem isolation: enabled tools, trusted extensions, and native execution retain their normal host privileges. A launch-policy change requires `/reload` and newly launched children; it does not hot-swap an already running worker’s tools.
+
+An extension-enabled Pi child loads the parent's Fabric build with `-e`, and it also loads the packages in its Pi settings. Those can name a different Fabric build, for example after a Fabric upgrade while the parent session keeps running. The Fabric copy named on the command line then takes precedence: any other copy of the `pi-fabric` package writes one `is inactive` warning and registers nothing, so the child still starts with exactly one `fabric_exec`. When several copies are named on the command line, the first one wins. A top-level `pi` without `-e` keeps the build from its settings.
 
 ### Durable participant residency
 
@@ -163,7 +296,7 @@ return { audit, supervisor };
 
 The first durable request starts one hidden resident host for the current root when needed. Fabric transfers actor ownership to this host or starts the one-shot run there. It publishes the owner in the standard participant directory. Fabric routes `steer`, `followUp`, `tell`, blocking `ask`, and `stop` through the acknowledged mesh control plane. The process uses the captured agent, mesh, timeout, recursion, and cost-ceiling configuration. It also uses the runner, model, and tool capabilities that the originating call explicitly authorized. Users do not configure a daemon profile or workflow policy.
 
-The original TUI can shut down after the transfer. Durable agents continue until they reach a terminal status. A resumed copy of the same root can call `agents.status`, `agents.wait`, `agents.log`, and `agents.cleanup`. The mesh stores terminal notifications and active actor deliveries until Main resumes. Durable actors keep their registry definition, mailbox history, runner session, mesh subscriptions, and replay cursor. Main relays session-bound host events while it is available. The cross-process relay can omit oversized raw image blocks. The relay keeps their redacted media descriptors.
+The original TUI can shut down after the transfer. Durable agents continue until they reach a terminal status. A resumed copy of the same root can call `agents.status`, `agents.wait`, `agents.log`, and `agents.cleanup`. A new root session in the same project can call `agents.status`, `agents.wait`, and `agents.log` for that durable agent too. The project boundary is the mesh root (`<project>/.pi/fabric/mesh` unless `mesh.root` says otherwise), and a run in another mesh root stays unknown. The read needs no opt-in from the run, and `agents.status` returns the full record, including `text`. It only reads: the completion receipt, `agents.cleanup`, and notifications stay with the root that spawned the agent. A scoped session reads only a run whose scope its own scope covers (same principal, every grant), and it never reads a run launched without a scope. If the run is unfinished and its resident host is not running, a wait from the owning root restarts the host for a hosted run (see hosted runs). `agents.wait` from another root fails instead, because it never starts that root's host. Resume the spawning session to re-attach a hosted run. The mesh stores terminal notifications and active actor deliveries until Main resumes. Durable actors keep their registry definition, mailbox history, runner session, mesh subscriptions, and replay cursor. Main relays session-bound host events while it is available. The cross-process relay can omit oversized raw image blocks. The relay keeps their redacted media descriptors.
 
 A durable actor has one resident execution owner. Other trusted sessions in the project can call `ask`, `tell`, `steer`, `followUp`, and `stop`; Fabric routes each call to that owner. Direct messages carry the caller's model and thinking binding. Actor status, mailbox history, logs, and definition export are shared project views. Only the owner can clear the mailbox or change tools, events, instructions, delivery policy, and project defaults. Fabric sends durable actor removal to the resident owner. The hidden host exits after a short idle grace when it owns no live durable actor or running durable agent. Durable residency requires a trusted project and `mesh.enabled`. Schema enforce mode does not support it.
 
@@ -317,7 +450,7 @@ Veda children do not have recursive Fabric capabilities. Fabric rejects `recursi
 
 ### Custom runners
 
-The default `pi-durable` runner uses the full isolated Pi/Fabric worker host; explicit `pi` selects the legacy CLI. See [Durable Pi runner](durable-pi.md) for recovery boundaries and the separate `pi-durable-leaf` hosted factory. Neither restores arbitrary `fabric_exec` continuations.
+The default `pi-durable` runner uses the full isolated Pi/Fabric worker host; explicit `pi` selects the legacy CLI. See [Durable Pi runner](durable-pi.md) for recovery boundaries and the separate `pi-durable-leaf` hosted factory. The default runner reruns an interrupted `fabric_exec` once when its program made no effect. Neither restores arbitrary `fabric_exec` continuations.
 
 A Pi extension can add a runner through the `pi-fabric/runners` subpath. The subpath is never loaded by the Fabric extension at startup.
 
@@ -334,11 +467,11 @@ Two kinds exist:
 - `kind: "worker"`: `launch(context)` returns `{ workerPath, workerArguments }`. Fabric runs that script under the selected transport and reads the [worker protocol](#worker-protocol) files. The context carries the run files, the task and launch facts, and `fabricWorker`, the launch Fabric would use for its own worker, so an adapter can wrap it. The optional `stop()` runs before the transport kills the process. A worker that dies before any progress is relaunched with the same launch (startup retry); Fabric never re-prompts a custom worker mid-run.
 - `kind: "hosted"`: no Fabric process. The adapter owns execution, for example in a daemon. `prepare(context)` must be pure and returns a JSON locator of at most 8 KiB. Fabric writes it to the run record (`hosted.locator`) and `hosted.json` before it calls `start(locator, context, reporter)`. `context.idempotencyKey` is the Fabric run id, so a second submission with the same key must not start a second run. `liveness(locator)` answers `running`, `sleeping`, `settled`, `cancelled`, `interrupted`, or `unknown`. `stop(locator, reason)` is required and returns `{ confirmed }`. `abort`, `sleep`/`wake` (with the `sleep` capability), `steer`, and `followUp` are optional. The adapter delivers steer and follow-up messages itself; a delivery failure lands in the run transcript.
 
-The hosted `reporter` has `progress({ turns, toolCalls, currentTool, text })`, `usage(total)` with the cumulative run usage (Fabric records the increase, which feeds budgets and `tokens.usage` lifecycle events), `transcript(event)`, `question(q)`, `finish({ status, output, structured? })`, and `fail({ error, retryable })`. `question` routes like a Pi child dialog: direct UI when the parent has one, otherwise a [decision](decisions.md#routed-child-questions), and only with `agents.childQuestions: "route"`. The run record shows `blockedOn` while it waits.
+The hosted `reporter` has `progress({ turns, toolCalls, currentTool, text })`, `usage(total)` with the cumulative run usage (Fabric records the increase, which feeds budgets and `tokens.usage` lifecycle events), `transcript(event)`, `question(q)`, `finish({ status, output, structured? })`, and `fail({ error, retryable })`. When the run has a `schema`, Fabric validates a `completed` finish against it as it does for its own worker: `structured` (`null` included), or `output` parsed as JSON when `structured` is absent, must match. A mismatch, or a value over 1 MiB from either source, settles the run `failed` with `Structured agent output was invalid: ...`. `question` routes like a Pi child dialog: direct UI when the parent has one, otherwise a [decision](decisions.md#routed-child-questions), and only with `agents.childQuestions: "route"`. The run record shows `blockedOn` while it waits, with the decision's `decisionId` once one is raised. After the resident host detaches a durable run, that reporter's `question` never settles, including for a question already open: ask again through the reporter that the next `attach` receives.
 
-Fabric never relaunches or re-prompts a hosted run. A `sleeping` run stays `running` with `sleeping: true`. When liveness reports `interrupted` or `unknown` (or `settled` without a result), the run settles `failed` with `outcome: "indeterminate"`. The same outcome marks a stop the adapter did not confirm, and a durable spawn request the resident host was processing when it restarted. Hosted runs work with `agents.run`, `spawn`, `wait`, `status`, `stop`, `steer`, `followUp`, the dashboard, budgets, and `residency: "durable"`. Persistent actors need a worker runner.
+Fabric never relaunches or re-prompts a hosted run. A program parks an idle hosted run with `agents.sleep({ id })` and resumes it with `agents.wake({ id })`. Both call the adapter's `sleep`/`wake` hook and return `{ id, requested }` after the hook resolves. They fail for an unknown id, a run that is not hosted in this session, a runner without the `sleep` capability, and a finished run. A `sleeping` run stays `running` with `sleeping: true` once liveness reports `sleeping`. When liveness reports `interrupted` or `unknown` (or `settled` without a result), the run settles `failed` with `outcome: "indeterminate"`. The same outcome marks a stop the adapter did not confirm, and a durable spawn request the resident host was processing when it restarted. Hosted runs work with `agents.run`, `spawn`, `wait`, `status`, `stop`, `sleep`, `wake`, `steer`, `followUp`, the dashboard, budgets, and `residency: "durable"`. Persistent actors need a worker runner.
 
-Registration is process-local. The resident host runs Pi with `--no-extensions`, so a durable run of a custom runner requires `residentModule`: an absolute path to an ES module that registers the adapter when imported. Fabric refuses a durable spawn without it. The resident host imports the module before launch. On restart it imports it again and calls `attach(locator, context, reporter)` for every unfinished hosted run; a run whose runner cannot be loaded settles indeterminate. When the resident host shuts down, durable hosted runs are detached; they keep running and are re-attached on the next start. Session hosted runs are stopped with the session.
+Registration is process-local. The resident host runs Pi with `--no-extensions`, so a durable run of a custom runner requires `residentModule`: an absolute path to an ES module that registers the adapter when imported. Fabric refuses a durable spawn without it. The resident host imports the module before launch. On restart it imports it again and calls `attach(locator, context, reporter)` for every unfinished hosted run; a run whose runner cannot be loaded settles indeterminate. When the resident host shuts down, durable hosted runs are detached; they keep running and are re-attached on the next start. If the resident host is gone while a durable hosted run is unfinished, `agents.wait` starts a new host, which re-attaches the run. The wait fails with the start error when the host cannot start. It also fails after the host stops three times during one wait. A new host re-attaches only hosted runs, so a wait on any other unfinished durable run fails at once when its host is gone. That wait also settles the run `failed` with `outcome: "indeterminate"`, so `agents.status` and `agents.list` stop reporting it as running. `agents.status` itself only reads the persisted record. Session hosted runs are stopped with the session.
 
 An illustrative daemon-backed adapter:
 
@@ -381,14 +514,14 @@ registerAgentRunner(runner);
 
 ### Worker protocol
 
-A worker runner process talks to Fabric through four files named in `context.files`. `pi-fabric/runners` exports a JSON Schema for each (`AgentRunRecordSchema`, `LifecycleLineSchema`, `TranscriptEventSchema`, `SteerCommandSchema`, protocol version `FABRIC_WORKER_PROTOCOL_VERSION = 1`). Readers ignore unknown fields.
+A worker runner process talks to Fabric through four files named in `context.files`. `pi-fabric/runners` exports a JSON Schema for each (`AgentRunRecordSchema`, `LifecycleLineSchema`, `TranscriptEventSchema`, `SteerCommandSchema`, protocol version `FABRIC_WORKER_PROTOCOL_VERSION = 1`). Readers ignore unknown fields. Fabric can add a steer command type without changing the protocol version, as it did for `ui_decision`, which it sends only to a runner that declares `questions`. A worker must ignore a steer line whose `type` it does not know, as Fabric's own worker does.
 
 | File | Direction | Content |
 | --- | --- | --- |
 | `statusFile` | worker writes | The run record, replaced atomically (write a temporary file, then rename). `status` moves from `running` to `completed`, `failed`, `stopped`, or `timed_out`; `text`, `value`, `error`, `turns`, `toolCalls`, `usage` (cumulative), `currentTool`, and `blockedOn` are the public fields. |
 | `lifecycleFile` | worker appends | One `{ version: 1, event, occurredAt, data }` line per event: `tokens.usage` (a per-event increase), `question` (a dialog to route), and the `pi.*` lifecycle events. |
 | `logFile` | worker appends | Transcript events for logs and the dashboard: `message_end` with a `user` or `assistant` message, `tool_execution_start`, `tool_execution_end`, and `extension_error`. |
-| `steerFile` | Fabric appends | Commands with `id` and `ts`: `steer`, `follow_up`, `set_steering_mode`, `set_follow_up_mode`, `compact`, and `ui_response` (`requestId` plus `value`, `confirmed`, or `cancelled`) answering a routed `question`. |
+| `steerFile` | Fabric appends | Commands with `id` and `ts`: `steer`, `follow_up`, `set_steering_mode`, `set_follow_up_mode`, `compact`, `ui_decision` (`requestId` and `decisionId`) naming the decision behind a routed `question`, which the worker records in `blockedOn.decisionId`, and `ui_response` (`requestId` plus `value`, `confirmed`, or `cancelled`) answering it. |
 
 A worker that exits without a terminal record is treated as a dead transport: it is relaunched only when it made no progress, and otherwise settles failed.
 
@@ -419,6 +552,8 @@ This is the host-level equivalent of the `pi-model-switch` extension's `switch_m
 | `auto`      | Tries Herdr, LocalTerm, tmux, screen, and then process         | Depends on the transport     |
 
 Herdr uses its local socket API to create an argv-backed background tab as one atomic operation. It does not change focus or require shell quoting. Automatic selection works only when the parent Pi process already runs in Herdr. This requires `HERDR_ENV=1` with an injected workspace and socket. Select `transport: "herdr"` under the same conditions. Use the attach command in the handle to open a child directly.
+
+Inside Herdr, a root session also shows its running agents on its own pane, whatever transport they use, and marks the pane blocked while a child question waits on the user. See `ui.herdrStatus` in the [configuration reference](configuration.md#ui).
 
 LocalTerm provides the required primitives that match tmux: detached creation, pinning, listing, capture, exec, attach, and kill. Pi Fabric requires no LocalTerm patch. Start the daemon before you select this transport:
 
@@ -500,6 +635,8 @@ Fabric uses one participant directory for each project. Every live entity has a 
 
 `agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
 
+Live discovery never returns a session that has left. To see recent departures, call `agents.departed({ limit? })`. It lists other root Pi sessions that are no longer live, newest first, each with `status`, `sessionId`, `cwd`, `label`, `startedAt`, and `lastSeenAt`. `status: "stopped"` means the session closed cleanly and left a tombstone. `status: "lost"` means its host lease expired without a clean close, so `lastSeenAt` is its last heartbeat. A session that is live again drops out of the list. Tombstones live under their own mesh prefix, so `agents.sessions()`, `agents.peers()`, and `agents.members()` never read them. Only roots get tombstones; child agents and actors simply leave. `mesh.departedLimit` and `mesh.departedRetentionMs` bound how many tombstones are kept and for how long.
+
 ```ts
 const main = await agents.main();
 const sessions = await agents.sessions();
@@ -513,9 +650,11 @@ const lineage = await agents.list({ scope: "lineage" });
 return { self: await agents.self(), lineage };
 ```
 
-Child dialogs (`select`, `confirm`, `input`, `editor`) are cancelled by default. With `agents.childQuestions: "route"` they reach the parent's UI, or a root-held [durable decision](decisions.md#routed-child-questions) when the parent is headless; the run record shows `blockedOn` while one waits.
+Child dialogs (`select`, `confirm`, `input`, `editor`) are cancelled by default. With `agents.childQuestions: "route"` they reach the parent's UI, or a root-held [durable decision](decisions.md#routed-child-questions) when the parent is headless or the run is durable; the run record shows `blockedOn`, with the decision's `decisionId`, while one waits. A run spawned with `holdQuestions: true` raises each question as a root-held decision with a 30-day deadline instead, even when the parent has a UI; see [Holding a question for a person](decisions.md#holding-a-question-for-a-person).
 
-For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. `followUp` waits until the current run settles. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
+Routing also gives a Pi child with extensions the tools in `agents.childQuestionTools` (default `["ask"]`), so the caller does not have to name them in `tools`. A child's system prompt lists only the extension tools its `tools` allowlist permits.
+
+For Main and one-shot agents, `steer` arrives after the tool calls in the current turn and before the next model call. A workflow that runs inside one `fabric_exec` is one tool call, so Main's steer waits for all of it; move the program to the background (Ctrl+B twice, or `background: true`) to steer Main while it runs, see [Background programs](background-tasks.md#background-programs). `followUp` waits until the current run settles. For actors, both operations add a message to the serial mailbox. `agents.status({ id })` accepts any participant ID. It returns complete details for a local run or actor and a bounded directory summary for a remote participant. `agents.setSteeringMode` and `setFollowUpMode` continue to control local one-shot runs.
 
 Local routing returns `"main"` or `"local"`. For cross-process `steer`, `followUp`, and `stop`, Fabric resolves the exact owner of the target. It sends a control command addressed to that owner and waits for an acknowledgement that matches the version, target, and owner identity. Success returns `routed: "mesh", acknowledged: true` after this verified acknowledgement. Unknown IDs, stale owners, rejection, and timeout throw an error. The dashboard actions `s`, `u`, and `x` use the same route. Set `mesh.enabled` to use cross-process control. See [`references/agents.md`](../skillsets/typescript/fabric-exec/references/agents.md).
 
@@ -525,7 +664,7 @@ An owner keeps its host ID across restarts (a Pi session's Main ID, or a residen
 
 ### Peer labels and queue gates
 
-Every root participant mints a project-scoped label such as `FAB-1` when it first publishes: the prefix derives from the project directory basename (initials for multi-word names, up to three letters for single-word names) and the number comes from a mesh-wide monotonic counter, so retired labels are never reused. Labels appear on participant records, peer projections, and the dashboard, giving other sessions' tooling a stable handle to show users in place of raw session ids.
+Every root participant mints a project-scoped label such as `FAB-1` at its first Fabric use (a `fabric_exec` run, an agent, or an actor), so opening Pi and leaving it idle takes no number: the prefix derives from the project directory basename (initials for multi-word names, up to three letters for single-word names) and the number comes from a mesh-wide monotonic counter, so a number is never minted twice. The counter belongs to a generation (`FABRIC_PEER_LABEL_SEQUENCE`, currently 3); this generation restarted numbering at 1, retired the labels earlier generations recorded, and skips any number a still-running older session holds. Concurrent sessions claim numbers by compare-and-swap under the mesh lock, so each gets its own. A resumed session keeps its label: it reads the `pi-fabric-peer` entry it recorded for its own participant id and reuses that label, without taking a number, at once, even before its first Fabric use, unless the label belongs to another project, comes from an older counter generation, or another live participant holds it. Forks and clones have new participant ids, so they take new numbers. Labels appear on participant records, peer projections, and the dashboard, giving other sessions' tooling a stable handle to show users in place of raw session ids. A root session also shows its own label at the head of the Fabric widget (or in the Pi footer when the widget is hidden) and, when configured, in its Herdr tab or pane name, so you can tell which terminal is `FAB-3`. Headless hosts read the label and participant id from the `pi-fabric-peer` session entry through Pi's RPC `get_entries`; see `ui.sessionLabel` in [UI configuration](configuration.md#ui).
 
 Two host-local, versioned events on `pi.events` let queue extensions coordinate with peers:
 
@@ -552,7 +691,7 @@ File or git changes you did not make may be theirs: do not revert or overwrite t
 - **Cache safety.** The notice is a persistent transcript message appended at a turn boundary. The system prompt, tool declarations, and every earlier message stay byte-identical, so the provider's cached prefix remains valid and only the notice itself is new input. The mid-run notice is a native `turn_end` boundary entry: it rides the request the run was about to make and never triggers an extra one. The text is deterministic for a given change. It carries labels, participant ids, and a working directory when that differs from the caller's, and no clock, run status, or model.
 - **Once per change.** Fabric rebuilds what the model was told from the notices on the active branch, so resuming or navigating a session does not repeat one. A compaction may drop earlier notices from the context, so the current peers are stated again at the next boundary.
 - **Departures are debounced.** A peer is reported gone only after it has been absent for 20 seconds, longer than the 15-second host lease, so a missed heartbeat or a wake from sleep is not reported as a departure and a rejoin. Arrivals are reported at once.
-- **Scope.** Only root sessions receive notices. Child agents and actors are coordinated by their parent. A notice shares what the participant directory already shares: prompts, results, and errors stay local.
+- **Scope.** Only root sessions with a UI receive notices. A run without a UI, such as `pi -p`, gets none: nobody reads the notice there, and the model's reply to it would replace the answer in the output. Child agents and actors are coordinated by their parent. A notice shares what the participant directory already shares: prompts, results, and errors stay local.
 
 **Limitation:** a session joins the participant directory when its Fabric runtime activates, which is normally its first `fabric_exec` call. Before that it neither sees peers nor is seen by them, so the first notice of a fresh session arrives after that first call, before the next model request. A session that never runs `fabric_exec` stays invisible.
 
@@ -631,6 +770,8 @@ A project-scoped actor stores one definition for the project. Select storage per
 - **Session binding.** A mode-`0600` file stores only `model` and `thinking` for one Pi session ID. It survives a resume of that session and does not rewrite `actors.json`.
 - **Runtime.** One owner keeps the stable actor identity, serial mailbox, and runner session. Other sessions send direct work to that owner.
 
+Creation rejects names already present in the visible project or session scope, including stopped actors. Creating a stopped actor's namesake is refused; automatic replacement is disabled. To reuse the name, explicitly remove the stopped actor first with `agents.remove({ id })`; removal deletes its retained actor session and history. This is a compatibility change from automatic replacement. The refusal does not provide distributed ownership or execution fencing between independent hosts.
+
 Fabric resolves each activation in this order:
 
 ```text
@@ -675,6 +816,12 @@ This primitive supports emergent supervisors and advisors without another extens
 Fabric sanitizes host-event JSON before placing it in the mailbox. The JSON includes a bounded snapshot of the recent session. Fabric redacts fields that resemble credentials and encoded blobs. Pi `ImageContent` blocks follow another path. Fabric replaces every persisted block with an indexed descriptor. It sends the raw image outside the mailbox with the transient activation and automatically submits it to the selected Pi or Claude actor model. There is no media opt-in flag because the explicit event subscription defines the trust boundary. Raw image bytes never enter `actors.json` or the actor mailbox record. The selected runner's persistent model session can retain images through its standard session behavior. Use `activation.signal.media` to read descriptor metadata for freshness predicates and correlation.
 
 Actors handle one message at a time. By default, they coalesce repeated host events, which is useful for `message_update` and `tool_execution_update`. They restore from the trusted project actor registry.
+
+### Unreadable actor files
+
+Fabric keeps actor state in three kinds of file: the shared registry `actors.json` under the mesh `actors/` directory, a binding file per session under its `bindings/` directory, and the template library `~/.pi/agent/fabric/actors/global-actors.json`. A missing file reads as empty. If a file exists but cannot be read or parsed, every action that would save it fails with `Cannot read Fabric actor store <path>: <detail>`. A template library that cannot be read also produces a warning at startup. Fabric does not overwrite the file, so the other hosts' actors, the other bindings, and the saved templates stay on disk. Shutdown still runs to completion and then reports the same error, without saving the suspended state of this session's actors.
+
+To recover, fix the problem the message names. Restore read permission for your user, or repair the JSON by hand. To start with an empty file instead, move the file aside, for example to `actors.json.bak`, and copy back any entries you want to keep. Fabric reads the file again on the next access, so you do not need to restart.
 
 ### Native asynchronous vision handoff
 
@@ -768,7 +915,7 @@ The `offset` values on log lines and all page cursors are byte offsets in the JS
 
 ## Global actor templates
 
-Persistent actors belong to a project mesh. If you want to reuse a persona in several projects, store it in the project-independent **template library**. This library is in your agent directory at `~/.pi/agent/fabric/actors/`. A template contains only an actor definition, including its name, instructions, subscriptions, and run settings. It contains no mailbox, session transcript, run logs, or other history. Templates are inactive. Import one into a project to run it.
+Persistent actors belong to a project mesh. If you want to reuse a persona in several projects, store it in the project-independent **template library**. This library is in your agent directory at `~/.pi/agent/fabric/actors/`. A template contains only an actor definition, including its name, instructions, subscriptions, and run settings. It contains no mailbox, session transcript, run logs, or other history. Templates are inactive. Import one into a project to run it. If the library file exists but cannot be read or parsed, Fabric warns at startup, and every global template action fails with that error until the file reads again. Fabric never replaces an unreadable library with an empty one.
 
 ```ts
 // Store a reusable persona in the global registry. This does not create a live actor.
@@ -781,7 +928,7 @@ return agents.create({
 });
 
 // List the templates. Then create a new actor from one in the current project.
-const [template] = agents.actors({ scope: "global" });
+const [template] = await agents.actors({ scope: "global" });
 return agents.import({ name: template.name });                       // create it without inherited history
 return agents.import({ name: "security-reviewer", as: "security-reviewer-2" }); // rename it if the name exists
 

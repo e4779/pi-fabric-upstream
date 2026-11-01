@@ -2,6 +2,7 @@ import path from "node:path";
 import { resolveAgentDir } from "../core/agent-dir.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { Component, TUI } from "@earendil-works/pi-tui";
+import { matchesKey } from "@earendil-works/pi-tui";
 import type { CodePreviewSettings } from "./code-preview.js";
 import type { FabricConversationState, FabricConversationTarget, FabricConversationView } from "./conversation.js";
 import type { NativeConversationReader, NativeConversationSource } from "./conversation-native-reader.js";
@@ -20,12 +21,15 @@ import type { ModelSource } from "./model-picker.js";
 import { createDashboardSnapshot, FabricDashboardSnapshotCache } from "./snapshot.js";
 import { safeText } from "./format.js";
 import { isActiveStatus, type FabricDashboardSnapshot, type FabricUiActor, type FabricUiAgent } from "./types.js";
-import { FabricWidget, shouldShowFabricWidget } from "./widget.js";
-import { WIDGET_ACTIVITY_LOG_LINES } from "./widget-activity.js";
+import { FabricWidget, shouldShowFabricWidget, type FabricWidgetRow } from "./widget.js";
 import { FabricWidgetRetention } from "./retention.js";
+import { FooterDock } from "./footer-dock.js";
 import { AgentTranscriptReader, type FabricTranscriptSource } from "./transcript.js";
 
 const WIDGET_ID = "pi-fabric";
+const WIDGET_PLACEMENT = { placement: "belowEditor" } as const;
+/** At most one move back to the end per interval, so two widgets never trade places every frame. */
+const WIDGET_REORDER_INTERVAL_MS = 1_000;
 const ACTIVITY_REFRESH_MS = 100;
 
 const emptySnapshot = (): FabricDashboardSnapshot => {
@@ -66,6 +70,7 @@ export class FabricUiController {
   #actorUnsubscribe: (() => void) | undefined;
   #agentUnsubscribe: (() => void) | undefined;
   #shellUnsubscribe: (() => void) | undefined;
+  #arrowEntryUnsubscribe: (() => void) | undefined;
   #tasksOpen = false;
   #tasksView: import("./shell-tasks.js").ShellTasksView | undefined;
   #closeTasks: (() => void) | undefined;
@@ -74,11 +79,15 @@ export class FabricUiController {
   #dashboardTui: TUI | undefined;
   #widgetMounted = false;
   #widget: FabricWidget | undefined;
+  #widgetReorderedAt = 0;
+  /** Row whose view is opening or open from the list; it keeps the filled circle meanwhile. */
+  #widgetOpenRow: string | undefined;
+  #widgetReorderPending = false;
+  /** Places the list after Pi's footer; undefined once this mount fell back to the editor slot. */
+  #footerDock: FooterDock | undefined;
+  #footerDockPending = false;
   /** Component that had focus before the widget took it (normally the editor). */
   #widgetReturnFocus: Component | undefined;
-  /** Pi's hideThinkingBlock for the widget pane; read once, at the first expansion. */
-  #widgetHideThinking: boolean | undefined;
-  #widgetHideThinkingLoad: Promise<void> | undefined;
   #lastRefreshErrorAt = 0;
   #lastRefreshAt = 0;
   #dashboardOpen = false;
@@ -97,8 +106,6 @@ export class FabricUiController {
   #activityRuns: FabricActivityRun[] = [];
   #activityView: ((detailed?: boolean) => FabricActivityRun[]) | undefined;
   readonly #transcripts = new AgentTranscriptReader();
-  /** Deeper pages for the widget's activity pane, so a turn's early thinking and tool calls stay visible. */
-  readonly #widgetTranscripts = new AgentTranscriptReader(WIDGET_ACTIVITY_LOG_LINES);
   readonly #conversationReaders = new Map<string, NativeConversationReader>();
   #activeConversationReader: string | undefined;
   readonly #snapshotCache = new FabricDashboardSnapshotCache();
@@ -123,6 +130,9 @@ export class FabricUiController {
     this.#actorUnsubscribe = this.state.actors.subscribe(() => this.#scheduleRefresh());
     this.#agentUnsubscribe = this.state.agents.subscribeUi(() => this.#scheduleRefresh());
     this.#shellUnsubscribe = this.state.shellJobs?.subscribe(() => this.#scheduleRefresh());
+    // Observed before the editor sees the key; consumed only when it moves focus.
+    this.#arrowEntryUnsubscribe = context.ui.onTerminalInput?.((data) =>
+      matchesKey(data, "down") && this.#enterWidgetFromEditor() ? { consume: true } : undefined);
     this.#refresh();
     this.#schedulePoll();
   }
@@ -136,6 +146,8 @@ export class FabricUiController {
     this.#tasksOpen = false;
     this.#shellUnsubscribe?.();
     this.#shellUnsubscribe = undefined;
+    this.#arrowEntryUnsubscribe?.();
+    this.#arrowEntryUnsubscribe = undefined;
     this.#closeConversation?.();
     this.#closeConversation = undefined;
     this.#conversationView?.dispose();
@@ -150,10 +162,10 @@ export class FabricUiController {
     this.#scheduledRefresh = undefined;
     // Hand focus back before the widget goes away, and drop the editor of this session.
     this.#releaseWidget();
+    this.#undockWidget();
     this.#widgetReturnFocus = undefined;
-    this.#widgetHideThinking = undefined;
-    this.#widgetHideThinkingLoad = undefined;
     this.#widget = undefined;
+    this.#footerDock = undefined;
     this.#activityUnsubscribe?.();
     this.#activityUnsubscribe = undefined;
     this.#actorUnsubscribe?.();
@@ -179,7 +191,6 @@ export class FabricUiController {
     this.#activityRuns = [];
     this.#activityView = undefined;
     this.#transcripts.clear();
-    this.#widgetTranscripts.clear();
     for (const reader of this.#conversationReaders.values()) reader.clear();
     this.#conversationReaders.clear();
     this.#activeConversationReader = undefined;
@@ -209,6 +220,54 @@ export class FabricUiController {
     tui.requestRender();
   }
 
+  /**
+   * ↓ in an empty editor moves into the participant list below it, as in Claude
+   * Code. The editor has no use for ↓ there: history browsing ends at empty text.
+   */
+  #enterWidgetFromEditor(): boolean {
+    if (this.ownsInput) return false;
+    const tui = this.#widgetTui as (TUI & { getFocusedComponent?(): unknown }) | undefined;
+    const widget = this.#widget;
+    if (!tui || !widget || tui.hasOverlay() || !widget.hasRows()) return false;
+    const editor = tui.getFocusedComponent?.() as
+      | (Component & { getText?(): string; isShowingAutocomplete?(): boolean })
+      | null
+      | undefined;
+    // Only Pi's main editor qualifies: dialogs and selectors keep their own arrows.
+    if (!editor || editor === widget || typeof editor.getText !== "function") return false;
+    if (editor.getText() !== "" || editor.isShowingAutocomplete?.()) return false;
+    this.#widgetReturnFocus = editor;
+    widget.selectFirst();
+    tui.setFocus(widget);
+    tui.requestRender();
+    return true;
+  }
+
+  /**
+   * Enter on a widget row: open the participant's conversation, or the tasks
+   * view for a shell row, then come back to the list.
+   */
+  async #openFromWidget(context: ExtensionContext, row: FabricWidgetRow): Promise<void> {
+    // Without this, the frames between releasing focus and the view appearing
+    // draw the filled circle on the header, a visible flicker.
+    this.#widgetOpenRow = row.id;
+    this.#releaseWidget();
+    const epoch = this.#epoch;
+    try {
+      if (row.kind === "shell") await this.openTasks(context, row.id);
+      else await this.openConversation(context, row.id);
+      if (epoch !== this.#epoch || this.ownsInput) return;
+      const tui = this.#widgetTui as (TUI & { getFocusedComponent?(): unknown }) | undefined;
+      const widget = this.#widget;
+      if (!tui || !widget?.hasRows() || tui.getFocusedComponent?.() !== this.#widgetReturnFocus) return;
+      widget.selectDefault();
+      tui.setFocus(widget);
+      tui.requestRender();
+    } finally {
+      if (epoch === this.#epoch && this.#widgetOpenRow === row.id) this.#widgetOpenRow = undefined;
+    }
+  }
+
   /** Return focus to the editor; a `forward` key the widget did not use goes to the editor too. */
   #releaseWidget(forward?: string): void {
     const tui = this.#widgetTui;
@@ -219,28 +278,10 @@ export class FabricUiController {
     tui.requestRender();
   }
 
-  /** Read Pi's hideThinkingBlock off the startup path, then redraw the pane. */
-  #widgetHidesThinking(context: ExtensionContext, tui: TUI): boolean {
-    if (this.#widgetHideThinking !== undefined) return this.#widgetHideThinking;
-    const epoch = this.#epoch;
-    this.#widgetHideThinkingLoad ??= (async () => {
-      let hidden = false;
-      try {
-        const { loadHostSdk } = await import("../core/host-sdk.js");
-        const { SettingsManager } = await loadHostSdk();
-        hidden = SettingsManager.create(context.cwd, resolveAgentDir(), { projectTrusted: context.isProjectTrusted?.() ?? false })
-          .getHideThinkingBlock();
-      } catch { /* no host settings: show thinking, as Pi does by default */ }
-      if (epoch !== this.#epoch) return;
-      this.#widgetHideThinking = hidden;
-      tui.requestRender();
-    })();
-    // Until the setting is known, show the marker only: never flash reasoning a user hid.
-    return true;
-  }
-
+  /** Without an ID, focus the footer list; explicit IDs open single-task detail. */
   async openTasks(context: ExtensionContext, query?: string): Promise<void> {
-    if (this.ownsInput) return;
+    // The tasks view may open over a conversation, from its agent list.
+    if (this.#tasksOpen || this.#dashboardOpen || this.#widget?.focused === true) return;
     const jobs = this.state.shellJobs;
     if (!jobs) { context.ui.notify("No shell task store in this session", "info"); return; }
     // Input ownership is claimed synchronously; reattached tasks arrive as store events.
@@ -253,6 +294,8 @@ export class FabricUiController {
     }
     if (!this.state.config.ui.enabled) { context.ui.notify("The Fabric UI is disabled by ui.enabled", "warning"); return; }
     if (!this.#context) this.start(context);
+    if (!query) { this.focusWidget(context); return; }
+    const id = candidates[0]!.id;
     this.#tasksOpen = true;
     const epoch = this.#epoch;
     try {
@@ -260,9 +303,8 @@ export class FabricUiController {
       if (epoch !== this.#epoch) return;
       await imageSafeCustom<void>(context.ui, (tui, theme, keys, done) => {
         this.#closeTasks = () => done();
-        const id = candidates[0]?.id;
         this.#tasksView = new ShellTasksView({ jobs, theme, keys, done: () => done(), requestRender: () => tui.requestRender(),
-          rows: () => tui.terminal?.rows ?? 24, ...(id ? { id } : {}) });
+          rows: () => tui.terminal?.rows ?? 24, id });
         return this.#tasksView;
       }, { overlay: true, overlayOptions: { width: "94%", maxHeight: "90%", anchor: "center", margin: 1 } });
     } finally {
@@ -404,6 +446,16 @@ export class FabricUiController {
         this.#closeConversation = () => done(undefined);
         const view = new FabricConversationView(tui, theme, {
           targets,
+          openTasks: (id) => void this.openTasks(context, id),
+          // The same agent list as the main screen, at the bottom of the window.
+          participants: (interaction) => new FabricWidget(
+            theme,
+            () => this.#snapshot,
+            this.state.config.ui.maxRows,
+            () => tui.terminal?.rows ?? process.stdout.rows,
+            this.#widgetRetention,
+            interaction,
+          ),
           onTargetChange: (id) => {
             if (this.#activeConversationReader !== id) this.#suspendConversationReader();
           },
@@ -604,17 +656,22 @@ export class FabricUiController {
       }
     };
     const onImportActor = (globalActorId: string): void => {
-      const def = this.state.globalActors.resolve(globalActorId);
-      if (!def) return;
-      this.state.actors
-        .create(this.state.globalActors.toRequest(def))
-        .then((actor) => {
-          context.ui.notify(`Imported global actor "${def.name}" as ${actor.name}`, "info");
-          this.#refresh();
-        })
-        .catch((error) =>
-          context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
-        );
+      try {
+        // resolve() rereads the template library and throws while it cannot be read.
+        const def = this.state.globalActors.resolve(globalActorId);
+        if (!def) return;
+        this.state.actors
+          .create(this.state.globalActors.toRequest(def))
+          .then((actor) => {
+            context.ui.notify(`Imported global actor "${def.name}" as ${actor.name}`, "info");
+            this.#refresh();
+          })
+          .catch((error) =>
+            context.ui.notify(error instanceof Error ? error.message : String(error), "error"),
+          );
+      } catch (error) {
+        context.ui.notify(error instanceof Error ? error.message : String(error), "error");
+      }
     };
     const onExportActor = (actorId: string): void => {
       try {
@@ -719,7 +776,11 @@ export class FabricUiController {
     }
     if (this.#timer || !this.#context) return;
     const expiryDelay = this.#widgetRetention.nextExpiryDelay(this.#snapshot, Date.now());
+    // A labelled root shows its label once the directory mints it; poll until then.
+    const labelPending = this.#snapshot.sessionLabel === undefined &&
+      typeof this.state.sessionLabelPending === "function" && this.state.sessionLabelPending();
     const active =
+      labelPending ||
       expiryDelay !== undefined ||
       this.#snapshot.shells?.some(job => job.finishedAt === undefined) ||
       this.#snapshot.runs.some((run) => run.status === "running") ||
@@ -857,6 +918,65 @@ export class FabricUiController {
     if (this.#events.length > limit) this.#events.splice(0, this.#events.length - limit);
   }
 
+  /**
+   * Dock the list after the footer outside the render pass that found it
+   * missing. When Pi's layout is not the one the dock knows, the list falls
+   * back to the below-editor slot for the rest of this mount.
+   */
+  #syncFooterDock(context: ExtensionContext, widget: FabricWidget): void {
+    const dock = this.#footerDock;
+    if (!dock || this.#footerDockPending || this.#widget !== widget) return;
+    this.#footerDockPending = true;
+    const epoch = this.#epoch;
+    queueMicrotask(() => {
+      this.#footerDockPending = false;
+      if (epoch !== this.#epoch || this.#widget !== widget || this.#footerDock !== dock) return;
+      const placement = dock.sync();
+      if (placement === "moved") this.#widgetTui?.requestRender();
+      if (placement === "unavailable") this.#fallBackToEditorSlot(context);
+    });
+  }
+
+  /** Draw the list in the below-editor slot itself for the rest of this mount. */
+  #fallBackToEditorSlot(context: ExtensionContext): void {
+    const widget = this.#widget;
+    this.#footerDock = undefined;
+    if (widget) context.ui.setWidget(WIDGET_ID, () => widget, WIDGET_PLACEMENT);
+  }
+
+  #undockWidget(widget = this.#widget): void {
+    if (widget !== this.#widget) return;
+    this.#footerDock?.detach();
+  }
+
+  /**
+   * Keep the list last among the widgets below the editor when it falls back
+   * to that slot. Pi draws them in
+   * the order they were last set, so a status line set after the list would
+   * sit under it, and the dock clips from the bottom when it runs short of
+   * rows. Setting the same component again moves it to the end and keeps its
+   * focus and selection.
+   */
+  #keepWidgetLast(context: ExtensionContext): void {
+    if (this.#widgetReorderPending) return;
+    const tui = this.#widgetTui as (TUI & { children?: unknown[] }) | undefined;
+    const widget = this.#widget;
+    if (!tui || !widget) return;
+    const parent = tui.children?.find((child) =>
+      (child as { children?: unknown[] }).children?.includes(widget)) as { children: unknown[] } | undefined;
+    if (!parent || parent.children.at(-1) === widget) return;
+    const wait = this.#widgetReorderedAt + WIDGET_REORDER_INTERVAL_MS - Date.now();
+    this.#widgetReorderPending = true;
+    const epoch = this.#epoch;
+    // Never inside a render: setWidget rebuilds the container being drawn.
+    setTimeout(() => {
+      this.#widgetReorderPending = false;
+      if (epoch !== this.#epoch || this.#widget !== widget || !this.#widgetMounted) return;
+      this.#widgetReorderedAt = Date.now();
+      context.ui.setWidget(WIDGET_ID, () => widget, WIDGET_PLACEMENT);
+    }, Math.max(0, wait)).unref?.();
+  }
+
   #renderWidget(context: ExtensionContext): void {
     const config = this.state.config.ui;
     const shouldShow =
@@ -879,28 +999,48 @@ export class FabricUiController {
             () => tui.terminal?.rows ?? process.stdout.rows,
             this.#widgetRetention,
             {
-              activity: (row) => {
-                const target = row.kind === "actor"
-                  ? this.#snapshot.actors.find((actor) => actor.id === row.id)
-                  : this.#snapshot.agents.find((agent) => agent.id === row.id);
-                return target ? this.#widgetTranscripts.read(this.#transcriptSource(target)) : undefined;
-              },
+              open: (row) => void this.#openFromWidget(context, row),
+              viewing: () => this.#widgetOpenRow,
+              // Nothing to select: collapse, unless a label would then have nowhere to show.
+              collapseIdle: () => this.#snapshot.sessionLabel === undefined || this.#footerDock?.badgeShown === true,
               release: (forward) => this.#releaseWidget(forward),
               requestRender: () => tui.requestRender(),
-              hideThinking: () => this.#widgetHidesThinking(context, tui),
+              rendered: () => this.#keepWidgetLast(context),
+              availableRows: (width) => this.#footerDock?.availableRows(width),
             },
           );
-          return this.#widget;
+          // The registered widget is a zero-height anchor; the list itself docks
+          // after Pi's footer, at the bottom of the screen, as in Claude Code.
+          const widget = this.#widget;
+          const anchor: Component & { dispose(): void } = {
+            render: () => {
+              this.#syncFooterDock(context, widget);
+              return [];
+            },
+            invalidate: () => {},
+            dispose: () => this.#undockWidget(widget),
+          };
+          // The session label sits on the editor border, as the conversation
+          // window shows its target there; with nothing to list, the list collapses.
+          this.#footerDock = new FooterDock(tui, anchor, widget, () => {
+            const label = this.#snapshot.sessionLabel;
+            return label ? safeText(label) : undefined;
+          });
+          return anchor;
         },
-        { placement: "aboveEditor" },
+        WIDGET_PLACEMENT,
       );
+      // Pi mounts the anchor inside setWidget, so the first frame can already be docked.
+      if (this.#footerDock?.sync() === "unavailable") this.#fallBackToEditorSlot(context);
       return;
     }
     if (!this.#widgetMounted) return;
     this.#releaseWidget();
+    this.#undockWidget();
     context.ui.setWidget(WIDGET_ID, undefined);
     this.#widgetMounted = false;
     this.#widgetTui = undefined;
     this.#widget = undefined;
+    this.#footerDock = undefined;
   }
 }

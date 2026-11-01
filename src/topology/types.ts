@@ -81,6 +81,33 @@ export interface FabricParticipantListOptions {
   includeStale?: boolean;
 }
 
+/**
+ * A root session that is no longer live. `stopped`: it closed cleanly and
+ * left a tombstone. `lost`: its owner lease expired without one (a crash).
+ */
+export interface FabricDepartedParticipant {
+  format: 1;
+  id: string;
+  kind: "root";
+  rootId: string;
+  ownerHostId: string;
+  ownerIdentityId: string;
+  ownerIncarnation?: string;
+  name: string;
+  label?: string;
+  cwd?: string;
+  sessionId?: string;
+  status: "stopped" | "lost";
+  startedAt: number;
+  /** When the session stopped, or its last heartbeat before it was lost. */
+  lastSeenAt: number;
+}
+
+export interface FabricDepartedListOptions {
+  /** Most entries returned, newest first. Defaults to the configured tombstone limit, or 32 when that limit is 0. */
+  limit?: number;
+}
+
 export interface FabricPeerInfo {
   id: string;
   name: string;
@@ -107,6 +134,8 @@ export interface FabricParticipantSource {
   /** All live root Pi session agents, including the current lineage root. */
   sessions?(now?: number): FabricParticipantInfo[];
   peers(now?: number): FabricPeerInfo[];
+  /** Stopped and lost root sessions; opt-in, never part of live discovery. */
+  departed?(options?: FabricDepartedListOptions, now?: number): FabricDepartedParticipant[];
   refresh(): Promise<void>;
   scheduleRefresh(): void;
 }

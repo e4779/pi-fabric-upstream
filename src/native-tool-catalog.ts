@@ -1,7 +1,7 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { nativeMcpIdentity } from "./core/native-mcp-identity.js";
 import type { ResolvedFabricAction } from "./core/action-registry.js";
-import { nativeToolIdentifier, nativeToolRef } from "./core/native-tool-names.js";
+import { NATIVE_CORE_TOOLS, nativeToolIdentifier, nativeToolRef } from "./core/native-tool-names.js";
 import { describeFabricActionDeclaration } from "./runtime/dynamic-guest-types.js";
 
 export interface NativeToolEntry {
@@ -19,6 +19,9 @@ export function nativeToolCatalog(actions: ResolvedFabricAction[], definitions: 
   for (const action of actions) {
     if (!["pi", "mcp", "extensions"].includes(action.provider)) continue;
     if (action.name.startsWith("$") || ["codemode", "fabric_exec"].includes(action.name)) continue;
+    // An extension override of a core tool runs through the pi.* action, so the
+    // pi entry is the one callable definition; a second entry would be ambiguous.
+    if (action.provider === "extensions" && NATIVE_CORE_TOOLS.has(action.name) && actions.some(other => other.provider === "pi" && other.name === action.name)) continue;
     const definition = definitions.find(tool => nativeToolRef(tool, identify) === action.ref || (action.provider === "extensions" && tool.name === action.name));
     if (definition && (definition.exposure === "hidden" || definition.exposure === "model-only")) continue;
     const rawName = definition?.name ?? (action.provider === "mcp" ? `mcp__${action.name.replace(".", "__")}` : action.name);
@@ -27,7 +30,10 @@ export function nativeToolCatalog(actions: ResolvedFabricAction[], definitions: 
     const fallbackOutput = action.provider === "pi" && action.name === "read"
       ? {anyOf: [{type: "string"}, {type: "object", properties: {type: {const: "image"}, data: {type: "string"}, mimeType: {type: "string"}, note: {type: "string"}}, required: ["type", "data", "mimeType", "note"]}]}
       : {type: "string"};
-    const declaration = describeFabricActionDeclaration(name, action.inputSchema, (definition?.outputSchema ?? action.outputSchema ?? fallbackOutput) as Record<string, unknown>);
+    const baseOutput = (definition?.outputSchema ?? action.outputSchema ?? fallbackOutput) as Record<string, unknown>;
+    const detachedOutput = {type: "object", properties: {output: {type: "string"}, taskId: {type: "string"}}, required: ["output", "taskId"]};
+    const output = action.provider === "pi" && (action.name === "bash" || action.name === "powershell") ? {anyOf: [baseOutput, detachedOutput]} : baseOutput;
+    const declaration = describeFabricActionDeclaration(name, action.inputSchema, output);
     const searchDescription = definition?.description ?? action.description;
     const description = `${searchDescription}\n${declaration}`;
     entries.push({name, rawName, ref: action.ref, description, searchDescription, declaration, inputSchema: action.inputSchema, ...(namespace ? {namespace} : {})});
@@ -58,6 +64,9 @@ export function searchNativeTools(entries: NativeToolEntry[], query: unknown, li
   if (typeof limit !== "number" || !Number.isSafeInteger(limit) || limit <= 0) throw new Error("searchTools() limit must be a positive integer");
   if (namespace != null && typeof namespace !== "string") throw new Error("searchTools() namespace must be a string");
   const docs = entries.filter(entry => !namespace || entry.namespace?.name === namespace || (entry.namespace && nativeToolIdentifier(entry.namespace.name) === namespace));
+  const exactQuery = query.trim();
+  const exact = docs.filter(entry => [entry.name, entry.rawName, entry.ref, entry.rawName.split("__").at(-1)].includes(exactQuery));
+  if (exact.length) return exact.slice(0, limit);
   const terms = [...new Set(tokenize(query))];
   const counts = docs.map(entry => {
     const map = new Map<string, number>();

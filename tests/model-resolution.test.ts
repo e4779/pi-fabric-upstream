@@ -1,8 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
+  EXACT_MODEL_FORM_ERROR,
+  EXACT_MODEL_RUNNER_ERROR,
   aliasThinking,
+  assertExactModelRequest,
   normalizeModelAliases,
   resolveAvailablePiModel,
+  resolveExactAvailablePiModel,
+  resolvePiModelSelector,
   resolveFabricModel,
   type FabricModelCandidate,
 } from "../src/core/model-resolution.js";
@@ -148,6 +153,14 @@ describe("resolveAvailablePiModel", () => {
     })).toThrow('Use agents.models({ runner: "pi" })');
   });
 
+  it("names a model registry failure in the unavailable-model error", () => {
+    for (const selector of ["openai-codex/gpt-6-sol", "sol"]) {
+      expect(() => resolveAvailablePiModel(selector, {
+        aliases: {}, available: [], registryError: new Error("registry offline"),
+      })).toThrow(/not available to this Pi session[\s\S]*The model registry failed: registry offline/);
+    }
+  });
+
   it("keeps provider-qualified aliases authoritative", () => {
     expect(resolveAvailablePiModel("openai-codex/gpt-6-sol", {
       aliases: normalizeModelAliases({ "openai-codex/gpt-6-sol": "openai-codex/gpt-5.6-sol" }),
@@ -198,6 +211,98 @@ describe("resolveAvailablePiModel", () => {
       }),
       available: AVAILABLE,
     })).toThrow(/google\/private-gemini, anthropic\/private-claude/);
+  });
+});
+
+describe("resolveExactAvailablePiModel", () => {
+  const aliases = normalizeModelAliases({
+    "google/gemini-2.5-pro": "google/gemini-2.5-flash",
+    fast: "google/gemini-2.5-flash",
+  });
+
+  it("ignores an alias that has the same name as the model", () => {
+    expect(resolveAvailablePiModel("google/gemini-2.5-pro", { aliases, available: AVAILABLE }))
+      .toBe(AVAILABLE[3]);
+    expect(resolveExactAvailablePiModel("google/gemini-2.5-pro", { available: AVAILABLE }))
+      .toBe(AVAILABLE[2]);
+  });
+
+  it("refuses a near-miss id instead of picking the closest model", () => {
+    const state = { aliases: {}, available: AVAILABLE };
+    expect(resolveAvailablePiModel("google/gemini-2.5-pr", state)).toBe(AVAILABLE[2]);
+    expect(() => resolveExactAvailablePiModel("google/gemini-2.5-pr", state)).toThrow(
+      'Model "google/gemini-2.5-pr" is not available to this Pi session. ' +
+        'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
+    );
+  });
+
+  it("refuses a bare selector or an alias name, even when one would resolve", () => {
+    const state = { aliases, available: AVAILABLE };
+    expect(resolveAvailablePiModel("fast", state)).toBe(AVAILABLE[3]);
+    expect(resolveAvailablePiModel("gemini-2.5-pro", state)).toBe(AVAILABLE[2]);
+    for (const selector of ["fast", "gemini-2.5-pro", "gemini", "", "   ", "google/", "/gemini-2.5-pro"]) {
+      expect(() => resolveExactAvailablePiModel(selector, state)).toThrow(EXACT_MODEL_FORM_ERROR);
+    }
+  });
+
+  it("finds a listed provider/id and returns the registry's own entry", () => {
+    expect(resolveExactAvailablePiModel("anthropic/claude-sonnet-4-5", { available: AVAILABLE }))
+      .toBe(AVAILABLE[1]);
+    expect(resolveExactAvailablePiModel(" Google/Gemini-2.5-Flash ", { available: AVAILABLE }))
+      .toBe(AVAILABLE[3]);
+  });
+
+  it("prefers the identical spelling when entries differ only by case", () => {
+    const upper = { provider: "lab", id: "Model-X" };
+    const lower = { provider: "lab", id: "model-x" };
+    expect(resolveExactAvailablePiModel("lab/model-x", { available: [upper, lower] })).toBe(lower);
+    expect(resolveExactAvailablePiModel("lab/Model-X", { available: [lower, upper] })).toBe(upper);
+  });
+
+  it("keeps slash-containing ids provider-scoped and never crosses providers", () => {
+    const model = { provider: "fireworks", id: "accounts/team/models/sol" };
+    expect(resolveExactAvailablePiModel("fireworks/accounts/team/models/sol", { available: [model] })).toBe(model);
+    expect(() => resolveExactAvailablePiModel("other/accounts/team/models/sol", { available: [model] }))
+      .toThrow(/not available to this Pi session/);
+  });
+
+  it("reports registry failures for exact selection", () => {
+    expect(() => resolvePiModelSelector("openai/example", {
+      aliases: {}, available: [], registryError: new Error("registry offline"),
+    }, "exact")).toThrow(/model registry failed: registry offline/);
+  });
+
+  it("selects exact or default resolution by mode", () => {
+    const state = { aliases, available: AVAILABLE };
+    expect(resolvePiModelSelector("google/gemini-2.5-pro", state)).toBe(AVAILABLE[3]);
+    expect(resolvePiModelSelector("google/gemini-2.5-pro", state, "exact")).toBe(AVAILABLE[2]);
+  });
+});
+
+describe("assertExactModelRequest", () => {
+  it("leaves a request without modelMatch alone", () => {
+    expect(() => assertExactModelRequest({ runner: "claude", model: "sonnet" })).not.toThrow();
+    expect(() => assertExactModelRequest({ runner: "pi" })).not.toThrow();
+  });
+
+  it("accepts a provider/id on a Pi runner", () => {
+    for (const runner of ["pi", "pi-durable"]) {
+      expect(() => assertExactModelRequest({ modelMatch: "exact", runner, model: "google/gemini-2.5-pro" })).not.toThrow();
+    }
+  });
+
+  it.each(["claude", "veda", "custom"])("refuses the %s runner instead of passing the model through", (runner) => {
+    expect(() => assertExactModelRequest({ modelMatch: "exact", runner, model: "google/gemini-2.5-pro" }))
+      .toThrow(EXACT_MODEL_RUNNER_ERROR);
+  });
+
+  it.each([undefined, "", "fast", "gemini-2.5-pro", 7])("refuses model %j", (model) => {
+    expect(() => assertExactModelRequest({ modelMatch: "exact", runner: "pi", model })).toThrow(EXACT_MODEL_FORM_ERROR);
+  });
+
+  it.each(["fuzzy", "EXACT", true, null])("refuses modelMatch %j", (modelMatch) => {
+    expect(() => assertExactModelRequest({ modelMatch, runner: "pi", model: "google/gemini-2.5-pro" }))
+      .toThrow(/Invalid Fabric agent modelMatch/);
   });
 });
 

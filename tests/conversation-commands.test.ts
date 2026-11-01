@@ -264,13 +264,13 @@ describe("preview-local commands", () => {
     expect(h.send).not.toHaveBeenCalled();
   });
 
-  it.each(["picker", "session", "dispose"])("drops late copy results after %s", async (action) => {
+  it.each(["switch", "session", "dispose"])("drops late copy results after %s", async (action) => {
     const h = harness();
     let resolve!: () => void;
     h.copy.mockImplementationOnce(() => new Promise<void>((done) => { resolve = done; }));
     h.command("/copy");
     await tick();
-    if (action === "picker") { h.command("/agents"); h.view.handleInput("\x1b"); }
+    if (action === "switch") h.view.selectTarget("b");
     if (action === "session") h.state.clear();
     if (action === "dispose") h.view.dispose();
     const renders = vi.mocked(h.tui.requestRender).mock.calls.length;
@@ -512,7 +512,7 @@ describe("preview-local commands", () => {
     expect(await provider.getSuggestions(["/model"], 0, 6, options)).toBeNull();
     expect(await provider.getSuggestions(["src/"], 0, 4, options)).toBeNull();
     expect(await conversationCommandCompletion(() => false).getSuggestions(["/"], 0, 1, options)).toBeNull();
-    expect(CONVERSATION_COMMANDS).toHaveLength(7);
+    expect(CONVERSATION_COMMANDS).toHaveLength(6);
   });
 
   it("matches native assistant-only copy semantics without exposing thinking or tools", () => {

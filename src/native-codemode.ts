@@ -94,7 +94,20 @@ export class NativeCodemodeProvider implements FabricProvider {
     return { finish: success => {
       this.transactions.delete(id);
       if (success && tx.staged) {
-        if (context.signal?.aborted || generation !== this.#generation || manager.getSessionId() !== tx.session || manager.getLeafId() !== tx.leaf) throw new Error("Script store transaction is stale: session or branch changed");
+        const currentLeaf = manager.getLeafId();
+        let branchUnchanged = currentLeaf === tx.leaf;
+        if (!branchUnchanged) {
+          const currentBranch = manager.getBranch();
+          const originalIndex = tx.leaf === null ? -1 : currentBranch.findIndex(entry => entry.id === tx.leaf);
+          const later = currentBranch.slice(originalIndex + 1);
+          // Receipts may advance the leaf during execution, but neither writer's
+          // state entries nor conversation/navigation changes are safe to cross.
+          branchUnchanged = (tx.leaf === null || originalIndex >= 0)
+            && later.length > 0 && later.at(-1)?.id === currentLeaf
+            && later.every(entry => entry.type === "custom"
+              && entry.customType !== CODEMODE_STORE_ENTRY && entry.customType !== "codemode-store");
+        }
+        if (context.signal?.aborted || generation !== this.#generation || manager.getSessionId() !== tx.session || !branchUnchanged) throw new Error("Script store transaction is stale: session or branch changed");
         if (!this.#append) throw new Error("Script store persistence is unavailable");
         if (nativeStore) {
           const set = Object.fromEntries(Object.entries(tx.staged).filter(([key, value]) => JSON.stringify(tx.values[key]) !== JSON.stringify(value)));

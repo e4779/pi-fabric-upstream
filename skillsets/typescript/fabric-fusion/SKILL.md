@@ -323,7 +323,7 @@ Panel members and the judge are plain, non-recursive agents, so deliberation is 
 
 Act mode costs exactly N reference calls plus exactly one actor call in a single parallel fan-out layer. The default recommended N is 1–2 (one reference plus an actor is a valid minimal act), with a hard maximum of 4. Prefer cheaper diverse references and the strongest reliable actor. Reusing a reference model as the actor is allowed when the goal is a bounded read-only second pass rather than model diversity; distinct models remain the default expectation. Tactical tasks should use a plain agent instead: act mode pays for the actor regardless of outcome and has no failure-only checkpoints — Fabric cannot observe nested actor tool-failure checkpoints at this level, so the actor is always one full call. `agentBudget`, `tokenBudget`, and concurrency settings are observational ceilings, not hard concurrent reservations, for references and actor alike. The default `actorTools` include `bash`, `edit`, and `write`: `bash` requires execute approval and `edit`/`write` mutate the working tree, so trim the list for sensitive runs.
 
-For same-model role diversity, recommend `/skill:fabric-council` for the user to invoke; do not invoke another user-only skill yourself. Use a plain agent when competing model perspectives do not justify the cost.
+For role diversity, on one model or with a model pinned to each role, recommend `/skill:fabric-council` for the user to invoke; do not invoke another user-only skill yourself. Use a plain agent when competing model perspectives do not justify the cost.
 
 ## Completion criterion
 

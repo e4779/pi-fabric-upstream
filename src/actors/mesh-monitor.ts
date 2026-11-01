@@ -24,6 +24,7 @@ export class ActorMeshMonitor {
     readonly config: Pick<FabricMeshConfig, "enabled" | "actorPollMs" | "maxReadEvents">,
     readonly callbacks: {
       cursorPath?: string | undefined;
+      onReconcile?(): void;
       beforePoll(): boolean;
       onEvent(event: MeshEvent): void;
     },
@@ -101,7 +102,10 @@ export class ActorMeshMonitor {
 
   #startTimer(delay: number): void {
     if (this.#timer) clearInterval(this.#timer);
-    this.#timer = setInterval(() => this.schedule(), delay);
+    this.#timer = setInterval(() => {
+      this.callbacks.onReconcile?.();
+      this.schedule();
+    }, delay);
     this.#timer.unref();
   }
 

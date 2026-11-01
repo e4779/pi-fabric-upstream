@@ -173,6 +173,21 @@ describe("DecisionsProvider", () => {
     expect(await provider.invoke("list", { status: "answered" }, context())).toHaveLength(0);
   });
 
+  it("bounds a wait only when neither the call nor the decision does", async () => {
+    const store = new DecisionStore(meshAt(), main);
+    const provider = new DecisionsProvider(store, main, 50);
+    const unbounded = await provider.invoke("raise", { title: "Nobody answers" }, context("a")) as { id: string };
+    const dated = await provider.invoke("raise", { title: "Dated", timeoutMs: 60_000 }, context("a")) as { id: string };
+    expect(await provider.invoke("wait", { id: unbounded.id }, context("b"))).toMatchObject({ status: "open" });
+
+    const wait = vi.spyOn(store, "wait");
+    expect(await provider.invoke("wait", { id: unbounded.id, timeoutMs: 10 }, context("b"))).toMatchObject({ status: "open" });
+    expect(wait).toHaveBeenLastCalledWith(unbounded.id, { timeoutMs: 10 });
+    wait.mockResolvedValueOnce({} as never);
+    await provider.invoke("wait", { id: dated.id }, context("b"));
+    expect(wait).toHaveBeenLastCalledWith(dated.id, {});
+  });
+
   it("keeps decision records out of reach of mesh.put/delete", async () => {
     const mesh = meshAt();
     const meshProvider = new MeshProvider(mesh, main, { list: () => [] } as never);

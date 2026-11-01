@@ -4,43 +4,60 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { ActionRegistry } from "../dist/core/action-registry.js";
 import { compileFabricSummary } from "../dist/compaction/hook.js";
-import * as kernel from "../dist/verified/generated/kernel.js";
-import * as authority from "../dist/verified/generated/authority-kernel.js";
-import { bindingStep } from "../dist/verified/generated/lifecycle-kernel.js";
-import { storageTransition } from "../dist/verified/generated/storage-kernel.js";
+import * as policy from "../dist/verified/generated/policy.js";
+import { capabilityAuthority } from "../dist/verified/generated/authority.js";
+import { bindingStep } from "../dist/verified/generated/lifecycle.js";
+import { storageTransition } from "../dist/verified/generated/storage.js";
+import { resourceScope, resourceConflict } from "../dist/verified/generated/resources.js";
+import { meshGrantTake } from "../dist/verified/generated/grants.js";
+import { budgetAdmission } from "../dist/verified/generated/budget.js";
+import { speculationAdmission, speculationCheck, speculationAccounting } from "../dist/verified/generated/speculation.js";
 
 // The retired PoC must not remain reachable through package exports.
 await assert.rejects(import("pi-fabric/verified/cell-provider"), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });
 await assert.rejects(import("pi-fabric/verified/goal-provider"), { code: "ERR_PACKAGE_PATH_NOT_EXPORTED" });
 const root = new URL("../", import.meta.url);
-for (const file of ["kernel.js", "kernel.d.ts", "provider-kernel.js", "provider-kernel.d.ts", "lifecycle-kernel.js", "lifecycle-kernel.d.ts", "authority-kernel.js", "authority-kernel.d.ts", "storage-kernel.js", "storage-kernel.d.ts", "manifest.json"]) {
+const stems = ["policy", "compaction", "resources", "lifecycle", "storage", "provider", "authority", "grants", "speculation", "budget"];
+for (const file of [...stems.flatMap((stem) => [`${stem}.js`, `${stem}.d.ts`]), "manifest.json"]) {
   assert.equal(readFileSync(new URL(`src/verified/generated/${file}`, root), "utf8"), readFileSync(new URL(`dist/verified/generated/${file}`, root), "utf8"));
 }
-assert.equal(kernel.footprintFits(65, 64, true), false);
-assert.equal(kernel.pointerCurrent(true, false), false);
-assert.equal(kernel.headReadable(true, true, false, true, false), false);
-assert.equal(kernel.useNormalized(true, true, true, true), false);
-assert.deepEqual(kernel.consume(true), { $: "Tuple", fst: true, snd: false });
+const call = (machine, input) => machine.step({}, machine.init({}), input).scalars;
+assert.equal(call(policy.pointerCurrent, { source: 1, lineage: 0 })["out.current"], 0);
+assert.equal(call(policy.headReadable, { sequence: 1, version: 1, committed: 0, pending: 1, marker: 0 })["out.readable"], 0);
+assert.equal(call(policy.useNormalized, { canonical: 1, plan: 1, changed: 1, accepted: 1 })["out.use"], 0);
+assert.deepEqual(call(policy.consume, { active: 1 }), { "out.released": 1, "out.active": 0 });
+assert.equal(call(policy.headReadable, { sequence: 1, version: 1, committed: 0, pending: 1, marker: 1 })["out.readable"], 1);
+const budget = { valid: 1, spentHigh: 10, spentLow: 3, limitHigh: 10, limitLow: 4 };
+assert.equal(call(budgetAdmission, budget)["out.admitted"], 1);
+assert.equal(call(budgetAdmission, { ...budget, spentLow: 4 })["out.admitted"], 0);
+const grant = { authenticated: 1, now: 11, expiresAt: 13, uses: 2, topic: 3, requestedTopic: 3, hasTopic: 1, kind: 5, hasKind: 1, requestedKind: 5, hasRequestedKind: 0, externalKind: 6 };
+assert.deepEqual(call(meshGrantTake, grant), { "out.plan": 5, "out.uses": 1, "out.topic": 3, "out.kind": 5 });
+assert.equal(call(meshGrantTake, { ...grant, requestedTopic: 4 })["out.plan"], 3);
+assert.equal(call(speculationAdmission, { ended: 0, duplicate: 0, entries: 2, inFlight: 1, maxEntries: 3, maxConcurrent: 2 })["out.plan"], 0);
+assert.equal(call(speculationCheck, { settled: 1, aborted: 1, now: 110, createdAt: 100, ttl: 1, birthEpoch: 2, epoch: 2, fresh: 1, failed: 0 })["out.outcome"], 2);
+assert.equal(call(speculationAccounting, { event: 7 }).epoch, 1);
 
-const list = (values) => values.reduceRight((tail, head) => ({ $: "Con", head, tail }), { $: "Nil" });
-const names = (values) => list(values.map(value => list(Array.from({ length: value.length }, (_, i) => value.charCodeAt(i)))));
-const parent = authority.authorityIssue(names(["exact grant"]));
-assert.equal(authority.authorityLive(authority.authorityDerive(parent, names(["different grant"]))), false);
-assert.equal(authority.authorityLive(authority.authorityRelease(parent)), false);
-const life = { $: "Life", phase: { $: "Retiring" }, owner: false, holds: 0, calls: 0, revoked: true };
-const closing = bindingStep(life, { $: "Shut" });
-assert.equal(closing.command.$, "StartClose");
-assert.equal(bindingStep(closing.next, { $: "Begin", cleanup: true }).command.$, "Denied");
-const revision = value => ({ $: "Revision", high: Math.floor(value / 4294967296), low: value % 4294967296 });
-const request = { $: "Request", key: list([107]), expected: { $: "At", version: revision(0) }, change: { $: "Put", value: list([49]), identity: list([105]) } };
-const storage = storageTransition(request, { $: "Slot", present: false, version: revision(0), highWater: revision(2 ** 48 - 1) });
-assert.deepEqual(storage, { $: "PutNext", key: request.key, value: request.change.value, identity: request.change.identity, version: revision(2 ** 48), highWater: revision(2 ** 48) });
-assert.equal(storageTransition(request, { $: "Slot", present: false, version: revision(1), highWater: revision(1) }).$, "Conflict");
-assert.equal(storageTransition(request, { $: "Slot", present: false, version: revision(0), highWater: revision(9007199254740991) }).$, "Exhausted");
-const declaration = [...Array.from({ length: 64 }, (_, i) => `r${i}`), "shared"];
-const normalized = kernel.resourceNormalize(kernel.resourceSource(names(declaration)), names(declaration.slice(0, 64)));
-assert.deepEqual(normalized, { $: "Unknown" });
-assert.equal(kernel.resourceConflict(normalized, kernel.resourceSource(names(["shared"])), true, false), true);
+const set = (ids) => new Map(ids.map((id) => [id, 1]));
+const empty = new Map();
+const parent = capabilityAuthority.step({}, capabilityAuthority.init({}), { op: 0, name: 0, parentLive: 0, Candidate: set([1]), Parent: empty });
+const child = capabilityAuthority.step({}, capabilityAuthority.init({}), { op: 1, name: 0, parentLive: 1, Candidate: set([2]), Parent: parent.maps.Grants });
+assert.equal(child.scalars.live, 0);
+assert.equal(capabilityAuthority.step({}, parent, { op: 3, name: 0, parentLive: 0, Candidate: empty, Parent: empty }).scalars.live, 0);
+// Phases: 2 Retiring, 3 Closing. Events: 9 Shut, 7 Begin. Commands: 0 Denied, 2 StartClose.
+const closing = bindingStep.step({}, { scalars: { phase: 2, owner: 0, holds: 0, calls: 0, revoked: 1, command: 0 }, maps: {} }, { event: 9, cleanup: 0 });
+assert.equal(closing.scalars.command, 2);
+assert.equal(bindingStep.step({}, closing, { event: 7, cleanup: 1 }).scalars.command, 0);
+const storage = (present, version, highWater) => call(storageTransition, { key: 1, any: 0, expected: 0, put: 1, value: 2, identity: 3, present, version, highWater });
+assert.deepEqual(storage(0, 0, 2 ** 48 - 1), { "out.plan": 3, "out.key": 1, "out.value": 2, "out.identity": 3, "out.version": 2 ** 48, "out.highWater": 2 ** 48 });
+assert.equal(storage(0, 1, 1)["out.plan"], 0);
+assert.equal(storage(0, 0, 9007199254740991)["out.plan"], 1);
+// Proposal ids first (2..65), then the 65th declared name: the omission is refused.
+const declared = Array.from({ length: 65 }, (_, i) => i + 2);
+const lengths = new Map(declared.map((id) => [id, 3]));
+const source = resourceScope.step({}, resourceScope.init({}), { op: 0, first: 2, Given: set(declared), Len: lengths });
+const normalized = resourceScope.step({}, source, { op: 1, first: 2, Given: set(declared.slice(0, 64)), Len: lengths });
+assert.equal(normalized.scalars.exact, 0);
+assert.equal(call(resourceConflict, { leftEffect: 1, rightEffect: 1, leftExact: 0, rightExact: 1, leftOrdered: 1, rightOrdered: 0, witness: 0, Left: empty, Right: set([66]) }).conflict, 1);
 
 const registry = new ActionRegistry();
 let entered;

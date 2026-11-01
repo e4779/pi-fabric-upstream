@@ -4,10 +4,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { MeshStore, type MeshIdentity, type MeshStoreOptions } from "../src/mesh/store.js";
 import { captureStorageDelete, captureStoragePut } from "../src/verified/storage.js";
-import {
-  storageTransition, type StorageChange, type StorageExpectation,
-  type StorageRequest, type StorageRevision, type StorageText,
-} from "../src/verified/generated/storage-kernel.js";
+import { storageTransition } from "../src/verified/generated/storage.js";
 
 const identity: MeshIdentity = { id: "storage:test", name: "test", kind: "main" };
 const roots: string[] = [];
@@ -29,58 +26,56 @@ afterEach(() => {
 });
 
 describe("compiled production storage reducer", () => {
-  const wire = (n: number): StorageRevision => ({ $: "Revision", high: Math.floor(n / 4294967296), low: n % 4294967296 });
-  const key: StorageText = { $: "Con", head: 107, tail: { $: "Nil" } };
-  const value: StorageText = { $: "Con", head: 0, tail: key };
-  const actor: StorageText = { $: "Con", head: 55296, tail: key };
-  const put: StorageChange = { $: "Put", value, identity: actor };
-  const remove: StorageChange = { $: "Delete" };
-  const run = (present: boolean, version: number, highWater: number, expected: number | undefined, change: StorageChange) => {
-    const cas: StorageExpectation = expected === undefined ? { $: "Any" } : { $: "At", version: wire(expected) };
-    const request: StorageRequest = { $: "Request", key, expected: cas, change };
-    return storageTransition(request, { $: "Slot", present, version: wire(version), highWater: wire(highWater) });
+  const PLANS = ["Conflict", "Exhausted", "Unchanged", "PutNext", "DeleteNext"];
+  // Interned ids as the bridge assigns them: unequal, so swapped fields show.
+  const key = 1, value = 2, actor = 3;
+  type Change = "put" | "delete";
+  const run = (present: boolean, version: number, highWater: number, expected: number | undefined, change: Change) => {
+    const out = storageTransition.step({}, storageTransition.init({}), {
+      key, any: expected === undefined ? 1 : 0, expected: expected ?? 0, put: change === "put" ? 1 : 0,
+      value: change === "put" ? value : 0, identity: change === "put" ? actor : 0,
+      present: present ? 1 : 0, version, highWater,
+    }).scalars;
+    const plan = PLANS[out["out.plan"]!];
+    if (plan === "PutNext") return { plan, key: out["out.key"], value: out["out.value"], identity: out["out.identity"], version: out["out.version"], highWater: out["out.highWater"] };
+    if (plan === "DeleteNext") return { plan, key: out["out.key"], version: out["out.version"], highWater: out["out.highWater"] };
+    return { plan };
   };
 
   it("distinguishes CAS, presence, payload and clock fields at the generated ABI", () => {
     // storage_* laws quantify over all requests and slots. Unequal key/clock
     // values catch swapped ABI fields without reimplementing the decision tree.
-    const live = { $: "PutNext", key, value, identity: actor, version: wire(4), highWater: wire(12) };
-    const fresh = { ...live, version: wire(12) };
-    expect(run(true, 3, 11, 3, put)).toEqual(live);
-    expect(run(true, 3, 11, undefined, put)).toEqual(live);
-    expect(run(false, 0, 11, 0, put)).toEqual(fresh);
-    expect(run(false, 7, 11, 7, put)).toEqual(fresh);
-    expect(run(true, 3, 11, 3, remove)).toEqual({ $: "DeleteNext", key, version: wire(4), highWater: wire(12) });
-    expect(run(false, 7, 11, 7, remove)).toEqual({ $: "Unchanged" });
-    expect(run(true, 3, 11, 2, put)).toEqual({ $: "Conflict" });
-    expect(run(true, 3, 11, 11, put)).toEqual({ $: "Conflict" });
-    expect(run(false, 7, 11, 0, remove)).toEqual({ $: "Conflict" });
-    expect(run(false, 0, 9007199254740991, undefined, remove)).toEqual({ $: "Unchanged" });
+    const live = { plan: "PutNext", key, value, identity: actor, version: 4, highWater: 12 };
+    const fresh = { ...live, version: 12 };
+    expect(run(true, 3, 11, 3, "put")).toEqual(live);
+    expect(run(true, 3, 11, undefined, "put")).toEqual(live);
+    expect(run(false, 0, 11, 0, "put")).toEqual(fresh);
+    expect(run(false, 7, 11, 7, "put")).toEqual(fresh);
+    expect(run(true, 3, 11, 3, "delete")).toEqual({ plan: "DeleteNext", key, version: 4, highWater: 12 });
+    expect(run(false, 7, 11, 7, "delete")).toEqual({ plan: "Unchanged" });
+    expect(run(true, 3, 11, 2, "put")).toEqual({ plan: "Conflict" });
+    expect(run(true, 3, 11, 11, "put")).toEqual({ plan: "Conflict" });
+    expect(run(false, 7, 11, 0, "delete")).toEqual({ plan: "Conflict" });
+    expect(run(false, 0, 9007199254740991, undefined, "delete")).toEqual({ plan: "Unchanged" });
   });
 
-  it("preserves limb carry, backend-domain crossings and overflow refusal", () => {
-    // Keep arithmetic backend probes separate from policy combinations.
+  it("keeps successors exact across numeric boundaries and refuses overflow", () => {
+    // Keep arithmetic probes separate from policy combinations.
     const successors = [
       [0, 1], [4294967294, 4294967295], [4294967295, 4294967296],
       [4294967296, 4294967297], [281474976710655, 281474976710656],
       [281474976710656, 281474976710657], [9007199254740990, 9007199254740991],
     ] as const;
     for (const [before, after] of successors) {
-      expect(run(true, before, before, undefined, put)).toEqual({ $: "PutNext", key, value, identity: actor, version: wire(after), highWater: wire(after) });
-      expect(run(true, before, before, undefined, remove)).toEqual({ $: "DeleteNext", key, version: wire(after), highWater: wire(after) });
+      expect(run(true, before, before, undefined, "put")).toEqual({ plan: "PutNext", key, value, identity: actor, version: after, highWater: after });
+      expect(run(true, before, before, undefined, "delete")).toEqual({ plan: "DeleteNext", key, version: after, highWater: after });
     }
     for (const [version, highWater] of [[3, 9007199254740991], [9007199254740991, 4], [9007199254740991, 9007199254740991]] as const) {
-      expect(run(true, version, highWater, undefined, put)).toEqual({ $: "Exhausted" });
-      expect(run(true, version, highWater, undefined, remove)).toEqual({ $: "Exhausted" });
+      expect(run(true, version, highWater, undefined, "put")).toEqual({ plan: "Exhausted" });
+      expect(run(true, version, highWater, undefined, "delete")).toEqual({ plan: "Exhausted" });
     }
-    for (const version of [
-      { $: "Revision" as const, high: 2097152, low: 0 },
-      { $: "Revision" as const, high: 0, low: 4294967296 },
-    ]) {
-      const slot = { $: "Slot" as const, present: true, version, highWater: version };
-      expect(storageTransition({ $: "Request", key, expected: { $: "Any" }, change: put }, slot)).toEqual({ $: "Exhausted" });
-      expect(storageTransition({ $: "Request", key, expected: { $: "Any" }, change: remove }, slot)).toEqual({ $: "Exhausted" });
-    }
+    // The compiled runtime refuses revisions past 2^53 - 1 before deciding.
+    for (const version of [2 ** 53, -1, 1.5]) expect(() => run(true, version, version, undefined, "put")).toThrow(RangeError);
   });
 
   it("uses lossless captured JSON, including NULs and lone surrogates", () => {

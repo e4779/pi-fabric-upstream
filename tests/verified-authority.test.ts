@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ActionRegistry, type FabricRegistryInvocationContext } from "../src/core/action-registry.js";
 import { CapabilityAuthority } from "../src/verified/authority.js";
-import * as kernel from "../src/verified/generated/authority-kernel.js";
+import * as kernel from "../src/verified/generated/authority.js";
+import { idSet, members } from "../src/verified/machine.js";
 import { FabricSpeculationStore } from "../src/speculation/store.js";
 import type { FabricActionDescriptor, FabricCapabilityBindingView, FabricInvocationContext, FabricProvider } from "../src/protocol.js";
 
@@ -16,51 +17,65 @@ const fixture = (scoped = false) => {
   return { provider, descriptor };
 };
 afterEach(async () => { await Promise.all(registries.splice(0).map(registry => registry.close())); vi.restoreAllMocks(); });
-const text = (value: string): kernel.AuthorityText => { let out: kernel.AuthorityText = { $: "Nil" }; for (let i = value.length - 1; i >= 0; i--) out = { $: "Con", head: value.charCodeAt(i), tail: out }; return out; };
-const grants = (values: string[]): kernel.AuthorityGrants => values.reduceRight<kernel.AuthorityGrants>((tail, value) => ({ $: "Con", head: text(value), tail }), { $: "Nil" });
+const ISSUE = 0, DERIVE = 1, USE = 2, RELEASE = 3;
+type Authority = ReturnType<typeof kernel.capabilityAuthority.init>;
+const machine = kernel.capabilityAuthority;
+const empty = new Map<number, number>();
+const issue = (ids: number[]): Authority => machine.step({}, machine.init({}), { op: ISSUE, name: 0, parentLive: 0, Candidate: idSet(ids), Parent: empty });
+const derive = (parent: Authority, ids: number[]): Authority => machine.step({}, machine.init({}), {
+  op: DERIVE, name: 0, parentLive: parent.scalars.live, Candidate: idSet(ids), Parent: idSet(members(parent, "Grants")),
+});
+// A step consumes its state; probe a copy so the authority under test is unchanged.
+const copy = (authority: Authority): Authority => ({ scalars: { ...authority.scalars }, maps: { Grants: new Map(authority.maps.Grants) } });
+const allows = (authority: Authority, id: number): boolean =>
+  machine.step({}, copy(authority), { op: USE, name: id, parentLive: 0, Candidate: empty, Parent: empty }).scalars.granted === 1;
+const release = (authority: Authority): Authority => machine.step({}, copy(authority), { op: RELEASE, name: 0, parentLive: 0, Candidate: empty, Parent: empty });
+const held = (authority: Authority): number[] => members(authority, "Grants").sort();
 
-// Mutation anchors: A.derive must not issue unconditionally or reverse covered;
-// A.allows must not accept Released; nameEqual must not accept a prefix; codec
-// must not omit a tuple field. Positive tests kill deny-all mutations. Production
+// Mutation anchors: derive must not issue unconditionally or reverse coverage;
+// use must not accept a released authority; the codec must not omit a tuple
+// field or compare a prefix. Positive tests kill deny-all mutations. Production
 // tests kill removal of prepared/approval/trace clones and shutdown propagation.
 describe("compiled authority state transitions", () => {
   it("encodes accepted and refused derivations without re-enumerating subsets", () => {
-    // derive_safe/derive_complete quantify over arbitrary grant lists.
+    // derive_safe/derive_complete quantify over arbitrary grant sets.
     const cases = [
       [[], [], true],
-      [["a"], [], true],
-      [["a", "b"], ["b"], true],
-      [["a", "b"], ["a", "b"], true],
-      [["a", "b"], ["a", "a"], true],
-      [["a", "a"], ["a"], true],
-      [["a"], ["a", "b"], false],
-      [["a"], ["b"], false],
+      [[1], [], true],
+      [[1, 2], [2], true],
+      [[1, 2], [1, 2], true],
+      [[1, 2], [1, 1], true],
+      [[1, 1], [1], true],
+      [[1], [1, 2], false],
+      [[1], [2], false],
     ] as const;
     for (const [parent, candidate, accepted] of cases) {
-      const child = kernel.authorityDerive(kernel.authorityIssue(grants([...parent])), grants([...candidate]));
-      expect(child).toEqual(accepted ? { $: "Active", grants: grants([...candidate]) } : { $: "Released" });
-      expect(kernel.authorityLive(child)).toBe(accepted);
+      const child = derive(issue([...parent]), [...candidate]);
+      expect(child.scalars.live).toBe(accepted ? 1 : 0);
+      expect(held(child)).toEqual(accepted ? [...new Set(candidate)].sort() : []);
     }
-    const root = kernel.authorityIssue(grants(["a", "b"]));
-    const child = kernel.authorityDerive(root, grants(["b"]));
-    expect(kernel.authorityAllows(child, text("b"))).toBe(true);
-    expect(kernel.authorityAllows(child, text("a"))).toBe(false);
-    expect(kernel.authorityAllows(child, text("c"))).toBe(false);
-    const released = kernel.authorityRelease(root);
-    expect(kernel.authorityLive(released)).toBe(false);
-    expect(kernel.authorityDerive(released, grants([]))).toEqual({ $: "Released" });
-    expect(kernel.authorityAllows(released, text("a"))).toBe(false);
-    expect(root).toEqual({ $: "Active", grants: grants(["a", "b"]) });
+    const root = issue([1, 2]);
+    const child = derive(root, [2]);
+    expect(allows(child, 2)).toBe(true);
+    expect(allows(child, 1)).toBe(false);
+    expect(allows(child, 3)).toBe(false);
+    const released = release(root);
+    expect(released.scalars.live).toBe(0);
+    expect(derive(released, []).scalars.live).toBe(0);
+    expect(allows(released, 1)).toBe(false);
+    expect(held(root)).toEqual([1, 2]);
   });
+});
 
+describe("authority identity codec", () => {
+  const view = (descriptorHash: string): FabricCapabilityBindingView => ({ ref: "demo.run", provider: "demo", providerBindingId: "b", generation: 1, descriptorHash });
   it("compares complete UTF-16 text, including long suffixes, NUL, astral and lone surrogates", () => {
     const prefix = "x".repeat(1100);
     for (const value of ["", "a", "a\0", "😀", "\ud800", prefix + "a"]) {
-      const root = kernel.authorityIssue(grants([value]));
-      expect(kernel.authorityAllows(root, text(value))).toBe(true);
+      const root = CapabilityAuthority.issue([view(value)]);
+      expect(root.resolve("demo.run")).toEqual(view(value));
       for (const other of [value + "b", value + "\0", value + "\udfff"]) {
-        expect(kernel.authorityAllows(root, text(other))).toBe(false);
-        expect(kernel.authorityLive(kernel.authorityDerive(root, grants([other])))).toBe(false);
+        expect(root.derive([view(other)]).active).toBe(false);
       }
     }
   });
@@ -90,7 +105,8 @@ describe("private canonical authority codec", () => {
 
 describe("ActionRegistry authority integration", () => {
   it("uses compiled issue/derive/use/release in the real registry, preserving aliases and retained generations", async () => {
-    const issue = vi.spyOn(kernel, "authorityIssue"); const derive = vi.spyOn(kernel, "authorityDerive"); const allows = vi.spyOn(kernel, "authorityAllows"); const release = vi.spyOn(kernel, "authorityRelease");
+    const step = vi.spyOn(kernel.capabilityAuthority, "step");
+    const ops = (op: number) => step.mock.calls.filter(([, , input]) => (input as { op: number }).op === op).length;
     const registry = create(); const first = fixture(); registry.register(first.provider);
     const parent = await registry.acquireCapabilityView(["demo.run", "demo.alias"], context);
     registry.register(fixture().provider, { overwrite: true });
@@ -98,21 +114,22 @@ describe("ActionRegistry authority integration", () => {
     expect(child.view!.bindings["demo.alias"]!.generation).toBe(parent.view!.bindings["demo.alias"]!.generation);
     expect(await registry.invoke("demo.alias", { value: 1 }, invocation({ capabilityView: child.view! }))).toEqual({ value: 1 });
     expect(first.provider.invoke).toHaveBeenCalledWith("run", { value: 1 }, expect.anything());
-    expect(issue).toHaveBeenCalledOnce(); expect(derive).toHaveBeenCalledOnce(); expect(allows).toHaveBeenCalled();
+    expect(ops(ISSUE)).toBe(1); expect(ops(DERIVE)).toBe(1); expect(ops(USE)).toBeGreaterThan(0);
     expect(first.provider.close).not.toHaveBeenCalled();
     await child.release();
     expect(await registry.invoke("demo.run", {}, invocation({ capabilityView: parent.view! }))).toEqual({});
-    await parent.release(); expect(release).toHaveBeenCalledTimes(2); expect(first.provider.close).toHaveBeenCalledOnce();
+    await parent.release(); expect(ops(RELEASE)).toBe(2); expect(first.provider.close).toHaveBeenCalledOnce();
   });
 
   it("refuses widening, forged/copied/cross-registry views and cascades parent release", async () => {
-    const registry = create(); registry.register(fixture().provider);
+    const registry = create(); const { provider } = fixture(); registry.register(provider);
     const parent = await registry.acquireCapabilityView(["demo.run"], context);
     const ctx = { ...context, capabilityView: parent.view! };
     expect((await registry.acquireCapabilityView(["demo.alias"], ctx)).satisfied).toBe(false);
     const child = await registry.acquireCapabilityView(["demo.run"], ctx);
     const empty = await registry.acquireCapabilityView([], ctx);
     expect(empty.satisfied).toBe(true);
+    expect(Object.isFrozen(parent.view)).toBe(true);
     expect(Object.isFrozen(parent.view!.bindings["demo.run"])).toBe(true);
     const other = create(); other.register(fixture().provider);
     for (const [target, view] of [[registry, structuredClone(parent.view!)], [other, parent.view!]] as const) {
@@ -120,9 +137,11 @@ describe("ActionRegistry authority integration", () => {
     }
     await parent.release();
     for (const view of [parent.view!, child.view!, empty.view!]) {
+      await expect(registry.invoke("demo.run", {}, invocation({ capabilityView: view }))).rejects.toThrow(/released|revoked/);
       await expect(registry.acquireCapabilityView([], { ...context, capabilityView: view })).rejects.toThrow(/released/);
       expect(() => registry.providers({ ...context, capabilityView: view })).toThrow(/released/);
     }
+    expect(provider.invoke).not.toHaveBeenCalled();
     await child.release(); await empty.release();
     expect(await registry.invoke("demo.run", {}, invocation())).toEqual({});
   });
@@ -138,13 +157,13 @@ describe("ActionRegistry authority integration", () => {
   });
 
   it("shutdown releases held root/child authority and revokes inspection views", async () => {
-    const release = vi.spyOn(kernel, "authorityRelease");
+    const step = vi.spyOn(kernel.capabilityAuthority, "step");
     const registry = create(); const { provider } = fixture(); registry.register(provider);
     const parent = await registry.acquireCapabilityView(["demo.run"], context);
     const child = await registry.acquireCapabilityView(["demo.run"], { ...context, capabilityView: parent.view! });
     const inspected = await registry.inspectCapabilities(["demo.run"], context);
     await registry.close();
-    expect(release).toHaveBeenCalledTimes(3);
+    expect(step.mock.calls.filter(([, , input]) => (input as { op: number }).op === RELEASE)).toHaveLength(3);
     expect(provider.close).toHaveBeenCalledOnce();
     for (const view of [parent.view!, child.view!, inspected.view!]) expect(() => registry.providers({ ...context, capabilityView: view })).toThrow(/released/);
     await parent.release(); await child.release();

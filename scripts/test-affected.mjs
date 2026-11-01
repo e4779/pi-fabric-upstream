@@ -78,9 +78,14 @@ const isTestFile = (file) => file.startsWith("tests/") && /\.test\.(?:ts|tsx)$/.
 // so without this mapping a shipped violation stays invisible to CI.
 const DOCS_STYLE_TEST = "tests/documentation-style.test.ts";
 const isDocsFile = (file) => file === "README.md" || file.startsWith("docs/");
+// A release bumps package.json, and the durable replay engine names that
+// version in a source literal. Selecting the suite that compares them makes a
+// release commit that forgets the literal fail its own CI run.
+const ENGINE_VERSION_TEST = "tests/durable-extension-replay.test.ts";
 const direct = [...new Set([
   ...files.filter(isTestFile),
   ...(files.some(isDocsFile) && fs.existsSync(DOCS_STYLE_TEST) ? [DOCS_STYLE_TEST] : []),
+  ...(files.includes("package.json") && fs.existsSync(ENGINE_VERSION_TEST) ? [ENGINE_VERSION_TEST] : []),
 ])];
 const related = files.filter(
   (file) => (file.startsWith("src/") || file.startsWith("tests/")) && !isTestFile(file),

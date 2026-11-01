@@ -7,9 +7,11 @@ import { PI_CORE_TOOL_NAMES } from "./pi-tools.js";
  */
 export const coreOverridePromptGuidance = (
   catalog: CapturedToolCatalog,
+  allowlist?: { has(name: string): boolean },
 ): string => {
   const sections: string[] = [];
   for (const name of PI_CORE_TOOL_NAMES) {
+    if (allowlist && !allowlist.has(name)) continue;
     const entry = catalog.get(name);
     if (!entry) continue;
     const lines: string[] = [];

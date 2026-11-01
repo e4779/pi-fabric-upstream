@@ -8,21 +8,13 @@ Haydn Paterson, licensed under MIT. This private artifact is not loaded by the
 Pi extension, which continues to use Pi's host-provided TypeBox. The complete
 license is distributed at [docs/licenses/typebox-mit.txt](docs/licenses/typebox-mit.txt).
 
-## pi-coralbricks-provider
+## gdp-wired
 
-The package bundles [`pi-coralbricks-provider`](https://github.com/monotykamary/pi-coralbricks-provider)
-unmodified under `node_modules/pi-coralbricks-provider`, at the exact version
-pinned in `package.json`. It is licensed under MIT, and its complete license is
-distributed beside it at `node_modules/pi-coralbricks-provider/LICENSE`.
-
-## Bend 2.0.37
-
-The generated policy kernel includes Bend's emitted JavaScript trampoline and
-compiled Base primitives from [Bend 2.0.37](https://github.com/bendlang/bend/tree/v2.0.37),
-Copyright 2026 HigherOrderCO, licensed under Apache-2.0. Pi Fabric selects the
-ABI library exports, adapts constructor tags at the boundary, and tree-shakes
-unused runtime code.
-The complete license is distributed at [docs/licenses/bend-apache-2.0.txt](docs/licenses/bend-apache-2.0.txt).
+The generated verified kernels in `dist/verified/generated/` are JavaScript
+emitted by the compiler of [gdp-wired](https://github.com/monotykamary/gdp-wired),
+including its small runtime guard helpers, Copyright (c) 2026 Tom X Nguyen,
+licensed under MIT. The prover itself is a build-time dependency and is not
+shipped. The complete license is distributed at [docs/licenses/gdp-wired-mit.txt](docs/licenses/gdp-wired-mit.txt).
 
 
 Pi Fabric's QuickJS host-bridge design and TypeScript code-mode ergonomics were informed by the MIT-licensed [`boozedog/pi-codemode`](https://github.com/boozedog/pi-codemode) project.

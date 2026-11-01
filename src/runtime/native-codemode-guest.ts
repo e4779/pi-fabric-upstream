@@ -80,7 +80,8 @@ globalThis.exit = () => { throw __exit; };
 globalThis.__fabricRun = async (main) => {
   if (typeof __nativeToolsEnabled !== "undefined" && __nativeToolsEnabled) {
     __nativeAllTools = Object.freeze(await __call("fabric.$piAllTools", {}));
-    for (const tool of __nativeAllTools) __nativeToolNames.add(tool.name);
+    // A host may also give a tool's identifier (jsName: my-tool -> my_tool) so tools.my_tool reaches it.
+    for (const tool of __nativeAllTools) { __nativeToolNames.add(tool.name); if (typeof tool.jsName === "string") __nativeToolNames.add(tool.jsName); }
     __nativeCatalogReady = true;
     if (__nativeProfile) globalThis.ALL_TOOLS = __nativeAllTools;
   }

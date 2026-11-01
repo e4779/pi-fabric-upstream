@@ -44,30 +44,18 @@ jobs:
           fi
       - name: Install dependencies
         run: bun install --frozen-lockfile
-      - name: Install pinned Bend proof compiler
+      - name: Prove kernels, refuse broken variants, and reproduce executable kernels
         if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          curl --proto '=https' --tlsv1.2 -fsSL -o "$RUNNER_TEMP/bend.tar.gz" https://github.com/bendlang/bend/releases/download/v2.0.37/bend-2.0.37-linux-x64.tar.gz
-          echo "84c32465a39bc9ac315eade23f470cb8db03153dc860f89564fcfec153c3e445  $RUNNER_TEMP/bend.tar.gz" | sha256sum -c -
-          tar -xzf "$RUNNER_TEMP/bend.tar.gz" -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/bend/bin" >> "$GITHUB_PATH"
-      - name: Check proofs, reproduce executable kernels, and reject invalid mutations
-        if: runner.os == 'Linux'
-        env:
-          BEND_NO_TELEMETRY: '1'
         run: bun run proof:check
       - name: Type check
         run: bun run typecheck
       # Some integration tests execute the published worker entrypoints in dist.
       - name: Build
         run: bun run build
-      - name: Check CI workflow runtime configuration
-        run: bunx vitest run tests/ci-workflows.test.ts
-      - name: Check Python kernel diagnostics
-        run: bunx vitest run tests/kernel-errors.test.ts
-      - name: Test verified-kernel ABI and provider dispatch on both platforms
-        run: bunx vitest run tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-artifact.test.ts
+      # Keep the same unconditional cross-platform checks, but pay Vitest's
+      # collection/worker startup once instead of three times.
+      - name: Check CI, Python diagnostics, and verified-kernel ABI
+        run: bunx vitest run tests/ci-workflows.test.ts tests/kernel-errors.test.ts tests/verified-kernels.test.ts tests/verified-resources.test.ts tests/verified-providers.test.ts tests/verified-authority.test.ts tests/verified-lifecycle.test.ts tests/verified-storage.test.ts tests/verified-grants.test.ts tests/verified-speculation.test.ts tests/verified-budget.test.ts tests/verified-artifact.test.ts tests/verified-proof-scope.test.ts tests/verified-kernel-pool.test.ts
       - name: Check bundled verified-kernel behavior
         run: bun run proof:dist
       - name: Test Windows type-checker regression

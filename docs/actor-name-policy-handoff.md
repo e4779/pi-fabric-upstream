@@ -1,0 +1,5 @@
+# Actor name decision: proof boundary
+
+`src/actors/name-policy.ts` evaluates two booleans from a host snapshot of exact trimmed-name matches. Active wins whenever present; stopped wins when active is absent; neither flag means available. `proofs/actor-name.ts` proves those three decisions using gdp-wired. Its three broken variants are refused with counterexamples. Both actor create adapters use the generated machine and refuse existing names before creating a directory or deleting an actor. Explicit removal is a separate operation.
+
+The proof covers the pure decision only. Snapshot completeness, actor lookup, filesystem and registry effects, deletion, and adapter control flow belong to the host. The manager uses its local loaded view; the directory combines its visible project and session views. Per-instance queues serialize local creates, while independent hosts can race. The decision does not establish distributed name uniqueness, ownership, crash recovery, or execution fencing. Tests cover preservation of a stopped actor and its session when an unrelated registry write fails.

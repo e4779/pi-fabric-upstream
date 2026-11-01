@@ -22,6 +22,21 @@ standalone jev-fabric without being rewritten.
   Linux). Durable batch tasks still run through `pi.bash` and its middleware;
   interactive children run outside `pi.bash`, so they are unavailable while an
   extension overrides `bash`. This preserves the extension's gate.
+- Extensions that guard the shell in a `tool_call` hook still see interactive
+  children. `sessions.open` emits a `bash` `tool_call` with the command (`cmd`,
+  or `argv` joined as a shell-quoted line), `cwd` and `parentToolCallId`, and a
+  block stops the open before anything starts. `sessions.write` emits one for
+  each write to a session that runs a shell, with the text as `command`; a block
+  means nothing is written. A `cmd` session always counts as a shell, and so does
+  an `argv` with any word that names a shell or a program that hosts one (`sh`,
+  `bash`, `zsh` and similar, `env bash`, `ssh`, `sudo`, `tmux`). A command split
+  across writes is judged as one line: the hook sees the unfinished line before
+  the new text. A hook may rewrite `cmd`, but a rewrite of `argv`, of written
+  text or of `cwd` is refused, since none can be replaced after the guard has
+  judged it. Writes to other children, such as a REPL or a harness `serve`, send
+  data and are not preflighted. The preflight fails closed: a hook that throws refuses the call, sessions are
+  refused until extension hooks have initialized, and a confined child whose
+  write policy denies the shell cannot open them.
 - A Jev program's interactive `session` children end whenever the program ends.
   `fabric_exec` children stay with the Pi session, like background tasks.
 

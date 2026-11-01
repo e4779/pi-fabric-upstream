@@ -1,17 +1,17 @@
 import { describe, expect, it } from "vitest";
-import * as kernel from "../src/verified/generated/kernel.js";
+import * as kernel from "../src/verified/policy.js";
 import {
-  acceptCompactionCut, acceptMemoryChunk, acceptSampleAccounting, acceptSummaryBounds,
-  assertCertificateFacts, bendList, boundedEffectResources,
+  acceptCompactionCut, acceptMemoryChunk, acceptSampleAccounting, acceptSummaryBounds, assertCertificateFacts,
 } from "../src/verified/policy.js";
+import { boundedEffectResources } from "../src/verified/resources.js";
 import { acceptsExpansionPage } from "../src/verified/memory.js";
 import { effectConflictsBetween, registrationEffect, summarizeEffects } from "../src/components/effect-policy.js";
 import { sampleAddressed } from "../src/compaction/bounds.js";
 
-// These are ABI/refinement checks of the emitted implementation, not substitutes
-// for the universal Bend proofs. In particular they exercise native JS numbers,
-// constructor fields and the adapter's actual source observations.
-describe("compiled Bend policy bridge", () => {
+// These are codec checks of the compiled machines, not substitutes for the
+// gdp-wired proofs. They exercise argument positions, 0/1 encodings, numeric
+// bounds and the adapter's actual source observations.
+describe("compiled gdp-wired policy bridge", () => {
   // Laws prove the Boolean functions universally. These asymmetric vectors
   // distinguish ABI argument positions and output tags without truth-table grids.
   it("preserves policy argument positions and outcome encodings", () => {
@@ -20,11 +20,6 @@ describe("compiled Bend policy bridge", () => {
     expect(kernel.transitionCurrent(false, false, true, false)).toBe(false);
     expect(kernel.transitionCurrent(false, true, false, false)).toBe(false);
     expect(kernel.transitionCurrent(false, true, true, true)).toBe(false);
-    expect(kernel.canClose(true, false, false, false)).toBe(true);
-    expect(kernel.canClose(false, false, false, false)).toBe(false);
-    expect(kernel.canClose(true, true, false, false)).toBe(false);
-    expect(kernel.canClose(true, false, true, false)).toBe(false);
-    expect(kernel.canClose(true, false, false, true)).toBe(false);
     expect(kernel.cleanupState(false, false)).toBe(0);
     expect(kernel.cleanupState(false, true)).toBe(1);
     expect(kernel.cleanupState(true, false)).toBe(2);
@@ -85,9 +80,8 @@ describe("compiled Bend policy bridge", () => {
     ]);
   });
 
-  it("checks numeric comparisons without U32 truncation and fails malformed Nat boundaries closed", () => {
-    for (const count of [0, 1, 63, 64, 65, 2 ** 32, Number.MAX_SAFE_INTEGER]) {
-      expect(kernel.footprintFits(count, 64, true)).toBe(count <= 64);
+  it("checks numeric comparisons without U32 truncation and fails malformed naturals closed", () => {
+    for (const count of [0, 1, 63, 64, 65, 2 ** 32, Number.MAX_SAFE_INTEGER - 1]) {
       expect(acceptSummaryBounds(count, count, count, count)).toBe(true);
       expect(acceptSummaryBounds(count + 1, count, 0, 0)).toBe(false);
     }
@@ -97,8 +91,8 @@ describe("compiled Bend policy bridge", () => {
     }
   });
 
-  it("refuses arithmetic outside the pinned backend domain without throwing", () => {
-    const max = 2 ** 48 - 1;
+  it("refuses arithmetic outside the compiled runtime's 2^53 domain without throwing", () => {
+    const max = Number.MAX_SAFE_INTEGER;
     expect(acceptSampleAccounting(max, max, 0, max)).toBe(true);
     expect(acceptSampleAccounting(max + 1, max, 1, max + 1)).toBe(false);
     expect(acceptSampleAccounting(max, max, 1, max)).toBe(false);
@@ -120,7 +114,7 @@ describe("compiled Bend policy bridge", () => {
     expect(acceptCompactionCut(base, [{ ...safe, first: -1 }])).toBe(false);
   });
 
-  // This still tests a TypeScript producer: Bend checks its accounting, not
+  // This still tests a TypeScript producer: the kernel checks its accounting, not
   // which source entries and omitted addresses the producer selects.
   it("conserves addressed samples over all small sizes and limits", () => {
     for (let total = 0; total <= 30; total++) for (let limit = 0; limit <= 12; limit++) {
@@ -163,26 +157,23 @@ describe("compiled Bend policy bridge", () => {
   });
 
   it("requires every certificate condition and consumes an active token only once", () => {
-    // all_sound/all_complete cover arbitrary conjunctions. Keep each host
+    // certificate_sound/certificate_complete cover the conjunction. Keep each host
     // diagnostic position and one multiple-failure precedence case, not 2^8 rows.
     const facts = (row: readonly boolean[]) => {
       const fact = (i: number) => ({ valid: row[i]!, error: `condition ${i}` });
       return [fact(0), fact(1), fact(2), fact(3), fact(4), fact(5), fact(6), fact(7)] as const;
     };
     const valid = Array<boolean>(8).fill(true);
-    expect(kernel.certificateAccepted(bendList(valid))).toBe(true);
     expect(() => assertCertificateFacts(facts(valid))).not.toThrow();
     for (let index = 0; index < valid.length; index++) {
       const row = [...valid]; row[index] = false;
-      expect(kernel.certificateAccepted(bendList(row))).toBe(false);
       expect(() => assertCertificateFacts(facts(row))).toThrow(`condition ${index}`);
     }
     const multiple = [...valid]; multiple[2] = false; multiple[6] = false;
-    expect(kernel.certificateAccepted(bendList(multiple))).toBe(false);
     expect(() => assertCertificateFacts(facts(multiple))).toThrow("condition 2");
     expect(() => assertCertificateFacts([] as unknown as Parameters<typeof assertCertificateFacts>[0])).toThrow("Invalid Schema");
     const first = kernel.consume(true);
-    expect(first).toEqual({ $: "Tuple", fst: true, snd: false });
-    expect(kernel.consume(first.snd)).toEqual({ $: "Tuple", fst: false, snd: false });
+    expect(first).toEqual({ released: true, active: false });
+    expect(kernel.consume(first.active)).toEqual({ released: false, active: false });
   });
 });

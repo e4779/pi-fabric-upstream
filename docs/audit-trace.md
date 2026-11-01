@@ -14,6 +14,7 @@ interface FabricPersistedExecutionDetailsV1 {
   audits: FabricLegacyRenderAudit[];
   phases: string[];
   error?: string;
+  omittedCalls?: { count: number; done: number }; // audits the size bound dropped
 }
 
 interface FabricExecutionTraceV1 {
@@ -150,4 +151,4 @@ An invalid or unknown trace, when present, blocks semantic legacy reinterpretati
 
 ## Limitations
 
-Persisted audits are verbatim. Resumed final rendering shows read bodies, edit diffs, write bodies, bash output, agent tasks, and provider results. Durable traces still store bounded projections. Bash command text stays in the trace, and arbitrary argument or result content never enters it. That exclusion covers discovery queries, workflow descriptions and data, external and MCP arguments, and provider results. When arguments are omitted from the trace, generic failure resolution keeps only the ref identity. The envelope stays bounded. Past 512 KiB, display-only audits trim first. Trace-only cards, old or trimmed, render `not retained across reload` markers for content the session record does not hold. Workflow activity content stays available only while the live execution result or activity store remains in memory.
+Persisted audits are verbatim. Resumed final rendering shows read bodies, edit diffs, write bodies, bash output, agent tasks, and provider results. Durable traces still store bounded projections. Bash command text stays in the trace, and arbitrary argument or result content never enters it. That exclusion covers discovery queries, workflow descriptions and data, external and MCP arguments, and provider results. When arguments are omitted from the trace, generic failure resolution keeps only the ref identity. The envelope stays bounded. Past 512 KiB, display-only audits trim first, and `omittedCalls` counts the dropped audits so the resumed card still reports every call. Trace-only cards, old or trimmed, render `not retained across reload` markers for content the session record does not hold. Workflow activity content stays available only while the live execution result or activity store remains in memory.

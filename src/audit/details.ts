@@ -4,7 +4,7 @@ import {
   isFabricExecutionTraceV1,
   type FabricExecutionTraceOperationV1,
   type FabricExecutionTraceV1,
-} from "./trace.js";
+} from "./trace-schema.js";
 
 export const FABRIC_EXECUTION_DETAILS_MAX_BYTES = 512 * 1024;
 
@@ -21,6 +21,8 @@ export interface FabricPersistedExecutionDetailsV1 {
   outputFormat?: "yaml" | "json";
   outputFormatStartLine?: number;
   outputFormatLines?: number;
+  /** Audits the size bound dropped; the resumed card still counts them. */
+  omittedCalls?: FabricOmittedCalls;
 }
 
 /**
@@ -71,6 +73,16 @@ export interface FabricExecutionRenderDetails {
   outputFormatLines?: number;
   phases: string[];
   audits: FabricLegacyRenderAudit[];
+  /** Calls a progress update left out to stay bounded; the live card still counts them. */
+  omittedCalls?: FabricOmittedCalls;
+}
+
+export interface FabricOmittedCalls {
+  count: number;
+  /** How many of the omitted calls had finished. */
+  done: number;
+  /** How many omitted calls failed (absent in older records). */
+  failed?: number;
 }
 
 const serializedBytes = (value: unknown): number =>
@@ -139,7 +151,14 @@ export const createFabricPersistedExecutionDetails = (input: {
     serializedBytes(details) > FABRIC_EXECUTION_DETAILS_MAX_BYTES &&
     details.audits.length > 0
   ) {
-    details.audits.pop();
+    const dropped = details.audits.pop()!;
+    const omitted = details.omittedCalls ?? { count: 0, done: 0 };
+    details.omittedCalls = {
+      count: omitted.count + 1,
+      done: omitted.done + (dropped.success !== undefined ? 1 : 0),
+      ...((omitted.failed ?? 0) + (dropped.success === false ? 1 : 0) > 0
+        ? { failed: (omitted.failed ?? 0) + (dropped.success === false ? 1 : 0) } : {}),
+    };
   }
   // Assessment rows are optional observability: they yield before the trace,
   // and their totals survive.
@@ -259,5 +278,133 @@ export const readFabricExecutionRenderDetails = (
       : {}),
     phases: oldPhases ?? trace?.phases ?? [],
     audits: oldAudits ?? trace?.operations.map(auditFromOperation) ?? [],
+    ...(omittedCalls(value.omittedCalls) ?? {}),
   };
+};
+
+const omittedCalls = (value: unknown): { omittedCalls: FabricOmittedCalls } | undefined => {
+  if (!isRecord(value)) return undefined;
+  const { count, done, failed } = value;
+  if (typeof count !== "number" || !Number.isInteger(count) || count <= 0) return undefined;
+  const finished = typeof done === "number" && Number.isInteger(done) ? Math.min(Math.max(0, done), count) : 0;
+  const failures = typeof failed === "number" && Number.isInteger(failed) ? Math.min(Math.max(0, failed), finished) : 0;
+  return { omittedCalls: { count, done: finished, ...(failures > 0 ? { failed: failures } : {}) } };
+};
+
+/** Byte budget for the call audits in one fabric_exec progress update. */
+export const FABRIC_PARTIAL_AUDITS_MAX_BYTES = 128 * 1024;
+/** Complete onUpdate envelope, including the second copy of progress in content. */
+export const FABRIC_PARTIAL_UPDATE_MAX_BYTES = 256 * 1024;
+// The expanded live card shows the first 30 calls; the collapsed one shows
+// running calls first. Keep those, plus the newest, and count the rest.
+const PARTIAL_HEAD_AUDITS = 30;
+const PARTIAL_TAIL_AUDITS = 30;
+const PARTIAL_PHASES = 64;
+const PARTIAL_PROGRESS_CHARS = 8_000;
+const SLIM_ARG_KEYS = 8;
+const SLIM_TEXT_CHARS = 240;
+
+export interface FabricPartialExecutionDetails {
+  progress?: string;
+  deadlineAt?: number;
+  phases: string[];
+  audits: FabricLegacyRenderAudit[];
+  omittedCalls?: FabricOmittedCalls;
+}
+
+const clipText = (value: string, max: number): string =>
+  value.length <= max ? value : `${value.slice(0, max)}…`;
+
+// A call row without its payloads: enough for the title and the status glyph.
+const slimAudit = (audit: FabricLegacyRenderAudit): FabricLegacyRenderAudit => {
+  const args: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(audit.args ?? {}).slice(0, SLIM_ARG_KEYS)) {
+    if (typeof value === "string") args[key] = clipText(value, SLIM_TEXT_CHARS);
+    else if (typeof value === "number" || typeof value === "boolean" || value === null) args[key] = value;
+  }
+  return {
+    ref: audit.ref,
+    ...(audit.nestedToolCallId !== undefined ? { nestedToolCallId: audit.nestedToolCallId } : {}),
+    ...(audit.tool !== undefined ? { tool: audit.tool } : {}),
+    ...(audit.provider !== undefined ? { provider: audit.provider } : {}),
+    ...(audit.success !== undefined ? { success: audit.success } : {}),
+    ...(audit.error !== undefined ? { error: clipText(audit.error, SLIM_TEXT_CHARS) } : {}),
+    ...(Object.keys(args).length > 0 ? { args } : {}),
+    ...(audit.startedAt !== undefined ? { startedAt: audit.startedAt } : {}),
+    ...(audit.endedAt !== undefined ? { endedAt: audit.endedAt } : {}),
+  };
+};
+
+/**
+ * Builds the details of one fabric_exec progress update. Each update replaces
+ * the previous one, so it must stand alone, yet its size must not grow with
+ * the number of nested calls: hundreds of calls with full arguments and
+ * results once made a single update line megabytes long. The final result is
+ * built separately and keeps every audit.
+ */
+export const createFabricPartialExecutionDetails = (input: {
+  audits: readonly FabricPersistableAuditInput[];
+  phases: readonly string[];
+  progress?: string | undefined;
+  deadlineAt?: number | undefined;
+}): FabricPartialExecutionDetails => {
+  const total = input.audits.length;
+  const running: number[] = [];
+  for (let index = 0; index < total; index++) {
+    if (input.audits[index]!.success === undefined) running.push(index);
+  }
+  // Priority order: running calls, then the newest, then the first ones.
+  const candidates = new Set<number>(running.slice(-PARTIAL_TAIL_AUDITS).reverse());
+  for (let index = total - 1; index >= Math.max(0, total - PARTIAL_TAIL_AUDITS); index--) candidates.add(index);
+  for (let index = 0; index < Math.min(total, PARTIAL_HEAD_AUDITS); index++) candidates.add(index);
+  const kept = new Map<number, FabricLegacyRenderAudit>();
+  let used = 0;
+  for (const index of candidates) {
+    const full = persistableAudit(input.audits[index]!);
+    const fullBytes = serializedBytes(full);
+    if (used + fullBytes <= FABRIC_PARTIAL_AUDITS_MAX_BYTES) {
+      kept.set(index, full);
+      used += fullBytes;
+      continue;
+    }
+    const slim = slimAudit(full);
+    const slimBytes = serializedBytes(slim);
+    if (used + slimBytes <= FABRIC_PARTIAL_AUDITS_MAX_BYTES) {
+      kept.set(index, slim);
+      used += slimBytes;
+    }
+  }
+  const audits = [...kept.keys()].sort((left, right) => left - right).map((index) => kept.get(index)!);
+  let omittedDone = 0;
+  let omittedFailed = 0;
+  for (let index = 0; index < total; index++) {
+    if (!kept.has(index)) {
+      if (input.audits[index]!.success !== undefined) omittedDone++;
+      if (input.audits[index]!.success === false) omittedFailed++;
+    }
+  }
+  const omitted = total - audits.length;
+  const progress = input.progress === undefined || input.progress.length <= PARTIAL_PROGRESS_CHARS
+    ? input.progress
+    : `…${input.progress.slice(-PARTIAL_PROGRESS_CHARS)}`;
+  const details: FabricPartialExecutionDetails = {
+    ...(progress !== undefined ? { progress } : {}),
+    ...(input.deadlineAt !== undefined ? { deadlineAt: input.deadlineAt } : {}),
+    phases: [],
+    audits,
+    ...(omitted > 0 ? { omittedCalls: { count: omitted, done: omittedDone, ...(omittedFailed > 0 ? { failed: omittedFailed } : {}) } } : {}),
+  };
+  // Audits take at most 128 KiB, and each copy of the 8,001-code-unit
+  // progress string takes at most six bytes per code unit in JSON. This
+  // leaves room below 256 KiB even before admitting any phase names.
+  // Measure the actual envelope: UTF-8 and JSON escaping are not char counts.
+  let bytes = serializedBytes({ content: [{ type: "text", text: progress ?? "" }], details });
+  for (let index = input.phases.length - 1; index >= Math.max(0, input.phases.length - PARTIAL_PHASES); index--) {
+    const phase = clipText(input.phases[index]!, SLIM_TEXT_CHARS);
+    const extra = serializedBytes(phase) + (details.phases.length > 0 ? 1 : 0);
+    if (bytes + extra > FABRIC_PARTIAL_UPDATE_MAX_BYTES) break;
+    details.phases.unshift(phase);
+    bytes += extra;
+  }
+  return details;
 };

@@ -1,15 +1,17 @@
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { normalizeFabricConfig, type FabricConfig } from "../src/config.js";
 import { ActionRegistry } from "../src/core/action-registry.js";
 import { FabricExecutionService } from "../src/execution-service.js";
-import { handleFabricProgramRunEvent, PROGRAM_RUN_MESSAGE_TYPE, runFabricProgramsCommand, type ProgramHostDeps } from "../src/programs/host.js";
+import piFabric from "../src/index.js";
+import { handleFabricProgramRunEvent, runHostProgram, PROGRAM_RUN_MESSAGE_TYPE, runFabricProgramsCommand, type ProgramHostDeps } from "../src/programs/host.js";
 import { hostProgramRunSource, programSourceWithInput, pythonLiteral } from "../src/programs/source.js";
 import { canonicalProgramJson, programDigest, ProgramStore, programsDirectory } from "../src/programs/store.js";
-import type { FabricActionDescriptor, FabricProgramRunReplyV1 } from "../src/protocol.js";
+import { FABRIC_PROGRAM_RUN_EVENT, snapshotFabricProgramRunRequestV1, type FabricActionDescriptor, type FabricProgramRunReplyV1 } from "../src/protocol.js";
 import { ProgramsProvider } from "../src/providers/programs-provider.js";
 import { availablePythonBackends } from "./fixtures/python-backends.js";
 import { rmTempSync } from "./fixtures/temp-cleanup.js";
@@ -29,6 +31,10 @@ const temp = (): string => {
   roots.push(root);
   return root;
 };
+
+// The listener snapshots a request at the event boundary; tests do the same.
+const handle = (request: unknown, deps: Parameters<typeof handleFabricProgramRunEvent>[1]): Promise<void> =>
+  handleFabricProgramRunEvent(snapshotFabricProgramRunRequestV1(request)!, deps);
 
 const demoDescriptor = (name: string): FabricActionDescriptor => ({
   name, description: `demo ${name}`, risk: "read",
@@ -137,6 +143,29 @@ describe("content-addressed program store", () => {
     await store.save({ name: "after-crash", code: "return 'recovered';" }, "typescript");
     expect(fs.existsSync(lock)).toBe(false);
     expect((await store.resolve("after-crash")).name).toBe("after-crash");
+  });
+
+  it("waits out a lock directory still pending deletion on Windows", async () => {
+    const { store } = fixture();
+    const mkdir = fs.promises.mkdir;
+    let rejected = 0;
+    const spy = vi.spyOn(fs.promises, "mkdir").mockImplementation(async (target, options) => {
+      if (String(target).endsWith(".lock") && rejected++ === 0) {
+        throw Object.assign(new Error("EPERM: operation not permitted, mkdir"), { code: "EPERM" });
+      }
+      return mkdir(target, options);
+    });
+    try {
+      const save = store.save({ name: "pending", code: "return 1;" }, "typescript");
+      if (process.platform === "win32") {
+        expect((await save).record.name).toBe("pending");
+        expect(rejected).toBe(2);
+      } else {
+        await expect(save).rejects.toThrow(/EPERM/);
+      }
+    } finally {
+      spy.mockRestore();
+    }
   });
 
   it("fails closed on a record whose content no longer matches its digest", async () => {
@@ -311,7 +340,7 @@ describe("host program runs", () => {
     const { deps, sendMessage } = hostDeps(f);
     const replies: FabricProgramRunReplyV1[] = [];
     {
-      await handleFabricProgramRunEvent({ ref: "hello", input: { who: "host" }, reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
+      await handle({ ref: "hello", input: { who: "host" }, reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
       expect(replies).toHaveLength(1);
       expect(replies[0]).toMatchObject({ ok: true, program: expect.stringMatching(/^hello@[0-9a-f]{64}$/), value: { greeting: "hi host" } });
       expect(sendMessage).toHaveBeenCalledOnce();
@@ -321,17 +350,631 @@ describe("host program runs", () => {
       const operation = message.details.trace.operations.find((entry: { ref: string }) => entry.ref === "fabric.program.run");
       expect(operation.args).toEqual({ program: replies[0]!.ok ? replies[0]!.program : "", invokedBy: "host" });
 
-      await handleFabricProgramRunEvent({ ref: "missing", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
+      await handle({ ref: "missing", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
       expect(replies[1]).toMatchObject({ ok: false, error: expect.stringMatching(/Unknown program/) });
-      await handleFabricProgramRunEvent({ ref: 7, reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
+      await handle({ ref: 7, reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
       expect(replies[2]).toMatchObject({ ok: false, error: expect.stringMatching(/ref must be/) });
-      await handleFabricProgramRunEvent({ ref: "hello", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: undefined });
+      await handle({ ref: "hello", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: undefined });
       expect(replies[3]).toMatchObject({ ok: false, error: expect.stringMatching(/No active Pi session/) });
       const aborted = new AbortController();
       aborted.abort();
-      await handleFabricProgramRunEvent({ ref: "hello", input: { who: "x" }, signal: aborted.signal, reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
+      await handle({ ref: "hello", input: { who: "x" }, signal: aborted.signal, reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, { ...deps, context: f.context });
       expect(replies[4]).toMatchObject({ ok: false });
     }
+  });
+
+  describe("caller-supplied code", () => {
+    const sha = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+    const CODE = "const r = await tools.call({ ref: 'demo.allowed', args: { who: input.who } }); return { r, who: input.who };";
+    const collect = () => {
+      const replies: FabricProgramRunReplyV1[] = [];
+      return { replies, reply: (result: FabricProgramRunReplyV1) => replies.push(result) };
+    };
+
+    it("runs matching code once, passes input, labels the run and saves nothing", async () => {
+      const f = fixture();
+      const { deps, sendMessage } = hostDeps(f);
+      const { replies, reply } = collect();
+      await handle({ code: CODE, input: { who: "pi-stack" }, reply }, { ...deps, context: f.context });
+      const label = `caller-code:${sha(CODE).slice(0, 12)}`;
+      const program = `caller-code:${sha(CODE)}`;
+      expect(replies).toEqual([{ ok: true, program, value: { r: { called: "allowed", args: { who: "pi-stack" } }, who: "pi-stack" }, logs: [] }]);
+      expect(f.demo).toHaveBeenCalledTimes(1);
+      expect(sendMessage).toHaveBeenCalledOnce();
+      const [message, options] = sendMessage.mock.calls[0]!;
+      expect(options).toEqual({ triggerTurn: false });
+      expect(message).toMatchObject({
+        customType: PROGRAM_RUN_MESSAGE_TYPE,
+        display: true,
+        details: { invokedBy: "host", success: true, program, source: "caller-code", sha256: sha(CODE) },
+      });
+      expect(message.content).toContain(label);
+      expect(message.details.trace.operations.map((entry: { ref: string }) => entry.ref)).toContain("demo.allowed");
+      // REQ-F.5: no program store was created or written.
+      expect(fs.existsSync(path.join(f.cwd, ".pi"))).toBe(false);
+      expect(await f.store.list()).toEqual([]);
+    });
+
+    it("exposes null as input when the request has none", async () => {
+      const f = fixture();
+      const code = "return { input };";
+      const { replies, reply } = collect();
+      await handle({ code, reply }, { ...hostDeps(f).deps, context: f.context });
+      expect(replies).toMatchObject([{ ok: true, value: { input: null } }]);
+    });
+
+    it("refuses each malformed request with one reply and runs nothing", async () => {
+      const f = fixture();
+      const { deps, sendMessage } = hostDeps(f);
+      const executed = vi.spyOn(f.service, "execute");
+      const good = { code: CODE };
+      const big = `return 1;${" ".repeat(65_536)}`;
+      const cases: Array<[string, Record<string, unknown>, string]> = [
+        ["neither", {}, "ref must be a non-empty string"],
+        ["empty code", { code: "" }, "code must be a non-empty string"],
+        ["blank code", { code: "  \n" }, "code must be a non-empty string"],
+        ["non-string code", { code: 7 }, "code must be a non-empty string"],
+        ["oversized code", { code: big }, "code exceeds 65536 characters"],
+        ["bad signal", { ...good, signal: {} }, "signal must be an AbortSignal"],
+      ];
+      for (const [name, request, error] of cases) {
+        const { replies, reply } = collect();
+        await handle({ ...request, reply }, { ...deps, context: f.context });
+        expect(replies, name).toEqual([{ ok: false, error: `Invalid program run request: ${error}` }]);
+      }
+      const { replies, reply } = collect();
+      await handle({ ...good, reply }, { ...deps, context: undefined });
+      expect(replies).toEqual([{ ok: false, error: "No active Pi session to run the program in" }]);
+      expect(f.demo).not.toHaveBeenCalled();
+      expect(executed).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it("accepts code of exactly the size limit", async () => {
+      const f = fixture();
+      const code = `return 1;${" ".repeat(65_536 - "return 1;".length)}`;
+      expect(code.length).toBe(65_536);
+      const { replies, reply } = collect();
+      await handle({ code, reply }, { ...hostDeps(f).deps, context: f.context });
+      expect(replies).toMatchObject([{ ok: true, value: 1 }]);
+    });
+
+    it("reports a failing program as one ok:false reply and still posts the transcript message", async () => {
+      const f = fixture();
+      const { deps, sendMessage } = hostDeps(f);
+      const code = "throw new Error('boom');";
+      const { replies, reply } = collect();
+      await handle({ code, reply }, { ...deps, context: f.context });
+      expect(replies).toHaveLength(1);
+      expect(replies[0]).toMatchObject({ ok: false, program: `caller-code:${sha(code)}`, error: expect.stringContaining("boom") });
+      expect(sendMessage.mock.calls[0]![0].details).toMatchObject({ invokedBy: "host", success: false });
+    });
+
+    it("copies only the named fields into the run", async () => {
+      const f = fixture();
+      const { deps, sendMessage } = hostDeps(f);
+      const executed = vi.spyOn(f.service, "execute");
+      const hostile = {
+        invokedBy: "model", parentToolCallId: "attacker-call", tokenBudget: 1, maxAgentCalls: 99, hardTimeoutMs: 1,
+        requestedTimeoutMs: 1, display: { name: "EVIL-DISPLAY" }, context: { cwd: "/EVIL" }, kernel2: "EVIL", EVIL: "EVIL-FIELD",
+      };
+      for (const request of [
+        { code: CODE, input: { who: "x" }, requirePromoted: true, ...hostile },
+        { ref: "hello", ...hostile },
+      ]) {
+        if ("ref" in request) await f.store.save({ name: "hello", code: "return 1;" }, "typescript");
+        const { replies, reply } = collect();
+        await handle({ ...request, reply }, { ...deps, context: f.context });
+        expect(replies, JSON.stringify(replies)).toMatchObject([{ ok: true }]);
+        const options = executed.mock.calls.at(-1)![0];
+        expect(options).toMatchObject({ invokedBy: "host", context: f.context });
+        expect(options.parentToolCallId).toMatch(/^fabric_program_[0-9a-f-]{36}$/);
+        for (const key of ["tokenBudget", "maxAgentCalls", "hardTimeoutMs", "requestedTimeoutMs"] as const) {
+          expect(options[key], key).toBeUndefined();
+        }
+        expect(options.display?.name).not.toContain("EVIL");
+        expect(options.code).not.toContain("EVIL");
+        expect(JSON.stringify(sendMessage.mock.calls.at(-1)![0])).not.toContain("EVIL");
+      }
+      expect(sendMessage).toHaveBeenCalledTimes(2);
+    });
+
+    it("faces the same programs.run approval as a saved program, and runs under allow", async () => {
+      // A read-only body: the only execute-risk action is the programs.run both paths go through.
+      const body = "return await tools.call({ ref: 'demo.allowed', args: { n: 1 } });";
+      const policies: Array<[string, (config: FabricConfig) => void]> = [
+        ["approvals.execute = deny", (config) => { config.approvals.execute = "deny"; }],
+        ['approvals.actions["programs.run"] = deny', (config) => { config.approvals.actions = { "programs.run": "deny" }; }],
+      ];
+      for (const [name, deny] of policies) {
+        const f = fixture();
+        await f.store.save({ name: "body", code: body }, "typescript");
+        const { deps } = hostDeps(f);
+        const asRef = collect();
+        const asCode = collect();
+        // Control: under allow, both run the body.
+        await handle({ ref: "body", reply: asRef.reply }, { ...deps, context: f.context });
+        await handle({ code: body, reply: asCode.reply }, { ...deps, context: f.context });
+        expect(asRef.replies, name).toMatchObject([{ ok: true, value: { called: "allowed" } }]);
+        expect(asCode.replies, name).toMatchObject([{ ok: true, value: { called: "allowed" } }]);
+        expect(f.demo, name).toHaveBeenCalledTimes(2);
+        f.demo.mockClear();
+        deny(f.config);
+        const deniedRef = collect();
+        const deniedCode = collect();
+        await handle({ ref: "body", reply: deniedRef.reply }, { ...deps, context: f.context });
+        await handle({ code: body, reply: deniedCode.reply }, { ...deps, context: f.context });
+        expect(deniedRef.replies, name).toMatchObject([{ ok: false, error: expect.stringContaining("programs.run") }]);
+        expect(deniedCode.replies, name).toHaveLength(1);
+        expect(deniedCode.replies[0], name).toMatchObject({ ok: false, error: expect.stringContaining("programs.run") });
+        expect(deniedCode.replies[0], name).toMatchObject({ error: (deniedRef.replies[0] as { error: string }).error });
+        expect(f.demo, name).not.toHaveBeenCalled();
+      }
+    });
+
+    it("still faces the approval policy for actions inside the code", async () => {
+      const f = fixture();
+      const { deps } = hostDeps(f);
+      const code = "return await tools.call({ ref: 'jev.run', args: { input: 1 } });";
+      const allowed = collect();
+      await handle({ code, reply: allowed.reply }, { ...deps, context: f.context });
+      expect(allowed.replies).toMatchObject([{ ok: true }]);
+      expect(f.jevRun).toHaveBeenCalledTimes(1);
+      f.jevRun.mockClear();
+      f.config.approvals.actions = { "jev.run": "deny" };
+      const { replies, reply } = collect();
+      await handle({ code, reply }, { ...deps, context: f.context });
+      expect(replies).toMatchObject([{ ok: false, error: expect.stringContaining("jev.run") }]);
+      expect(f.jevRun).not.toHaveBeenCalled();
+    });
+
+    it("records the caller-code program run in the execution trace, with host attribution", async () => {
+      const f = fixture();
+      await f.store.save({ name: "body", code: CODE }, "typescript");
+      const { deps } = hostDeps(f);
+      const executed = vi.spyOn(f.service, "execute");
+      const code = collect();
+      const saved = collect();
+      await handle({ code: CODE, input: { who: "x" }, reply: code.reply }, { ...deps, context: f.context });
+      await handle({ ref: "body", input: { who: "x" }, reply: saved.reply }, { ...deps, context: f.context });
+      // The trace the execution itself returned, not the message metadata built from it.
+      const traceOf = async (index: number) => (await executed.mock.results[index]!.value as { trace: { operations: Array<{ ref: string; args?: Record<string, unknown> }> } }).trace.operations;
+      const callerOps = await traceOf(0);
+      const savedOps = await traceOf(1);
+      const callerRun = callerOps.filter((entry) => entry.ref === "fabric.program.run");
+      expect(callerRun).toHaveLength(1);
+      expect(callerRun[0]!.args).toEqual({ program: `caller-code:${sha(CODE)}`, invokedBy: "host" });
+      // The same operation, in the same place, as a saved program's run.
+      expect(callerOps.map((entry) => entry.ref)).toEqual(savedOps.map((entry) => entry.ref));
+      expect(callerOps.map((entry) => entry.ref)).toEqual(["programs.run", "fabric.program.run", "demo.allowed"]);
+      expect(Object.keys(callerRun[0]!.args!)).toEqual(Object.keys(savedOps.find((entry) => entry.ref === "fabric.program.run")!.args!));
+    });
+
+    it("refuses caller code when the session has no program-run provider, without executing it", async () => {
+      const f = fixture();
+      const { deps, sendMessage } = hostDeps(f);
+      const executed = vi.spyOn(f.service, "execute");
+      const absent = { ...deps, state: { ...deps.state, registry: { has: () => false } } } as unknown as ProgramHostDeps;
+      const { replies, reply } = collect();
+      await handle({ code: CODE, reply }, { ...absent, context: f.context });
+      expect(replies).toEqual([{ ok: false, error: "Program runs are unavailable in this session" }]);
+      expect(executed).not.toHaveBeenCalled();
+      expect(f.demo).not.toHaveBeenCalled();
+      expect(sendMessage).toHaveBeenCalledOnce();
+    });
+
+    it("uses a ref that no saved program can have", async () => {
+      const f = fixture();
+      const ref = `caller-code:${sha(CODE)}`;
+      await expect(f.store.save({ name: ref, code: "return 1;" }, "typescript")).rejects.toThrow(/Invalid program name/);
+      await expect(f.store.resolve(ref)).rejects.toThrow(/Invalid program name/);
+    });
+
+    it("never lets a model reach caller code: the ref resolves only inside the host run that supplied it", async () => {
+      const f = fixture();
+      const ref = `caller-code:${sha(CODE)}`;
+      const replay = `return await programs.run({ ref: ${JSON.stringify(ref)}, input: { who: "m" } });`;
+      // A model execution of its own: its parentToolCallId is not the host run's.
+      const modelReplay = async (when: string, id: string) => {
+        const model = await f.service.execute({ code: replay, signal: undefined, parentToolCallId: id, context: f.context, onPartial() {} });
+        expect(model.success, when).toBe(false);
+        expect(model.error, when).toMatch(/Invalid program name/);
+      };
+      // A host run of the caller code that stays active until the test releases it.
+      const heldHostRun = (id: string, signal?: AbortSignal) => {
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => { release = resolve; });
+        let enter!: () => void;
+        const entered = new Promise<void>((resolve) => { enter = resolve; });
+        f.demo.mockImplementationOnce(async () => { enter(); await gate; return { called: "allowed", args: {} }; });
+        const done = f.service.execute({
+          code: hostProgramRunSource("typescript", { ref, input: { who: "h" } }),
+          callerProgram: { code: CODE, sha256: sha(CODE) },
+          signal, parentToolCallId: id, context: f.context, invokedBy: "host", onPartial() {},
+        }).then((result) => result, (error: unknown) => ({ success: false as const, error: String(error) }));
+        return { release, entered, done };
+      };
+
+      // 1. While the host run is active the binding exists, and it still does not reach a model.
+      const active = heldHostRun("host-active");
+      await active.entered;
+      expect(f.demo).toHaveBeenCalledOnce();
+      await modelReplay("during the host run", "model-during");
+      expect(f.demo).toHaveBeenCalledOnce();
+      active.release();
+      expect(await active.done).toMatchObject({ success: true });
+      // 2. After it completed, the binding is gone.
+      await modelReplay("after completion", "model-after");
+      expect(f.demo).toHaveBeenCalledOnce();
+
+      // 3. An aborted host run leaves no binding behind either.
+      const controller = new AbortController();
+      const aborted = heldHostRun("host-aborted", controller.signal);
+      await aborted.entered;
+      await modelReplay("during the second host run", "model-during-aborted");
+      controller.abort();
+      aborted.release();
+      expect(await aborted.done).toMatchObject({ success: false });
+      await modelReplay("after an abort", "model-after-aborted");
+      expect(f.demo).toHaveBeenCalledTimes(2);
+    });
+
+    it("computes the hash itself and records it", async () => {
+      const f = fixture();
+      const { deps, sendMessage } = hostDeps(f);
+      const { replies, reply } = collect();
+      await handle({ code: CODE, input: { who: "pi-stack" }, reply }, { ...deps, context: f.context });
+      expect(replies).toMatchObject([{ ok: true, program: `caller-code:${sha(CODE)}`, value: { who: "pi-stack" } }]);
+      expect(sendMessage.mock.calls[0]![0].details).toMatchObject({ source: "caller-code", sha256: sha(CODE) });
+    });
+
+    it("runs the ref and ignores the code when a request carries both", async () => {
+      const f = fixture();
+      await f.store.save({ name: "hello", code: "return { from: 'saved' };" }, "typescript");
+      const { deps } = hostDeps(f);
+      const executed = vi.spyOn(f.service, "execute");
+      const { replies, reply } = collect();
+      await handle({ ref: "hello", code: CODE, reply }, { ...deps, context: f.context });
+      expect(replies).toMatchObject([{ ok: true, value: { from: "saved" } }]);
+      expect(executed.mock.calls[0]![0].callerProgram).toBeUndefined();
+      expect(f.demo).not.toHaveBeenCalled();
+    });
+
+    it("refuses caller code in a python session without executing it", async () => {
+      const execute = vi.fn();
+      const sendMessage = vi.fn();
+      const deps = {
+        state: { ensure: async () => undefined, config: { executor: { kernel: "python" } }, execution: { execute }, registry: { has: () => true } },
+        pi: { sendMessage },
+      } as unknown as ProgramHostDeps;
+      const code = "return 1;";
+      const reply = await runHostProgram(deps, {} as ExtensionContext, { code });
+      expect(reply).toMatchObject({ ok: false, error: expect.stringContaining("kernel is python") });
+      expect(execute).not.toHaveBeenCalled();
+    });
+
+  });
+
+  describe("program run event listener", () => {
+    const boot = async () => {
+      const listeners = new Map<string, (value: unknown) => unknown>();
+      const handlers = new Map<string, Array<(...args: never[]) => unknown>>();
+      const pi = {
+        events: {
+          emit: vi.fn(),
+          on: vi.fn((channel: string, handler: (value: unknown) => unknown) => {
+            listeners.set(channel, handler);
+            return () => listeners.delete(channel);
+          }),
+        },
+        getActiveTools: vi.fn(() => ["fabric_exec"]),
+        getAllTools: vi.fn(() => [{ name: "fabric_exec" }]),
+        on: vi.fn((event: string, handler: (...args: never[]) => unknown) => {
+          handlers.set(event, [...(handlers.get(event) ?? []), handler]);
+        }),
+        registerCommand: vi.fn(),
+        registerMessageRenderer: vi.fn(),
+        registerTool: vi.fn(),
+        setActiveTools: vi.fn(),
+      } as unknown as ExtensionAPI;
+      await piFabric(pi);
+      const listener = listeners.get(FABRIC_PROGRAM_RUN_EVENT)!;
+      const shutdown = async () => { for (const handler of handlers.get("session_shutdown") ?? []) await handler(); };
+      return { listener, shutdown };
+    };
+    // Resolves with the reply, or rejects after the bound: a lost reply is a failure, not a hang.
+    const nextReply = (timeoutMs = 10_000) => {
+      let calls = 0;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let resolveReply!: (result: FabricProgramRunReplyV1) => void;
+      const done = new Promise<FabricProgramRunReplyV1>((resolve, reject) => {
+        resolveReply = resolve;
+        timer = setTimeout(() => reject(new Error(`no reply within ${timeoutMs} ms`)), timeoutMs);
+      }).finally(() => clearTimeout(timer));
+      const reply = (result: FabricProgramRunReplyV1): void => { calls++; resolveReply(result); };
+      return { reply, done, calls: () => calls };
+    };
+    // Lets any further, unexpected reply arrive before a test counts replies.
+    const drained = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+    it("still answers once, on the original reply, when the caller deletes or replaces it after emitting", async () => {
+      const { listener, shutdown } = await boot();
+      try {
+        for (const [name, tamper] of [
+          ["delete", (request: Record<string, unknown>) => { delete request.reply; }],
+          ["replace", (request: Record<string, unknown>) => { request.reply = vi.fn(); }],
+          ["clear every field", (request: Record<string, unknown>) => { for (const key of Object.keys(request)) delete request[key]; }],
+        ] as const) {
+          const answered = nextReply();
+          const request: Record<string, unknown> = { ref: "hello", reply: answered.reply };
+          listener(request);
+          tamper(request);
+          expect(await answered.done, name).toMatchObject({ ok: false, error: expect.stringMatching(/No active Pi session/) });
+          await drained();
+          expect(answered.calls(), name).toBe(1);
+          if (typeof request.reply === "function") {
+            expect(request.reply as ReturnType<typeof vi.fn>, name).not.toHaveBeenCalled();
+          }
+        }
+      } finally {
+        await shutdown();
+      }
+    });
+
+    describe("a ref request keeps the first release's replies, validation order and reply call", () => {
+      // The strings and the order are copied from the handler before this change, not computed.
+      const refError = "Invalid program run request: ref must be a non-empty string";
+      const cases: Array<[string, Record<string, unknown>, string]> = [
+        ["no ref", {}, refError],
+        ["numeric ref", { ref: 7 }, refError],
+        ["null ref", { ref: null }, refError],
+        ["empty ref", { ref: "" }, refError],
+        ["oversized ref", { ref: "r".repeat(130) }, refError],
+        ["ref error before requirePromoted", { ref: 7, requirePromoted: "yes" }, refError],
+        ["ref error before signal", { ref: 7, signal: {} }, refError],
+        ["no ref error before signal", { signal: {} }, refError],
+        ["requirePromoted", { ref: "hello", requirePromoted: "yes" }, "Invalid program run request: requirePromoted must be a boolean"],
+        ["requirePromoted before signal", { ref: "hello", requirePromoted: 1, signal: {} }, "Invalid program run request: requirePromoted must be a boolean"],
+        ["signal", { ref: "hello", signal: {} }, "Invalid program run request: signal must be an AbortSignal"],
+        ["valid ref, no session", { ref: "hello" }, "No active Pi session to run the program in"],
+      ];
+      const expectEachCase = async (extra: Record<string, unknown>): Promise<void> => {
+        const { listener, shutdown } = await boot();
+        try {
+          for (const [name, fields, error] of cases) {
+            const seen: Array<{ self: unknown; result: FabricProgramRunReplyV1 }> = [];
+            const answered = nextReply();
+            listener({
+              ...fields,
+              ...extra,
+              // A plain function: `this` is what the caller's reply was invoked with.
+              reply: function (this: unknown, result: FabricProgramRunReplyV1) { seen.push({ self: this, result }); answered.reply(result); },
+            });
+            await answered.done;
+            expect(seen, name).toEqual([{ self: undefined, result: { ok: false, error } }]);
+          }
+        } finally {
+          await shutdown();
+        }
+      };
+      it("through the listener", () => expectEachCase({}));
+
+      it("reaches the saved-program run unchanged, calling reply directly", async () => {
+        const f = fixture();
+        await f.store.save({ name: "hello", code: "return { greeting: 'hi ' + input.who };" }, "typescript");
+        const { deps } = hostDeps(f);
+        const seen: unknown[] = [];
+        await handle({ ref: "hello", input: { who: "host" }, reply: function (this: unknown) { seen.push(this); } }, { ...deps, context: f.context });
+        expect(seen).toEqual([undefined]);
+      });
+    });
+
+    it("runs what the request said when it was read, whatever the caller does to it afterwards", async () => {
+      const f = fixture();
+      await f.store.save({ name: "hello", code: "return { who: input.who };" }, "typescript");
+      await f.store.save({ name: "evil", code: "return { who: 'EVIL' };" }, "typescript");
+      const answered = nextReply();
+      const request: Record<string, unknown> = { ref: "hello", input: { who: "original" }, reply: answered.reply };
+      const snapshot = snapshotFabricProgramRunRequestV1(request)!;
+      request.ref = "evil";
+      request.input = { who: "EVIL" };
+      request.signal = AbortSignal.abort();
+      delete request.reply;
+      await handleFabricProgramRunEvent(snapshot, { ...hostDeps(f).deps, context: f.context });
+      expect(await answered.done).toMatchObject({ ok: true, program: expect.stringMatching(/^hello@/), value: { who: "original" } });
+      expect(answered.calls()).toBe(1);
+    });
+
+    it("runs the input's contents as they were when the request was read", async () => {
+      const f = fixture();
+      await f.store.save({ name: "hello", code: "return input;" }, "typescript");
+      const answered = nextReply();
+      const input = { who: "original", tags: ["a"], nested: { n: 1 } };
+      const snapshot = snapshotFabricProgramRunRequestV1({ ref: "hello", input, reply: answered.reply })!;
+      input.who = "EVIL";
+      input.tags.push("EVIL");
+      input.nested.n = 2;
+      await handleFabricProgramRunEvent(snapshot, { ...hostDeps(f).deps, context: f.context });
+      expect(await answered.done).toMatchObject({ ok: true, value: { who: "original", tags: ["a"], nested: { n: 1 } } });
+    });
+
+    it("refuses input that was not JSON when read, even if the caller makes it JSON afterwards", async () => {
+      const f = fixture();
+      await f.store.save({ name: "hello", code: "return input;" }, "typescript");
+      const answered = nextReply();
+      const input: Record<string, unknown> = { n: 1n };
+      const snapshot = snapshotFabricProgramRunRequestV1({ ref: "hello", input, reply: answered.reply })!;
+      input.n = 1;
+      await handleFabricProgramRunEvent(snapshot, { ...hostDeps(f).deps, context: f.context });
+      expect(await answered.done).toEqual({ ok: false, program: expect.stringMatching(/^hello@/), error: "Program input must be JSON-compatible" });
+    });
+
+    it("reads requirePromoted before the input's toJSON can change it", async () => {
+      const f = fixture();
+      await f.store.save({ name: "hello", code: "return 1;" }, "typescript");
+      const answered = nextReply();
+      const request: Record<string, unknown> = { ref: "hello", requirePromoted: true, reply: answered.reply };
+      request.input = { toJSON: () => { request.requirePromoted = false; return { who: "x" }; } };
+      const snapshot = snapshotFabricProgramRunRequestV1(request)!;
+      await handleFabricProgramRunEvent(snapshot, { ...hostDeps(f).deps, context: f.context });
+      expect(await answered.done).toMatchObject({ ok: false, error: expect.stringMatching(/no promoted version/) });
+    });
+
+    it("runs the code the request carried when it was read, whatever the caller does to it afterwards", async () => {
+      const f = fixture();
+      const code = "return { who: input.who };";
+      const answered = nextReply();
+      const request: Record<string, unknown> = { code, input: { who: "original" }, reply: answered.reply };
+      const snapshot = snapshotFabricProgramRunRequestV1(request)!;
+      const evil = "return { who: 'EVIL' };";
+      request.code = evil;
+      request.input = { who: "EVIL" };
+      request.ref = "hello";
+      delete request.reply;
+      await handleFabricProgramRunEvent(snapshot, { ...hostDeps(f).deps, context: f.context });
+      expect(await answered.done).toMatchObject({ ok: true, value: { who: "original" } });
+      expect(answered.calls()).toBe(1);
+    });
+
+    describe("a named field whose getter throws", () => {
+      const boom = (): never => { throw new Error("getter boom"); };
+      // Adds (or replaces) an own, enumerable accessor that throws when read.
+      const unreadable = (request: Record<string, unknown>, ...fields: string[]): Record<string, unknown> => {
+        for (const field of fields) Object.defineProperty(request, field, { get: boom, enumerable: true, configurable: true });
+        return request;
+      };
+      const refused = (field: string) => `Invalid program run request: ${field} could not be read`;
+      const named = ["ref", "input", "requirePromoted", "signal"] as const;
+      const codeFields = ["code"] as const;
+
+      it.each(named)("%s on a ref request: nothing escapes the listener and the request is answered exactly once", async (field) => {
+        const { listener, shutdown } = await boot();
+        try {
+          const answered = nextReply();
+          const request = unreadable({ ref: "hello", reply: answered.reply }, field);
+          expect(() => listener(request)).not.toThrow();
+          expect(await answered.done).toEqual({ ok: false, error: refused(field) });
+          await drained();
+          expect(answered.calls()).toBe(1);
+        } finally {
+          await shutdown();
+        }
+      });
+
+      it("names the unreadable field and runs nothing, for every field of a ref request", async () => {
+        const f = fixture();
+        await f.store.save({ name: "hello", code: "return 1;" }, "typescript");
+        const { deps, sendMessage } = hostDeps(f);
+        const executed = vi.spyOn(f.service, "execute");
+        for (const field of named) {
+          const replies: FabricProgramRunReplyV1[] = [];
+          const request = unreadable({ ref: "hello", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, field);
+          await handle(request, { ...deps, context: f.context });
+          expect(replies, field).toEqual([{ ok: false, error: refused(field) }]);
+        }
+        expect(executed).not.toHaveBeenCalled();
+        expect(f.demo).not.toHaveBeenCalled();
+        expect(sendMessage).not.toHaveBeenCalled();
+      });
+
+      it.each(codeFields)("%s on a ref request is never read, so the saved program still runs", async (field) => {
+        const f = fixture();
+        await f.store.save({ name: "hello", code: "return 1;" }, "typescript");
+        const { deps } = hostDeps(f);
+        const replies: FabricProgramRunReplyV1[] = [];
+        await handle(unreadable({ ref: "hello", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, field), { ...deps, context: f.context });
+        expect(replies).toMatchObject([{ ok: true, value: 1 }]);
+      });
+
+      it.each([...codeFields, ...named])("%s on a code request: nothing escapes the listener and the request is answered exactly once", async (field) => {
+        const { listener, shutdown } = await boot();
+        try {
+          const answered = nextReply();
+          const request = unreadable({ code: "return 1;", reply: answered.reply }, field);
+          expect(() => listener(request)).not.toThrow();
+          expect(await answered.done).toEqual({ ok: false, error: refused(field) });
+          expect(answered.calls()).toBe(1);
+        } finally {
+          await shutdown();
+        }
+      });
+
+      it("names the unreadable field and runs nothing, for every field of a code request", async () => {
+        const f = fixture();
+        const { deps, sendMessage } = hostDeps(f);
+        const executed = vi.spyOn(f.service, "execute");
+        for (const field of [...codeFields, "input", "requirePromoted", "signal"]) {
+          const replies: FabricProgramRunReplyV1[] = [];
+          const request = unreadable({ code: "return 1;", reply: (result: FabricProgramRunReplyV1) => replies.push(result) }, field);
+          await handle(request, { ...deps, context: f.context });
+          expect(replies, field).toEqual([{ ok: false, error: refused(field) }]);
+        }
+        expect(executed).not.toHaveBeenCalled();
+        expect(f.demo).not.toHaveBeenCalled();
+        expect(sendMessage).not.toHaveBeenCalled();
+      });
+
+      describe("is refused before any other check", () => {
+        // The first unreadable field, in read order, is the one named.
+        const cases: Array<[string, Record<string, unknown>, string[], string]> = [
+          ["numeric ref, then input", { ref: 7 }, ["input"], refused("input")],
+          ["invalid requirePromoted, then signal", { ref: "hello", requirePromoted: "yes" }, ["signal"], refused("signal")],
+          ["invalid signal, then requirePromoted", { ref: "hello", signal: {} }, ["requirePromoted"], refused("requirePromoted")],
+          ["signal before input", { ref: "hello" }, ["signal", "input"], refused("signal")],
+        ];
+        it.each(cases)("%s", async (_name, fields, broken, error) => {
+          const { listener, shutdown } = await boot();
+          try {
+            const answered = nextReply();
+            expect(() => listener(unreadable({ ...fields, reply: answered.reply }, ...broken))).not.toThrow();
+            expect(await answered.done).toEqual({ ok: false, error });
+            await drained();
+            expect(answered.calls()).toBe(1);
+          } finally {
+            await shutdown();
+          }
+        });
+      });
+
+      it("stays silent, throwing nothing, when reply cannot be read; a reply that is no function still throws", async () => {
+        const { listener, shutdown } = await boot();
+        try {
+          expect(() => listener(unreadable({ ref: "hello" }, "reply"))).not.toThrow();
+          // The documented synchronous throw for a payload without a reply function is unchanged.
+          expect(() => listener({ ref: "hello", reply: 5 })).toThrow("Invalid Pi Fabric program run request");
+          expect(() => listener({ ref: "hello" })).toThrow("Invalid Pi Fabric program run request");
+          // The listener is still alive and answers the next request.
+          const barrier = nextReply();
+          listener({ ref: "hello", reply: barrier.reply });
+          expect(await barrier.done).toMatchObject({ ok: false });
+        } finally {
+          await shutdown();
+        }
+      });
+
+      it("reads reply and every named field exactly once, a throwing one included", async () => {
+        const f = fixture();
+        const reads: Record<string, number> = {};
+        const answered = nextReply();
+        const request: Record<string, unknown> = {};
+        const values: Record<string, unknown> = { reply: answered.reply, ref: "hello" };
+        for (const field of ["reply", ...named, ...codeFields]) {
+          Object.defineProperty(request, field, {
+            enumerable: true,
+            get() {
+              reads[field] = (reads[field] ?? 0) + 1;
+              if (field === "input") throw new Error("getter boom");
+              return values[field];
+            },
+          });
+        }
+        const snapshot = snapshotFabricProgramRunRequestV1(request)!;
+        await handleFabricProgramRunEvent(snapshot, { ...hostDeps(f).deps, context: f.context });
+        expect(await answered.done).toEqual({ ok: false, error: refused("input") });
+        // A ref request never reads the code fields.
+        expect(reads).toEqual(Object.fromEntries(["reply", ...named].map((field) => [field, 1])));
+      });
+    });
   });
 
   it("lists, promotes, retires and runs through the slash command", async () => {

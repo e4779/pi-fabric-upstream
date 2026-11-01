@@ -1,52 +1,14 @@
-import {
-  storageTransition,
-  type StoragePlan,
-  type StorageRequest,
-  type StorageRevision,
-  type StorageText,
-} from "./generated/storage-kernel.js";
+import { Interner, bit } from "./machine.js";
+import { storageTransition } from "./generated/storage.js";
 import type { MeshIdentity } from "../mesh/store.js";
 
-// Bend Nat arithmetic is capped at 2^48-1. Canonical radix-2^32 limbs
-// represent the entire JS safe-integer range without crossing that runtime cap.
-const RADIX = 4294967296;
-
-const encode = (text: string): StorageText => {
-  let result: StorageText = { $: "Nil" };
-  for (let index = text.length - 1; index >= 0; index--) {
-    result = { $: "Con", head: text.charCodeAt(index), tail: result };
-  }
-  return result;
-};
-
-const decode = (text: StorageText): string => {
-  const units: string[] = [];
-  for (let node = text; node.$ === "Con"; node = node.tail) {
-    if (node.head < 0 || node.head > 65535) throw new Error("Invalid storage code unit");
-    units.push(String.fromCharCode(node.head));
-  }
-  return units.join("");
-};
+const PLANS = ["Conflict", "Exhausted", "Unchanged", "PutNext", "DeleteNext"] as const;
 
 export const storageRevision = (value: unknown): number => {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
     throw new Error("Invalid Fabric mesh revision: expected a nonnegative safe integer");
   }
   return value;
-};
-
-const encodeRevision = (value: number): StorageRevision => {
-  const exact = storageRevision(value);
-  return { $: "Revision", high: Math.floor(exact / RADIX), low: exact % RADIX };
-};
-
-const decodeRevision = (value: StorageRevision): number => {
-  if (!Number.isInteger(value.high) || !Number.isInteger(value.low) || value.high < 0 || value.high > 2097151 || value.low < 0 || value.low >= RADIX) {
-    throw new Error("Invalid verified storage revision limbs");
-  }
-  // Representation conversion only; CAS, overflow and successor/carry decisions
-  // are performed by the executable proved reducer, not reproduced here.
-  return storageRevision(value.high * RADIX + value.low);
 };
 
 const serialize = (value: unknown): string => {
@@ -71,26 +33,25 @@ const capture = (
   payload?: { value: string; identity: string },
 ): CapturedStorageRequest => {
   const expected = ifVersion === undefined ? undefined : storageRevision(ifVersion);
-  // The wire graph and JSON strings never escape this closure. Caller-owned
-  // objects (including nested identity/value) are not retained across lock wait.
-  const request: StorageRequest = {
-    $: "Request",
-    key: encode(key),
-    expected: expected === undefined ? { $: "Any" } : { $: "At", version: encodeRevision(expected) },
-    change: payload === undefined ? { $: "Delete" } : {
-      $: "Put", value: encode(payload.value), identity: encode(payload.identity),
-    },
-  };
+  // The JSON strings never escape this closure. Caller-owned objects (including
+  // nested identity/value) are not retained across lock wait.
   return Object.freeze({
     key,
     transition(present: boolean, actualVersion: number, highWater: number): StorageTransition {
       const actual = storageRevision(actualVersion);
       const clock = storageRevision(highWater);
       if (clock < actual) throw new Error("Inconsistent Fabric mesh high-water revision");
-      const plan: StoragePlan = storageTransition(
-        request, { $: "Slot", present, version: encodeRevision(actual), highWater: encodeRevision(clock) },
-      );
-      switch (plan.$) {
+      // Ids start at 1, so a forwarded 0 can never name a string.
+      const names = new Interner(1);
+      const out = storageTransition.step({}, storageTransition.init({}), {
+        key: names.id(key), any: bit(expected === undefined), expected: expected ?? 0,
+        put: bit(payload !== undefined), value: names.id(payload?.value ?? ""), identity: names.id(payload?.identity ?? ""),
+        present: bit(present), version: actual, highWater: clock,
+      }).scalars;
+      // Representation conversion only; CAS, overflow and successor decisions are
+      // performed by the executable proved reducer, not reproduced here.
+      const plan = PLANS[out["out.plan"]!];
+      switch (plan) {
         case "Conflict":
           throw new Error(`Mesh compare-and-swap failed for ${key}: expected version ${expected}, found ${actual}`);
         case "Exhausted":
@@ -99,12 +60,14 @@ const capture = (
           return { kind: "unchanged" };
         case "PutNext":
           return {
-            kind: "put", key: decode(plan.key), value: JSON.parse(decode(plan.value)),
-            identity: JSON.parse(decode(plan.identity)) as MeshIdentity,
-            version: decodeRevision(plan.version), highWater: decodeRevision(plan.highWater),
+            kind: "put", key: names.name(out["out.key"]!), value: JSON.parse(names.name(out["out.value"]!)),
+            identity: JSON.parse(names.name(out["out.identity"]!)) as MeshIdentity,
+            version: storageRevision(out["out.version"]), highWater: storageRevision(out["out.highWater"]),
           };
         case "DeleteNext":
-          return { kind: "delete", key: decode(plan.key), version: decodeRevision(plan.version), highWater: decodeRevision(plan.highWater) };
+          return { kind: "delete", key: names.name(out["out.key"]!), version: storageRevision(out["out.version"]), highWater: storageRevision(out["out.highWater"]) };
+        default:
+          throw new Error("Invalid verified storage plan");
       }
     },
   });

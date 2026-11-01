@@ -1,6 +1,6 @@
 # Deterministic compaction
 
-Pi Fabric provides an LLM-free compactor through `session_before_compact`. This compactor is the default engine. Set `compaction.engine` to `"pi"` to defer to Pi's compactor.
+Pi Fabric provides an LLM-free compactor through `session_before_compact`. This compactor is the default engine. Set `compaction.engine` to `"pi"` to defer to Pi's compactor. Another extension can take compaction alone, keeping Fabric's `/tree` summaries, through a [compaction owner claim](programmatic-compaction.md#compaction-owner-claim).
 
 Fabric keeps a bounded recent raw continuity tail after compaction. The tail uses Pi's active `keepRecentTokens` setting, which defaults to 20,000 tokens. Fabric rebuilds the older state into its deterministic summary. Pi's native cut and Codex-style checkpoint compaction use the same fresh-window principle. The summary carries durable state, and a small raw suffix keeps the recent conversation coherent for the model.
 
@@ -53,7 +53,8 @@ both for one model, the token threshold wins. A configured threshold lower
 than Pi's built-in threshold makes Fabric trigger compaction at a safe settled
 boundary. When Pi's built-in threshold is lower, Fabric defers that automatic
 compaction until the model reaches its model-specific threshold. Fabric never
-defers overflow and manual compactions.
+defers overflow and manual compactions. Under a compaction owner claim,
+Fabric neither triggers nor defers: the owner runs its own thresholds.
 
 ## Headroom trigger
 
@@ -159,6 +160,12 @@ if no legal suffix fits, Fabric compacts everything. Preparation settings
 still apply without a model window. This fallback emits no fabricated model
 window or calibrated budget metadata. Its bound is on structural raw-tail
 estimates plus the bounded summary, not unknown fixed provider overhead.
+
+When Fabric cancels a manual or overflow compaction because it cannot produce
+a summary (nothing to cut, no raw source, or no summary that fits the target),
+a UI context receives a bounded warning naming the reason. A cancelled
+threshold compaction stays quiet: Pi rechecks the threshold before every
+assistant response, so a warning there would repeat on each call.
 
 The live cut determines only what Pi keeps. The summary source is the raw
 active-branch prefix before that new boundary. Normalization skips earlier
@@ -355,7 +362,8 @@ and outer result prose still cannot create file, failure, or activity facts.
 ## Deterministic branch summaries
 
 When the Fabric engine is active, the same registration also handles
-`session_before_tree`. The handler returns nothing when `userWantsSummary` is
+`session_before_tree`. A compaction owner claim leaves this handler on
+unless the claim sets `branchSummary: true`. The handler returns nothing when `userWantsSummary` is
 false, and it compiles only `preparation.entriesToSummarize` when true. Tree
 custom instructions use the same plain/typed decoder and fail-closed limits as
 compaction. The exact `__pi_vcc__` value carries routing meaning only for
@@ -395,8 +403,10 @@ not extend decision retention across abandoned branches lacking raw dialogue.
 Precedence remains:
 
 1. exact `__pi_vcc__` custom-instruction sentinel.
-2. configured Fabric engine.
-3. pi-vcc/default Pi behavior.
+2. a [compaction owner claim](programmatic-compaction.md#compaction-owner-claim):
+   Fabric returns nothing, before any threshold deferral.
+3. configured Fabric engine.
+4. pi-vcc/default Pi behavior.
 
 Fabric marks claimed events with `_fabricCompaction`. If an earlier pi-vcc
 handler marked `_piVccOverriding` and Fabric has nothing to compact, Fabric
@@ -429,6 +439,12 @@ It never retries, re-compacts, or otherwise contests the result. The pi-vcc
 sentinel and pi-vcc overrides that Fabric yields to on purpose do not warn. To
 make Fabric the owner, load it after other compaction extensions as described
 above, or set the engine to `"pi"` to hand compaction over deliberately.
+An extension that holds a [compaction owner claim](programmatic-compaction.md#compaction-owner-claim)
+gets compaction without a load-order race, and its results do not warn.
+
+When Fabric cannot produce a summary (for example nothing to compact, or no
+summary fits the context target), it cancels the compaction and shows the
+reason as a UI warning, the same way it reports a rejected instruction.
 
 ## Orphaned tool-result repair
 

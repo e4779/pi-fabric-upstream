@@ -2,7 +2,10 @@
 
 Fabric-managed `pi.bash` and `pi.powershell` commands have session-owned job IDs.
 `background: true`, the shell hang threshold, or Ctrl+B twice detaches a command;
-an explicit shell `timeout` remains a hard cap. Completed jobs have terminal states
+an explicit shell `timeout` remains a hard cap. A foreground shell shows the
+shortcut while it waits, including while output streams; the first keypress prompts
+for confirmation.
+Completed jobs have terminal states
 (`exited`, `failed`, `killed`, `timed_out`), not the old `spilled` state. `exited`
 means exit code zero, not that the user's assignment is verified.
 
@@ -23,6 +26,37 @@ already queued messages. Aborted/error turns suspend wakeups until new user inpu
 branch navigation discards delivery from old-frontier jobs. Session shutdown/reload
 closes the inbox before aborting jobs, so cleanup cannot start a new turn.
 Print-mode processes do not stay alive indefinitely just to receive late events.
+
+## Background programs
+
+A whole `fabric_exec` program can leave its tool call the same way. Pi delivers
+a steering message to Main only after the current tool calls finish, so while a
+long workflow runs inside one `fabric_exec`, a message typed to Main waits for
+every agent in it. Moving the program to the background ends that tool call and
+Main takes the steer on its next request.
+
+- **Ctrl+B twice** within one second, from an empty editor, while a
+  `fabric_exec` runs. A nested shell that is still waiting is spilled first, as
+  before; press the chord again to move the program. With text in the editor,
+  Ctrl+B stays cursor-left.
+- **`background: true`** on the `fabric_exec` call starts the program as a task
+  and returns at once. The model uses it for long workflows whose result it
+  does not need before continuing.
+
+The tool call returns the task ID. The program keeps running with its own
+cancellation signal: Esc and later turns no longer stop it, and `tasks.stop`,
+the task detail's `x`, or session shutdown do (stopping also stops the child
+agents it owns). Its child agents stay steerable through `agents.steer`,
+`/fabric chat`, or the agent list. Progress lines and the final result go to
+the task's bounded log; the result reaches the owning agent as a background
+task event, bounded to about 6,000 characters, with the same batching, wakeup,
+and suspension rules as shell tasks. The live-task reminder lists running
+programs. A background program never claims a Prewalk handoff, and the shell
+timing bridge below does not report programs.
+
+Main and a background program can edit the same files at the same time. Detach
+only work whose files Main will not touch, or tell Main what it should leave
+alone.
 
 ## Extension timing bridge
 
@@ -75,20 +109,69 @@ suspension suppresses the reminder until new input, just like automatic delivery
 Reload/session shutdown removes the context hook along with the inbox. Awareness
 works without a terminal and does not restore processes across Pi restarts.
 
+### Prompt-cache warming while yielded
+
+Spilling ends the tool call, so the agent run settles and Pi's cache warmer moves
+to its idle phase. Pi prices idle refreshes with a fixed low continuation
+probability, because an idle session usually waits on a person. While a
+spilled job whose completion wakes this agent is still running, the next real
+request is near-certain. The inbox handles Pi's `cache_warming_decision` and,
+only when Pi chose `stop` in the idle phase, re-prices that refresh at
+probability 1 against Pi's own $0.05 savings threshold, returning `warm` if it
+clears.
+
+It never downgrades `warm` or touches streaming-phase decisions, and counts the
+same jobs as the reminder above minus UI-only monitors. Refreshes are ordinary
+paid `cache_warm` usage, not a guarantee of a cache hit or net savings. Fabric
+neither changes Pi's warming setting nor bypasses native request eligibility.
+
+To opt in, merge these fields into Pi's **global** `~/.pi/agent/settings.json`
+(or the settings file under your custom Pi agent directory), not project settings:
+
+```json
+{
+  "cacheWarming": "idle",
+  "showCacheMissNotices": true
+}
+```
+
+`showCacheMissNotices` is optional diagnostics. Restart Pi after a file edit and
+send a new real request; changing the policy cannot revive an already stopped
+warmer or recover a cache entry that has expired. Pi's default `"streaming"` mode
+stops warming when the run settles, before any extension is asked. `"off"`
+remains off. No extra Fabric setting or `cache.hold` call is required for this
+idle-decision override; scoped leases are a separate optional capability.
+
+For the five-minute cache tier, Pi's first refresh is due at 270 seconds after
+the real request. Fabric's default 120-second shell spill can settle the run
+before then, which explains why streaming warming records no refresh while the
+agent waits. With idle warming enabled, `/session` shows the native warming
+state/decision; successful refreshes appear as `cache_warm` usage, and
+`cache.status()` exposes their receipts in its bounded observation window.
+A missing receipt alone does not prove a cache miss: small prompts, unsupported
+models, unsafe replays, changed context, or expired refresh deadlines can prevent
+warming.
+
+Pi's 30-minute idle safety horizon still applies, measured from the real request
+that started warming, **not** from spill or the latest refresh. Jobs may outlast
+both warming and the cache TTL; this patch does not keep them warm indefinitely.
+`tests/shell-cache-warming-sdk.test.ts` exercises native scheduling, replay,
+receipts, completion wakeup, default/off/UI-only exclusions, and the safety
+horizon with an offline provider; it does not measure live-provider cache hits.
+
 ## Inspection and control
 
-- `/fabric tasks` or **Ctrl+Alt+T** opens the lazy inspector. A single task opens
-  directly. `/fabric tasks <id-or-unique-prefix>` opens a specific task.
-- The widget shows up to three tasks, elapsed time, and the command or short
-  description. It stays alive after the Fabric program returns. Completion hints
-  expire after 30 seconds; retained jobs remain in the inspector.
-- The rounded, theme-aware inspector groups tasks into **Active**, **Needs
-  attention** (failed/timed out), and **Finished**. Purpose/command labels lead;
-  IDs, elapsed time, exit codes and monitor delivery sit beneath each task.
-  Live tasks use Fabric's activity spinner; completed tasks have fixed status icons.
-  Arrows/PageUp/PageDown navigate the list without selecting group headings.
-- Enter opens detail; arrows/PageUp/PageDown scroll the bounded output tail; G
-  follows the tail; x twice within three seconds stops; Esc backs out/closes.
+- Focus the footer list with **↓** from an empty editor or `/fabric tasks`, then
+  press **Enter** on a task to open its lazy detail.
+  `/fabric tasks <id-or-unique-prefix>` opens a specific task directly.
+- The footer lists tasks individually after agents, with elapsed time and the
+  command or short description. It stays alive after the Fabric program returns.
+  Completion hints expire after 30 seconds; retained jobs remain inspectable by ID.
+- The rounded, theme-aware detail shows one task. Live tasks use Fabric's
+  activity spinner; completed tasks have fixed status icons. There is no
+  secondary task-list overlay or global task-list shortcut.
+- Arrows/PageUp/PageDown scroll the bounded output tail; G follows the tail;
+  x twice within three seconds stops; Esc closes the detail in one step.
 - Elapsed time and time since last output are separate. A quiet shell is not
   automatically classified as stuck. Opening/closing the inspector doesn't stop it.
 - `ui.enabled` and `ui.widget` retain their existing meaning. Rendering is TUI-only;
@@ -200,9 +283,12 @@ Subscribed actors, including durable actors on the resident host, wake on it.
 
 The default store is `<cwd>/.jev-fabric-native`, the same one Claude Code,
 Codex or a shell uses for `jev-fabric` in that project, so it doubles as a
-process registry across harnesses. `tasks.external` lists jobs there that no
-task of this session tracks (id, state, label, start time). `tasks.adopt({jobId,
-description?})` attaches one as a durable task of this session: output,
+process registry across harnesses. Before a durable job or session uses the
+default store, Fabric writes a `.gitignore` containing `*` into it, so the store
+does not show as untracked files in a Git checkout. A configured `home` is left
+as it is. `tasks.external` lists jobs there that no task of this session tracks
+(id, state, label, start time). `tasks.adopt({jobId, description?})` attaches
+one as a durable task of this session: output,
 completion notification, wait/watch/stop and an inspector row. Adoption never
 restarts or signals the process; stopping it afterwards does.
 

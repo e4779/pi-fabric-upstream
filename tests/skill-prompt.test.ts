@@ -29,6 +29,12 @@ const occurrences = (value: string, search: string): number =>
   value.split(search).length - 1;
 
 describe("full code skill prompt", () => {
+  it("supports a host reader or no loading instruction without changing ordinary defaults", () => {
+    expect(restoreSkillsForFullCodePrompt("base", skills, true, "mcp.files.read")).toContain("Use `mcp.files.read` inside `fabric_exec`");
+    const managed = restoreSkillsForFullCodePrompt("base", skills, true, null);
+    expect(managed).toContain("<name>release-risk</name>");
+    expect(managed).not.toMatch(/pi\.read|Use the read tool/);
+  });
   it("restores Pi's skill catalog before the working directory", () => {
     const prompt = restoreSkillsForFullCodePrompt(
       "Core prompt\nCurrent working directory: /workspace",

@@ -58,10 +58,15 @@ interface FabricAgentRequest {
   /** Omitted/inherit uses caller executor.kernel; concrete choices require Pi with extensions. */
   kernel?: FabricKernel | "inherit";
   task: string;
+  /** Name of an agent file listed by agents.definitions(); fields passed here win over the file. */
+  agent?: string;
   name?: string;
   runner?: FabricAgentRunner;
   transport?: FabricTransport;
   model?: string;
+  /** Pi only. "exact": select a visible provider/id without aliases or fuzzy matching; strict admission and a partial guard are not final-dispatch enforcement. Later hooks, unknown APIs, providers or extension calls can route data elsewhere. */
+  modelMatch?: "exact";
+  holdQuestions?: true;
   persona?: string;
   thinking?: FabricThinking;
   /** Child thinking bounds; must lie inside this session's bounds. Levels outside are clamped. */
@@ -85,10 +90,16 @@ interface FabricAgentRequest {
   /** Narrow the host-issued scope; omitted inherits it. Refused when this session is unscoped. */
   scope?: { grants: { resource: string; actions: ("read" | "write" | "execute")[] }[] };
   schema?: Record<string, unknown>;
+  /** Appended to the child's system prompt (Veda receives it as a <system_instructions> block); blank is ignored and durable spawn refuses it. */
+  systemPrompt?: string;
+  /** Pi only. Skills by name from this session: false = none; a list = preload those plus this session's others; inherit: false = only the preloaded ones. */
+  skills?: false | string[] | { preload?: string[]; inherit?: boolean };
   prompt?: string;
   instructions?: string;
   timeout_ms?: number;
   residency?: FabricParticipantResidency;
+  /** agents.spawn only: return a "queued" handle at once; the run starts when a concurrency slot frees. */
+  queue?: boolean;
   /** Opt in to session persistence for hook-based observability and external trace ingestion. */
   persistSession?: boolean;
 }
@@ -384,7 +395,6 @@ interface FabricCapabilityCatalog {
   complete: boolean;
   reasons: string[];
 }
-interface FabricToolsApi {
 interface FabricActionListEnvelope {
   kind: "pi-fabric.action-list";
   version: 1;
@@ -438,6 +448,14 @@ interface FabricCapturedTool {
   (args?: Record<string, unknown>): Promise<FabricCapturedToolResult>;
 }
 type FabricExtensionsApi = Record<string, FabricCapturedTool>;
+// A provider another extension registers is a global named after it when
+// the name is free (src/provider-globals.ts). Each call is
+// tools.call({ ref: "<provider>.<action>", args }). Typed actions come from
+// the provider's input schemas (runtime/dynamic-guest-types.ts); actions
+// without usable types keep this loose shape and validate at dispatch.
+interface FabricProviderGlobal {
+  [action: string]: (args?: Record<string, unknown>) => Promise<any>;
+}
 // String-primary tools (read/bash/powershell/grep/find/ls) accept a bare string; the
 // runtime proxy coerces it to { <primaryField>: string }. Lets the model write
 // the natural form (pi.bash("ls")) instead of pi.bash({ command: "ls" }).
@@ -669,6 +687,7 @@ type FabricActorRequest = FabricActorRequestBase & (
   | { delivery: "nextTurn"; triggerTurn?: false }
   | { delivery: "steer" | "followUp"; triggerTurn: boolean }
 );
+type FabricGlobalActorTemplate = FabricActorRequest & { id: string; createdAt: number; updatedAt: number };
 interface FabricActorInfo {
   kernel?: FabricKernel;
   pythonRuntime?: "cpython" | "monty";
@@ -740,6 +759,18 @@ interface FabricActorMessage {
 }
 // agentId/agent_id spellings repair to id during agent arg normalization.
 type FabricAgentTargetArgs = { id: string; agentId?: string; agent_id?: string };
+interface FabricAgentDefinition {
+  name: string;
+  description: string;
+  path: string;
+  scope: "user" | "project";
+  /** Path of the lower-precedence file with the same name that this one replaces. */
+  shadows?: string;
+  /** One entry per ignored field. */
+  warnings: string[];
+  /** Set when the file cannot be used; name is then the file name without .md. */
+  error?: string;
+}
 interface FabricAgentsApi {
   run(args: FabricAgentRequest): Promise<FabricAgentResult>;
   /** Hosted capability only; resumes a paused direct child without exposing its checkpoint. */
@@ -760,6 +791,14 @@ interface FabricAgentsApi {
   main(): Promise<FabricMainAgentInfo>;
   sessions(): Promise<FabricParticipantInfo[]>;
   peers(): Promise<FabricPeerInfo[]>;
+  /** Root sessions no longer live, newest first. Never part of live discovery. */
+  departed(args?: { limit?: number }): Promise<Array<{
+    id: string; kind: "root"; rootId: string; ownerHostId: string; ownerIdentityId: string; ownerIncarnation?: string;
+    name: string; label?: string; cwd?: string; sessionId?: string;
+    status: "stopped" | "lost"; startedAt: number; lastSeenAt: number;
+  }>>;
+  /** Named agent files that agents.run and agents.spawn accept in agent. */
+  definitions(): Promise<FabricAgentDefinition[]>;
   subscribe(args: {
     from: string;
     events: FabricLifecycleEventType[];
@@ -770,9 +809,14 @@ interface FabricAgentsApi {
   }): Promise<FabricLifecycleSubscription>;
   subscriptions(args?: { from?: string; to?: string }): Promise<FabricLifecycleSubscription[]>;
   unsubscribe(args: FabricAgentTargetArgs): Promise<{ removed: boolean }>;
-  models(args?: { runner?: FabricAgentRunner; refresh?: boolean }): Promise<FabricModelInfo[]>;
+  /** With model, only entries whose key equals it exactly (no aliases or fuzzy matching); unknown keys give []. */
+  models(args?: { runner?: FabricAgentRunner; refresh?: boolean; model?: string }): Promise<FabricModelInfo[]>;
   stop(args: FabricAgentTargetArgs): Promise<FabricAgentResult | FabricActorInfo | FabricRemoteControlResult>;
   cleanup(args: FabricAgentTargetArgs & { deleteBranch?: boolean; delete_branch?: boolean }): Promise<{ cleaned: boolean }>;
+  /** Park an idle hosted run of this session; the runner must declare the sleep capability. */
+  sleep(args: { id: string }): Promise<{ id: string; requested: "sleep" }>;
+  /** Resume a hosted run that agents.sleep parked. */
+  wake(args: { id: string }): Promise<{ id: string; requested: "wake" }>;
   create(args: FabricActorRequest): Promise<FabricActorInfo>;
   setModel(args: { id: string; model?: string; scope?: FabricActorBindingScope }): Promise<FabricActorInfo>;
   switchModel(args: FabricModelSwitchRequest): Promise<FabricModelSwitchResult>;
@@ -799,7 +843,9 @@ interface FabricAgentsApi {
   /** Advisory compaction of a running Pi-runner child at its next safe turn boundary. */
   compact(args: { id: string; instructions?: string }): Promise<{ queued: true; messageId: string }>;
   actorStatus(args: FabricAgentTargetArgs): Promise<FabricActorInfo>;
-  actors(): Promise<FabricActorInfo[]>;
+  /** Live actors in this Fabric session by default; scope "global" lists the project-independent templates. */
+  actors(args?: { scope?: "project" }): Promise<FabricActorInfo[]>;
+  actors(args: { scope: "global" }): Promise<FabricGlobalActorTemplate[]>;
   messages(args: { id: string; limit?: number }): Promise<FabricActorMessage[]>;
   remove(args: { id: string }): Promise<{ removed: boolean }>;
   /** Drop an actor's mailbox history without stopping the actor. */
@@ -807,7 +853,7 @@ interface FabricAgentsApi {
   /** Stamp a global template into the current project as a fresh live actor with no inherited history. */
   "import"(args: { id?: string; name?: string; as?: string }): Promise<FabricActorInfo>;
   /** Export a live project actor's definition to the global registry as a project-independent template. */
-  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricActorRequest & { id: string; createdAt: number; updatedAt: number }>;
+  "export"(args: { id: string; overwrite?: boolean }): Promise<FabricGlobalActorTemplate>;
   log(args: {
     id: string;
     type?: "session" | "run" | "all";
@@ -1266,10 +1312,17 @@ interface FabricCompactPendingIntent {
   reason?: string;
   instructions?: string;
   preserve?: string[];
+  /** Queued after the compaction commits as a labelled Fabric message. */
+  seed?: string;
   requestedBy: string;
   requestedAt: number;
 }
 type FabricCompactionOwner = "fabric" | "pi" | "external" | "none";
+/** The extension holding the compaction owner claim; compact.* routes to it. */
+interface FabricCompactionClaimRef {
+  name: string;
+  version: string;
+}
 interface FabricCompactLastCommit {
   at: number;
   requestedBy: string;
@@ -1278,6 +1331,7 @@ interface FabricCompactLastCommit {
   tokensBefore?: number;
   estimatedTokensAfter?: number;
   error?: string;
+  seeded?: true;
 }
 type FabricComponentState = "waiting" | "loading" | "active" | "unloading" | "failed" | "quarantined" | "disposed";
 interface FabricComponentEffectInfo {
@@ -1468,15 +1522,25 @@ interface FabricCompactApi {
     instructions?: string;
     preserve?: string[];
     requestedBy?: string;
+    /** Queued after the compaction commits as a labelled Fabric message that starts a turn; a prompt submitted during the compaction runs first. */
+    seed?: string;
     instruction?: string;
     requested_by?: string;
-  }): Promise<{ requested: true; intent: FabricCompactPendingIntent }>;
+  }): Promise<{
+    requested: true;
+    intent: FabricCompactPendingIntent;
+    /** Present under a compaction owner claim: the request went to this owner. */
+    claim?: FabricCompactionClaimRef;
+    result?: unknown;
+  }>;
   status(): Promise<{
     pending?: FabricCompactPendingIntent;
     last?: FabricCompactLastCommit;
     lastAuto?: { at: number; trigger: "headroom" | "tokens" | "ratio"; committed: boolean };
     owner: FabricCompactionOwner;
     outputReserveTokens: number;
+    claim?: FabricCompactionClaimRef & { branchSummary: boolean; actions: string[] };
+    ownerStatus?: unknown;
   }>;
   /** Read-only context pressure; never compacts. */
   pressure(): Promise<{
@@ -1489,10 +1553,20 @@ interface FabricCompactApi {
     thresholdFraction?: number;
     thresholdTokens?: number;
     owner: FabricCompactionOwner;
+    claim?: FabricCompactionClaimRef;
+    /** The claimed owner's own stage and thresholds. */
+    ownerPressure?: { stage: string; thresholds?: Record<string, number> };
   }>;
-  /** Persistent carry-forward focus rendered in every Fabric summary until cleared; no args reads. */
-  carry(args?: { items?: string[]; add?: string[]; remove?: string[]; clear?: boolean }): Promise<{ items: string[] }>;
-  cancel(): Promise<{ cancelled: true }>;
+  /** Persistent carry-forward focus rendered in every Fabric summary until cleared; no args reads. Under a claim the owner keeps it. */
+  carry(args?: { items?: string[]; add?: string[]; remove?: string[]; clear?: boolean }): Promise<{ items: string[]; claim?: FabricCompactionClaimRef }>;
+  /** Under a claim, says which was cancelled: Fabric's own pending request, the owner's, or both. */
+  cancel(): Promise<{
+    cancelled: true;
+    claim?: FabricCompactionClaimRef;
+    fabricIntentCleared?: boolean;
+    ownerCancelled?: boolean;
+    result?: unknown;
+  }>;
 }
 
 interface FabricPrewalkFileIdentityStatus {
@@ -1636,7 +1710,8 @@ export interface FabricGuestDeclarationOptions {
    * Pre-rendered replacement blocks from buildDynamicGuestDeclarations().
    * Applied only when the loose anchor line is still present — excluded
    * globals (or orchestration-only mode, for extensions) keep nothing to
-   * replace, and missing/undefined sections keep the loose surface.
+   * replace, and missing/undefined sections keep the loose surface. The
+   * `providers` block is appended: it declares new globals only.
    */
   dynamic?: FabricDynamicGuestDeclarations;
   /**
@@ -1684,5 +1759,7 @@ export const guestTypeDeclarations = (
       terminatedDeclaration(options.dynamic.extensions),
     );
   }
+  // Provider globals add names; they replace no static declaration.
+  if (options.dynamic?.providers) result += terminatedDeclaration(options.dynamic.providers);
   return result;
 };

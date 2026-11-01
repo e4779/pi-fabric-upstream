@@ -1,21 +1,42 @@
 import { DEFAULT_FABRIC_CONFIG, type FabricConfig } from "./config.js";
 import { createProviderComponent, type FabricProviderComponent } from "./components/provider-component.js";
 import type { FabricProvider } from "./protocol.js";
+import { foregroundConfigValue, MAX_FOREGROUND_TOOLS } from "./core/foreground-tools.js";
 
 const REPLACEABLE = new Set(["agents", "memory", "compact", "schema", "state", "mesh", "mcp"]);
 export interface FabricManagedHostOptions {
   /** Host code only; never read from project/global configuration or the provider event payload. */
   providers: readonly string[];
+  /** Exact registered tools kept model-visible beside fabric_exec (at most eight). */
+  foreground?: readonly string[];
+  /** Additional turn-stable host instructions; never interpreted as configuration. */
+  guidance?: string;
+  /** Callable reader used for skill loading; omitted means the host owns loading. */
+  skillReader?: string;
+  /** Keep Fabric compaction by default, or delegate to the embedding Pi host. */
+  compaction?: "fabric" | "pi";
+  /** Host-only limits; ambient executor settings are ignored. */
+  executor?: { readonly maxCpuSliceMs?: number };
 }
 
 /** Closed-world provider authority for embedded hosts. Native providers cannot return on reload. */
 export class FabricManagedHost {
+  readonly options: Readonly<FabricManagedHostOptions>;
   readonly #allowed: Set<string>;
   readonly #providers = new Map<string, FabricProvider>();
   readonly #retired = new Set<FabricProvider>();
   #sealed = false;
   constructor(options: FabricManagedHostOptions) {
-    this.#allowed = new Set(options.providers);
+    const foreground = options.foreground ?? [];
+    foregroundConfigValue({ tools: foreground.map(name => ({ name, owner: "managed-host", reason: "human-input" })), maxTools: MAX_FOREGROUND_TOOLS });
+    if (foreground.length > MAX_FOREGROUND_TOOLS) throw new Error(`managedHost.foreground accepts at most ${MAX_FOREGROUND_TOOLS} tools`);
+    if (options.skillReader !== undefined && !/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)+$/.test(options.skillReader)) throw new Error("managedHost.skillReader must be a dotted callable name");
+    if (options.guidance !== undefined && typeof options.guidance !== "string") throw new Error("managedHost.guidance must be a string");
+    if (options.compaction !== undefined && !["fabric", "pi"].includes(options.compaction)) throw new Error("Invalid managedHost.compaction");
+    const maxCpuSliceMs = options.executor?.maxCpuSliceMs ?? 1000;
+    if (!Number.isSafeInteger(maxCpuSliceMs) || maxCpuSliceMs <= 0) throw new Error("managedHost.executor.maxCpuSliceMs must be a positive safe integer");
+    this.options = Object.freeze({ ...options, providers: Object.freeze([...options.providers]), foreground: Object.freeze([...foreground]), executor: Object.freeze({ maxCpuSliceMs }) });
+    this.#allowed = new Set(this.options.providers);
     for (const name of this.#allowed) if (!REPLACEABLE.has(name)) throw new Error(`Managed host cannot replace provider: ${name}`);
   }
   register(provider: FabricProvider, overwrite = false): void {
@@ -56,6 +77,8 @@ export class FabricManagedHost {
     config.fullCodeMode = true;
     config.executor.kernel = "typescript";
     config.executor.runtime = "quickjs";
+    config.executor.maxCpuSliceMs = this.options.executor!.maxCpuSliceMs!;
+    config.foreground = { tools: this.options.foreground!.map(name => ({ name, owner: "managed-host", reason: "human-input" })), maxTools: MAX_FOREGROUND_TOOLS };
     config.mcp.enabled = false;
     config.mcp.allowDynamicServers = false;
     config.mesh.enabled = false;
@@ -66,11 +89,12 @@ export class FabricManagedHost {
     config.repairs.enabled = false;
     config.entropy.compile = false;
     config.speculation.enabled = false;
+    config.jev.enabled = false;
     config.ui.enabled = false;
     config.schema.mode = "off";
     config.schema.trustedCommands = {};
     config.components = [];
-    config.compaction.engine = "fabric";
+    config.compaction.engine = this.options.compaction ?? "fabric";
     config.approvals = {...config.approvals, read: "allow", write: "allow", execute: "allow", agent: "allow", network: "deny"};
     return config;
   }

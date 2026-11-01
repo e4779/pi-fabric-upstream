@@ -4,6 +4,7 @@ import { runAbortable } from "../async-settlement.js";
 import type { ActionRegistry, FabricCapabilityViewLease, FabricCallAudit } from "../core/action-registry.js";
 import { ApprovalController, FabricSessionApprovals } from "../core/approval-controller.js";
 import { FabricAutoApprovalClassifier } from "../core/auto-approval-classifier.js";
+import type { FabricActionPolicyHooks } from "../core/action-policy-hooks.js";
 import type { FabricConfig } from "../config.js";
 import type { FabricInvocationContext } from "../protocol.js";
 import type { JevLaunch, JevRunInfo, JevJson, JevResponse } from "./types.js";
@@ -28,6 +29,8 @@ export interface JevManagerOptions {
   /** Host-only target snapshot hook, before any guest execution. */
   onRunStarted?(id: string): void;
   authorize?(ref: string, parentToolCallId: string): Promise<void>;
+  /** Extension action policy hooks; consulted only when approvals.policyHooks is true. */
+  actionPolicyHooks?: FabricActionPolicyHooks | undefined;
 }
 const prelude = `const input = JSON.parse(π.__jevInput);
 const program = Object.freeze({
@@ -125,12 +128,23 @@ export class JevProgramManager {
       const sources = await registry.guestTypeSources({ ...context, capabilityView: lease.view });
       const { code, checked } = runtime.prepare(prelude + definition.code, true, [], sources, [], true);
       if (checked.errors.length) throw new Error(`Jev program typecheck failed: ${checked.errors.map(e => e.message).join("; ").slice(0, 2000)}`);
-      const approval = new ApprovalController(config.approvals, context.extensionContext, this.#approvals, new FabricAutoApprovalClassifier(() => config.jev));
+      // Nested program actions pass the same extension policy hooks as the
+      // fabric_exec program that launched this one; the run's own signal takes
+      // over once the run exists.
+      let policySignal = context.signal;
+      const policyHooks = this.options.actionPolicyHooks;
+      const policyGate = policyHooks && config.approvals.policyHooks === true
+        ? policyHooks.bind({ caller: "jev", parentToolCallId: context.parentToolCallId }, () => policySignal)
+        : undefined;
+      const approval = new ApprovalController(
+        config.approvals, context.extensionContext, this.#approvals, new FabricAutoApprovalClassifier(() => config.jev),
+        undefined, undefined, undefined, policyGate,
+      );
       if (observe) await approval.approve({
         ref: "jev.spawn", provider: "jev", name: "spawn",
         description: "Observe future Main lifecycle events and explicitly selected content for a bounded Jev program",
         inputSchema: {}, risk: "read",
-      }, { observe });
+      }, { observe }, undefined, context.signal);
       if (this.#closed) throw new Error("Jev program manager is closed");
       context.signal?.throwIfAborted();
       if (observe && observationHost!.revision !== observationRevision)
@@ -143,6 +157,7 @@ export class JevProgramManager {
       const maxTokens = bounded(limits.maxTokens, 100_000, config.jev.maxTokens);
       const id = randomUUID();
       const controller = new AbortController();
+      policySignal = controller.signal;
       const info: JevRunInfo = {
         id, name: definition.name, state: "running", background, startedAt: Date.now(),
         evaluations: 0, toolCalls: 0, usage: { input_tokens: 0, output_tokens: 0 },
@@ -223,11 +238,11 @@ export class JevProgramManager {
                 parentToolCallId: `jev:${id}`, nestedToolCallId: `jev:${id}:${info.toolCalls}`,
                 update() {}, activity() {}, attachMedia() {}, attachPreview() {},
                 authorize: async action => { await this.options.authorize?.(action.ref, `jev:${id}`); },
-                approve: async (action, prepared) => {
+                approve: async (action, prepared, approvalSignal = signal) => {
                   if (action.ref === "schema.commit") {
-                    await approval.approve({ ...action, risk: "write" }, prepared);
-                    await approval.approve({ ...action, risk: "execute" }, prepared);
-                  } else await approval.approve(action, prepared);
+                    await approval.approve({ ...action, risk: "write" }, prepared, undefined, approvalSignal);
+                    await approval.approve({ ...action, risk: "execute" }, prepared, undefined, approvalSignal);
+                  } else await approval.approve(action, prepared, undefined, approvalSignal);
                 },
                 audits, maxResultChars: ref === "jev.decide" ? DECISION_MAX_BYTES : ref === "jev.evaluate" ? 1_048_576 : config.executor.maxNestedResultChars,
               });
@@ -266,6 +281,9 @@ export class JevProgramManager {
           }, {
             timeoutMs, memoryLimitBytes: Math.min(config.executor.memoryLimitBytes, 64 * 1024 * 1024),
             maxCpuSliceMs: 100, maxPendingTimers: 128, maxLogChars: 4096, strings: { __jevInput: JSON.stringify(input), __jevRunId: id }, signal: controller.signal,
+            // Globals only for providers the program's committed view binds,
+            // matching the declarations its type check used.
+            providerGlobals: sources.providers?.map((source) => source.provider) ?? [],
           });
           info.logs = result.logs;
           if (budgetFailure) { info.state = "failed"; info.error = budgetFailure; }

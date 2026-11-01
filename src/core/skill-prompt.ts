@@ -13,10 +13,13 @@ export const restoreSkillsForFullCodePrompt = (
   systemPrompt: string,
   skills: readonly Skill[],
   fullCodeMode = true,
+  skillReader: string | null | undefined = undefined,
 ): string => {
   const section = formatSkillsForPrompt([...skills]).replace(
     PI_SKILL_LOAD_INSTRUCTION,
-    fullCodeMode ? FABRIC_SKILL_LOAD_INSTRUCTION : PI_SKILL_LOAD_INSTRUCTION,
+    skillReader === null ? "" : skillReader !== undefined
+      ? `Use \`${skillReader}\` inside \`fabric_exec\` to load a skill's file when the task matches its description.`
+      : fullCodeMode ? FABRIC_SKILL_LOAD_INSTRUCTION : PI_SKILL_LOAD_INSTRUCTION,
   );
   // Replace the catalog, not just its loader sentence: a previous catalog may
   // advertise skills for a different kernel, including in native-tool mode.

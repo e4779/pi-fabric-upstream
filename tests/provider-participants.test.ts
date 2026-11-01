@@ -216,13 +216,25 @@ describe("participant directory", () => {
     directory.registerSource(() => registry.records(identity.id, identity.id, identity.id));
     try {
       await directory.start();
-      expect(directory.get("provider:delegate:run-1")).toMatchObject({
+      // Read at the persisted lease's own timestamps: slow filesystem writes or
+      // a descheduled CI worker can otherwise consume this fixture's 300ms lease.
+      const hosts = directory.mesh.listAll("topology/hosts/");
+      expect(hosts).toHaveLength(1);
+      const host = hosts[0]!.value as { updatedAt: number; expiresAt: number };
+      expect(host.expiresAt).toBeGreaterThan(host.updatedAt);
+      expect(directory.get("provider:delegate:run-1", host.updatedAt)).toMatchObject({
         kind: "provider",
         provider: "delegate",
         status: "running",
         capabilities: ["followUp", "stop"],
         local: true,
+        stale: false,
       });
+      // Even if a heartbeat renews the lease during these reads, this time is expired.
+      expect(directory.get("provider:delegate:run-1", Number.MAX_SAFE_INTEGER)).toBeUndefined();
+      expect(directory.list({ includeStale: true }, Number.MAX_SAFE_INTEGER)).toContainEqual(
+        expect.objectContaining({ id: "provider:delegate:run-1", stale: true }),
+      );
     } finally {
       await directory.close();
     }

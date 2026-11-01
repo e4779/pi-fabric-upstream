@@ -104,7 +104,9 @@ export class ComponentsProvider implements FabricProvider {
           `${descriptor.name} ${descriptor.description}`.toLowerCase().includes(query),
         )
       : descriptors;
-    return filtered.slice(0, Math.max(1, Math.min(request.limit ?? 100, 100)));
+    return request.limit === undefined
+      ? filtered.slice()
+      : filtered.slice(0, Math.max(1, Math.min(request.limit, 100)));
   }
 
   async describe(

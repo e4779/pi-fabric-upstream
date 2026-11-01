@@ -2,10 +2,13 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import {
+  fsyncDirectory,
+  mkdirDurable,
   writeFileAtomic,
-  encodeOwnerIdentityLine,
-  lockOwnerLiveness,
-  SHORT_LOCK_MAX_HOLD_MS,
+  formatShortLockOwner,
+  reapStaleShortLock,
+  releaseShortLock,
+  tryAcquireShortLock,
 } from "../core/atomic-write.js";
 import { readJsonlPage } from "../log-tail.js";
 import { captureStoragePut, captureStorageDelete, storageRevision } from "../verified/storage.js";
@@ -108,7 +111,14 @@ export interface MeshStoreOptions {
   maxStateTombstones?: number;
   lockTimeoutMs?: number;
   staleLockMs?: number;
+  /**
+   * `"fsync"` flushes every committed write (event append, state, sequence,
+   * schedules, grants, compaction) to stable storage before the call returns.
+   */
+  durability?: MeshDurability;
 }
+
+export type MeshDurability = "default" | "fsync";
 
 const TOPIC_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,127}$/;
 const KEY_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:/-]{0,255}$/;
@@ -251,12 +261,17 @@ const readState = (filePath: string, maxBytes: number, recoverDamage = true): Me
   }
 };
 
-const atomicWrite = (filePath: string, value: unknown, maxBytes = Number.POSITIVE_INFINITY): void => {
+const atomicWrite = (
+  filePath: string,
+  value: unknown,
+  maxBytes = Number.POSITIVE_INFINITY,
+  fsync = false,
+): void => {
   const serialized = JSON.stringify(value, null, 2);
   if (Buffer.byteLength(serialized, "utf8") > maxBytes) {
     throw new Error(`Fabric mesh state exceeds ${maxBytes} bytes`);
   }
-  writeFileAtomic(filePath, serialized);
+  writeFileAtomic(filePath, serialized, fsync ? { fsync: true, durabilityRoot: path.dirname(filePath) } : undefined);
 };
 
 // Host invariant for the proved reducer: the persisted clock covers every
@@ -336,6 +351,8 @@ export class MeshStore {
   readonly #maxStateTombstones: number;
   readonly #lockTimeoutMs: number;
   readonly #staleLockMs: number;
+  /** Whether committed writes are flushed to stable storage before returning. */
+  readonly durable: boolean;
   #stateCache:
     | { device: number; inode: number; size: number; modifiedAt: number; state: MeshStateFile }
     | undefined;
@@ -379,7 +396,10 @@ export class MeshStore {
     );
     this.#lockTimeoutMs = Math.max(100, Math.floor(options.lockTimeoutMs ?? LOCK_TIMEOUT_MS));
     this.#staleLockMs = Math.max(100, Math.floor(options.staleLockMs ?? STALE_LOCK_MS));
-    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    this.durable = options.durability === "fsync";
+    // Establish every ancestor link once, even for a pre-created root. Later
+    // writes can stop at this root while its parent namespace stays unchanged.
+    mkdirDurable(root, 0o700, this.durable);
   }
 
   async publish(input: {
@@ -443,8 +463,8 @@ export class MeshStore {
     if (Buffer.byteLength(line, "utf8") > limit) {
       throw new Error(`Mesh event exceeds ${limit} bytes`);
     }
-    fs.appendFileSync(this.#eventsPath, `${line}\n`, { encoding: "utf8", mode: 0o600 });
-    atomicWrite(this.#counterPath, sequence);
+    this.#appendEventLine(`${line}\n`);
+    atomicWrite(this.#counterPath, sequence, Number.POSITIVE_INFINITY, this.durable);
     this.#compactEventLog();
     return event;
   }
@@ -628,10 +648,11 @@ export class MeshStore {
   #writeSchedules(schedules: MeshSchedule[]): void {
     if (schedules.length === 0) {
       fs.rmSync(this.#schedulesPath, { force: true });
+      if (this.durable) fsyncDirectory(this.root);
       this.#scheduleCache = undefined;
       return;
     }
-    atomicWrite(this.#schedulesPath, { format: 1, schedules }, MAX_SCHEDULE_FILE_BYTES);
+    atomicWrite(this.#schedulesPath, { format: 1, schedules }, MAX_SCHEDULE_FILE_BYTES, this.durable);
     this.#scheduleCache = undefined;
   }
 
@@ -853,16 +874,21 @@ export class MeshStore {
 
   list(prefix = "", limit = 100): MeshStateEntry[] {
     const boundedLimit = Math.max(1, Math.min(Math.floor(limit), this.maxReadEvents));
-    return this.listAll(prefix).slice(0, boundedLimit);
+    return this.#listEntries(prefix).slice(0, boundedLimit).map((entry) => jsonClone(entry));
   }
 
   /** Internal project-state scan for host-managed indexes that must reconcile every key. */
   listAll(prefix = ""): MeshStateEntry[] {
+    return this.#listEntries(prefix).map((entry) => jsonClone(entry));
+  }
+
+  // Cached entries never escape without cloning. Bound public reads before
+  // copying payloads so a small page does not serialize the entire mesh.
+  #listEntries(prefix: string): MeshStateEntry[] {
     if (prefix) this.#validateKey(prefix);
     return Object.values(this.#readCachedState().entries)
       .filter((entry) => !prefix || entry.key.startsWith(prefix))
-      .sort((left, right) => left.key.localeCompare(right.key))
-      .map((entry) => jsonClone(entry));
+      .sort((left, right) => left.key.localeCompare(right.key));
   }
 
   async put(input: {
@@ -896,7 +922,7 @@ export class MeshStore {
       state.highWater = plan.highWater;
       state.tombstoneOrder = (state.tombstoneOrder ?? []).filter((key) => key !== plan.key);
       compactStateTombstones(state, this.#maxStateTombstones);
-      atomicWrite(this.#statePath, state, this.#maxStateBytes);
+      atomicWrite(this.#statePath, state, this.#maxStateBytes, this.durable);
       this.#cacheState(state);
       return jsonClone(entry);
     });
@@ -933,7 +959,7 @@ export class MeshStore {
         plan.key,
       ];
       compactStateTombstones(state, this.#maxStateTombstones);
-      atomicWrite(this.#statePath, state, this.#maxStateBytes);
+      atomicWrite(this.#statePath, state, this.#maxStateBytes, this.durable);
       this.#cacheState(state);
       return { deleted: true, version: plan.version };
     });
@@ -978,85 +1004,35 @@ export class MeshStore {
   }
 
   async #withLock<T>(operation: () => T): Promise<T> {
-    fs.mkdirSync(this.root, { recursive: true, mode: 0o700 });
+    mkdirDurable(this.root, 0o700, this.durable, this.root);
     const deadline = Date.now() + this.#lockTimeoutMs;
     const token = randomUUID();
-    const ownerPath = path.join(this.#lockPath, "owner");
-    while (true) {
-      try {
-        fs.mkdirSync(this.#lockPath, { mode: 0o700 });
-        fs.writeFileSync(ownerPath, `${token}\n${process.pid}\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, {
-          encoding: "utf8",
-          mode: 0o600,
-        });
-        break;
-      } catch (error) {
-        if (errorCode(error) !== "EEXIST") throw error;
-        if (this.#clearStaleLock(ownerPath)) continue;
-        if (Date.now() >= deadline) throw new Error("Timed out waiting for the Fabric mesh lock");
-        await delay(10);
-      }
+    while (!tryAcquireShortLock(this.#lockPath, formatShortLockOwner(token))) {
+      if (this.#clearStaleLock()) continue;
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for the Fabric mesh lock");
+      await delay(10);
     }
     try {
       return operation();
     } finally {
-      try {
-        const owner = fs.readFileSync(ownerPath, "utf8");
-        if (owner.startsWith(`${token}\n`)) {
-          fs.rmSync(this.#lockPath, { recursive: true, force: true });
-        }
-      } catch {
-        // Another process already recovered or removed this lock.
-      }
+      // Takes the lock back from a reaper's claim path too, so a reaper's
+      // rename-back cannot restore a released lock.
+      releaseShortLock(this.#lockPath, token);
     }
   }
 
   // Returns true when a stale lock was removed and acquisition should retry.
-  // A lock is stale when it outlived the stale window without a live owner:
-  // either the owner file names a dead process, or the owner file is missing
-  // or corrupt — the owner crashed between creating the lock directory and
-  // writing the owner file — and the untouched lock directory itself is
-  // stale. Removal re-reads the state it judged stale so a freshly rotated
-  // owner is never deleted mid-check.
-  #clearStaleLock(ownerPath: string): boolean {
-    let lockModifiedAt: number | undefined;
-    let owner: string | undefined;
-    try {
-      owner = fs.readFileSync(ownerPath, "utf8");
-    } catch {
-      try {
-        lockModifiedAt = fs.statSync(this.#lockPath).mtimeMs;
-      } catch {
-        return false;
-      }
-    }
-    if (owner !== undefined) {
-      const [, pidText, createdText, identityLine] = owner.trim().split("\n");
-      const createdAt = Number(createdText);
-      if (Number.isFinite(createdAt) && Date.now() - createdAt <= this.#staleLockMs) return false;
-      // Unknown (another PID namespace within the hold ceiling) is not death.
-      if (lockOwnerLiveness(Number(pidText), createdAt, identityLine, {
-        legacyAlive: processAlive,
-        maxHoldMs: Math.max(SHORT_LOCK_MAX_HOLD_MS, this.#staleLockMs),
-      }) !== "dead") return false;
-      try {
-        if (fs.readFileSync(ownerPath, "utf8") !== owner) return false;
-        fs.rmSync(this.#lockPath, { recursive: true, force: true });
-        return true;
-      } catch {
-        return false;
-      }
-    }
-    if (lockModifiedAt === undefined || Date.now() - lockModifiedAt <= this.#staleLockMs) {
-      return false;
-    }
-    try {
-      if (fs.statSync(this.#lockPath).mtimeMs !== lockModifiedAt) return false;
-      fs.rmSync(this.#lockPath, { recursive: true, force: true });
-      return true;
-    } catch {
-      return false;
-    }
+  // A lock without a usable owner (missing, empty or partial owner file) is
+  // judged only by the lock directory's age: its owner may be mid-acquire.
+  // Otherwise a lock is removed when its owner is dead past the stale window,
+  // provably dead within it (same host, PID namespace and boot, and the pid is
+  // gone or reused), or older than the short-lock hold ceiling, which only a
+  // leaked lock reaches. Removal is a rename claim that re-verifies the owner.
+  #clearStaleLock(): boolean {
+    return reapStaleShortLock(this.#lockPath, {
+      staleMs: this.#staleLockMs,
+      legacyAlive: processAlive,
+    });
   }
 
   #readGeneration(): number {
@@ -1084,6 +1060,22 @@ export class MeshStore {
     };
   }
 
+  #appendEventLine(line: string): void {
+    if (!this.durable) {
+      fs.appendFileSync(this.#eventsPath, line, { encoding: "utf8", mode: 0o600 });
+      return;
+    }
+    const descriptor = fs.openSync(this.#eventsPath, "a", 0o600);
+    try {
+      fs.writeFileSync(descriptor, line, "utf8");
+      fs.fsyncSync(descriptor);
+    } finally {
+      fs.closeSync(descriptor);
+    }
+    // Existence is not a durability barrier (including after an earlier failure).
+    fsyncDirectory(this.root);
+  }
+
   #compactEventLog(): void {
     let descriptor: number | undefined;
     try {
@@ -1106,12 +1098,23 @@ export class MeshStore {
       const temporaryPath =
         this.#eventsPath + "." + process.pid + "." + randomUUID() + ".tmp";
       try {
-        fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
+        if (this.durable) {
+          const temporary = fs.openSync(temporaryPath, "wx", 0o600);
+          try {
+            fs.writeFileSync(temporary, retained);
+            fs.fsyncSync(temporary);
+          } finally {
+            fs.closeSync(temporary);
+          }
+        } else {
+          fs.writeFileSync(temporaryPath, retained, { mode: 0o600 });
+        }
         fs.renameSync(temporaryPath, this.#eventsPath);
+        if (this.durable) fsyncDirectory(this.root);
       } finally {
         try { fs.rmSync(temporaryPath, { force: true }); } catch {}
       }
-      atomicWrite(this.#generationPath, this.#readGeneration() + 1);
+      atomicWrite(this.#generationPath, this.#readGeneration() + 1, Number.POSITIVE_INFINITY, this.durable);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     } finally {
@@ -1133,6 +1136,7 @@ export class MeshStore {
       fs.readSync(descriptor, tail, 0, readBytes, size - readBytes);
       const newline = tail.lastIndexOf(0x0a);
       fs.ftruncateSync(descriptor, newline >= 0 ? size - readBytes + newline + 1 : 0);
+      if (this.durable) fs.fsyncSync(descriptor);
     } catch (error) {
       if (errorCode(error) !== "ENOENT") throw error;
     } finally {

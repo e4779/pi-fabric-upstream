@@ -5,7 +5,7 @@ import type {
   ToolResultEvent,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { readFabricExecutionTraceV1 } from "../audit/index.js";
+import { readFabricExecutionTraceV1 } from "../audit/trace-schema.js";
 import { FABRIC_NESTED_TOOL_CALL_ID_PREFIX as NESTED_TOOL_CALL_ID_PREFIX } from "../protocol.js";
 import type {
   FabricToolPlacement,

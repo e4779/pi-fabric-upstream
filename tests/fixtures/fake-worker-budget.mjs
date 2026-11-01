@@ -11,6 +11,8 @@ const taskFile = args.get("task-file");
 const task = fs.readFileSync(taskFile, "utf8");
 const match = task.match(/COST ([\d.]+)/);
 const cost = match ? Number(match[1]) : 0;
+const delay = task.match(/DELAY (\d+)/);
+if (delay) await new Promise((resolve) => setTimeout(resolve, Number(delay[1])));
 const now = Date.now();
 const record = {
   id: args.get("id"),

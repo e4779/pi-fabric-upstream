@@ -59,6 +59,27 @@ describe("extensionToolRosterGuidance", () => {
     }
   });
 
+  it("names tools from one package by its manifest when they live in different subfolders", () => {
+    const root = mkdtempSync(path.join(tmpdir(), "fabric-roster-"));
+    try {
+      const pkgDir = path.join(root, "pi-split-ext");
+      mkdirSync(path.join(pkgDir, "dist", "tools"), { recursive: true });
+      writeFileSync(path.join(pkgDir, "package.json"), JSON.stringify({ name: "pi-split-ext" }));
+      // alpha sorts first, so its walk passes through dist/ before beta's walk starts there.
+      const tools = [
+        entry("beta_tool", { path: path.join(pkgDir, "dist", "beta.js") }),
+        entry("alpha_tool", { path: path.join(pkgDir, "dist", "tools", "alpha.js") }),
+      ];
+      const first = extensionToolRosterGuidance(tools, new Set());
+      const second = extensionToolRosterGuidance(tools, new Set());
+      expect(first).toContain("- pi-split-ext: alpha_tool, beta_tool");
+      expect(second).toContain("- pi-split-ext: alpha_tool, beta_tool");
+      expect(second).toBe(first);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("strips npm: prefixes without touching the filesystem", () => {
     const roster = extensionToolRosterGuidance(
       [entry("tool_two", { source: "npm:@scope/pi-npm-ext", path: "/nonexistent/nowhere/index.js" })],

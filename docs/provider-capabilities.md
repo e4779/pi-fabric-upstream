@@ -35,7 +35,7 @@ Preparation outputs are snapshotted before validation. Approval, tracing and
 speculation callbacks receive separate copies, so they cannot change the owned
 validated payload. Shared backing memory is refused, including buffers hidden
 inside maps, typed views, and native WebAssembly memory. This is a tested host
-adapter contract, not a Bend proof of JavaScript cloning or schema validation.
+adapter contract, not a proof of JavaScript cloning or schema validation.
 
 Tickets are one-use. This is not distributed exactly-once execution or an
 idempotency guarantee for independently retried calls. Arguments must be
@@ -124,24 +124,25 @@ until a valid snapshot is restored. Complete concatenated snapshots retain their
 existing newest-complete-snapshot recovery behavior. Invalid, missing, regressed
 relative to retained history, or exhausted clocks fail closed on mutation.
 
-Revisions use radix-`2^32` limbs, keeping arithmetic inside Bend's immediate-Nat
-domain while representing every nonnegative JS-safe integer. The JSON/UTF-16
-codec, faithful slot observation, history preservation, cooperative lock, atomic
+Revisions are naturals below `2^53`, the bound the compiled gdp-wired runtime
+enforces, so every nonnegative JS-safe integer is representable without limbs.
+The JSON codec, injective string interning, faithful slot observation, history preservation, cooperative lock, atomic
 rename and cache publication remain host assumptions. These plans do not prove
 crash durability, multi-write state transactions or schema filesystem rollback.
 
 ## Verification boundary
 
-Seven laws cover the executable provider wrapper: `provider_plan_safe`,
-`provider_ticket_consumed`, `provider_replay_refused`,
+Eight laws cover the executable provider ticket machine (`proofs/provider.ts`):
+`provider_plan_safe`, `provider_ticket_consumed`, `provider_replay_refused`,
 `provider_revocation_consumes`, `provider_revoked_refused`,
-`provider_canceled_refused`, and `provider_admission_complete`. They use shared
-full-text plan specifications. The proof forwards a payload-slot identifier,
-not a formal representation of arbitrary JavaScript arguments or provider code.
+`provider_canceled_refused`, `state_stale_refused`, and
+`provider_admission_complete`. Keys, revisions and payload slots are interned
+names compared by identity. The proof forwards a payload-slot identifier, not a
+formal representation of arbitrary JavaScript arguments or provider code.
 
 | Guarantee | Evidence | Boundary |
 | --- | --- | --- |
-| Exact, one-use dispatch plans | Executable laws, pinned generation and artifact receipt, ABI tests and negative mutations | Compiler, codec, and interpreter remain trusted |
+| Exact, one-use dispatch plans | Executable gdp-wired laws, pinned generation and artifact receipt, codec tests and refused broken variants | gdp-wired kernel and compiler, interning codec, and interpreter remain trusted |
 | All registry action routes use the gate | Ordinary/scoped/speculative/replay integration tests and bundled smoke | Direct native calls bypass the registry |
 | Exact authority attenuation/use/release | Executable subset, membership, positive acceptance and release laws; forged/cross-registry/retained-generation tests | JS issuer ownership, tuple codec, hashing and parent-abort delivery remain trusted |
 | Binding lifecycle transitions | Executable admission, count-preservation, exact release and close-reservation laws; real-promise and finalizer tests | Host event delivery, private maps and correspondence to provider-owned work remain trusted |
@@ -152,7 +153,7 @@ not a formal representation of arbitrary JavaScript arguments or provider code.
 | Packaging and lazy loading | Artifact checks, stable lazy entry, cold-import and first-use tests | Supported-platform CI and independent review remain necessary |
 
 The host issuer, descriptor truthfulness, hash collision resistance, UUID
-uniqueness, UTF-16/ABI codec, private-slot fidelity, interpreter, lifecycle event
+uniqueness, string interning codec, private-slot fidelity, interpreter, lifecycle event
 observation, approval hooks, metadata/preparation hooks, compiler and JavaScript
 runtime are trusted assumptions. Metadata hooks are not proved effect-free.
 Compiler checking does not replace independent specification or adapter review.
@@ -170,7 +171,7 @@ and their precise host assumptions.
 ### Principal and scope
 
 The host-issued [principal and scope](providers.md#principal-and-scope) is trusted
-host adapter code in `src/scope.ts`. No Bend kernel checks it. Grammar parsing,
+host adapter code in `src/scope.ts`. No verified kernel checks it. Grammar parsing,
 digest canonicalization, issuance sealing, registry injection, child derivation and
 cache keying are tested JavaScript. Capability views and scopes are independent: a
 view limits which actions a caller can dispatch, and a scope tells providers which
@@ -208,8 +209,8 @@ bun run benchmark:provider-dispatch
 bun run benchmark:startup . ../pi-fovea ../pi-contour
 ```
 
-The contributor toolchain pins Bend 2.0.37. `BEND_BIN` can select a trusted
-compiler executable. Normal builds verify artifact hashes without Bend.
+`gdp-wired` is pinned as an exact devDependency. Normal builds verify artifact
+hashes without loading the prover.
 
 The dispatch benchmark measures first use and warm full-registry read calls
 without provider I/O. Each dispatch observes its descriptor again; measure real

@@ -25,8 +25,7 @@ if (process.argv[2] === "--child") {
   const { loadExtensionFromFactory, createExtensionRuntime } = await import(pathToFileURL(resolve(dirname(hostEntry), "core/extensions/loader.js")).href);
   const { createEventBus } = await import(pathToFileURL(resolve(dirname(hostEntry), "core/event-bus.js")).href);
   const jiti = createJiti(import.meta.url, { moduleCache: false, tryNative: false, virtualModules });
-  // Every manifest entry, in order, sharing one bus and runtime as Pi loads them
-  // (bundled Pi packages such as ./node_modules/pi-coralbricks-provider included).
+  // Every manifest entry, in order, sharing one bus and runtime as Pi loads them.
   const eventBus = createEventBus();
   const runtime = createExtensionRuntime();
   const entries = [];

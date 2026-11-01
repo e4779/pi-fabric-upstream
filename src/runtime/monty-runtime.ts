@@ -89,7 +89,9 @@ export class MontyRuntime implements FabricKernelRuntime {
     const abort = (): void => stop("aborted");
     const scheduleDeadline = (): void => {
       if (timer) clearTimeout(timer);
-      if (stopped || !Number.isFinite(deadlineAt)) return;
+      if (stopped) return;
+      options.onDeadline?.(Number.isFinite(deadlineAt) ? deadlineAt : undefined);
+      if (!Number.isFinite(deadlineAt)) return;
       timer = setTimeout(() => {
         if (Date.now() < deadlineAt) scheduleDeadline();
         else stop("timed_out");
@@ -101,6 +103,7 @@ export class MontyRuntime implements FabricKernelRuntime {
       suspend: () => {
         if (timer) clearTimeout(timer);
         deadlineAt = Infinity;
+        options.onDeadline?.(undefined);
       },
       resume: (remainingMs) => {
         deadlineAt = Date.now() + remainingMs;
@@ -161,7 +164,7 @@ export class MontyRuntime implements FabricKernelRuntime {
         }
         const waitsForHuman = options.isHumanWaitHostCall?.(ref, args) === true;
         if (waitsForHuman) humanWait.enter();
-        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal));
+        const task = runAbortable(hostAbort.signal, () => hostCall(ref, args, hostAbort.signal, (wait) => humanWait.run(wait)));
         tasks.add(task);
         try { return montyInput(normalizeMontyValue(await task, true)); }
         catch (error) {
@@ -176,7 +179,7 @@ export class MontyRuntime implements FabricKernelRuntime {
       class PayloadValues {}
       const attributes = new PayloadValues();
       for (const [key, value] of Object.entries(strings)) Object.defineProperty(attributes, key, { value, enumerable: true });
-      const bindings = montyBindings(native, dispatch);
+      const bindings = montyBindings(native, dispatch, options.providerGlobals);
       bindings.payloads = montyInput(strings);
       bindings.π = new native.ClassInstance(attributes, { name: "FabricPayloads", eagerAttrs: Object.keys(strings) });
       // Bootstrap separately so user traceback offsets remain exactly one wrapper line.

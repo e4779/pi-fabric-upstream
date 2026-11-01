@@ -320,7 +320,7 @@ describe("expensive skill program behavior", () => {
     await expect(runSkill("fabric-council", {
       π: { task: "decide", roles: JSON.stringify(["a", "b"]) }, workflow, phase, parallel,
       agent: async () => { calls += 1; return "unexpected"; },
-    })).rejects.toThrow("3–5 distinct");
+    })).rejects.toThrow("3–8 distinct");
     expect(calls).toBe(0);
 
     const result = await runSkill("fabric-council", {
@@ -334,6 +334,82 @@ describe("expensive skill program behavior", () => {
     expect(result).toMatchObject({ status: "partial", result: "a report" });
     expect(result).not.toHaveProperty("fallback");
     expect(calls).toBe(3);
+  });
+
+  it("pins each Council seat and the synthesis to exact registry keys and reports them", async () => {
+    const calls: Array<{ label: string; model: string | undefined; thinking: string | undefined }> = [];
+    const result = await runSkill("fabric-council", {
+      π: {
+        task: "decide",
+        roles: JSON.stringify([
+          { role: "architect", model: "P/One", thinking: "high" },
+          "researcher",
+          { role: "adversary", model: "p/two" },
+        ]),
+        synthesis: "p/three",
+      },
+      workflow, phase, parallel,
+      tools: { models: async () => [{ key: "p/one" }, { key: "p/two" }, { key: "p/three" }] },
+      agent: async (_prompt: string, options: { label: string; model?: string; thinking?: string }) => {
+        calls.push({ label: options.label, model: options.model, thinking: options.thinking });
+        return options.label === "council synthesis" ? "decision" : `${options.label} report`;
+      },
+    });
+
+    expect(calls).toEqual([
+      { label: "architect", model: "p/one", thinking: "high" },
+      { label: "researcher", model: undefined, thinking: undefined },
+      { label: "adversary", model: "p/two", thinking: undefined },
+      { label: "council synthesis", model: "p/three", thinking: undefined },
+    ]);
+    expect(result).toMatchObject({
+      status: "success",
+      result: "decision",
+      synthesisModel: "p/three",
+      seats: [
+        { role: "architect", model: "p/one", thinking: "high", status: "completed" },
+        { role: "researcher", status: "completed" },
+        { role: "adversary", model: "p/two", status: "completed" },
+      ],
+    });
+    expect((result.seats as Array<Record<string, unknown>>)[1]).not.toHaveProperty("model");
+  });
+
+  it("rejects unknown Council models and malformed seats before any agent runs", async () => {
+    let calls = 0;
+    const run = (roles: unknown[], synthesis = "") => runSkill("fabric-council", {
+      π: { task: "decide", roles: JSON.stringify(roles), synthesis },
+      workflow, phase, parallel,
+      tools: { models: async () => [{ key: "p/two" }, { key: "q/two" }] },
+      agent: async () => { calls += 1; return "unexpected"; },
+    });
+
+    await expect(run([{ role: "a", model: "x/two" }, "b", "c"]))
+      .rejects.toThrow('model "x/two" for role "a" is not in the model registry. Did you mean: p/two, q/two?');
+    await expect(run(["a", "b", "c"], "nope/model"))
+      .rejects.toThrow('model "nope/model" for synthesis is not in the model registry.');
+    await expect(run([{ role: "a", thinking: "extreme" }, "b", "c"]))
+      .rejects.toThrow('Council role "a" has unknown thinking "extreme".');
+    await expect(run([{ model: "p/two" }, "b", "c"]))
+      .rejects.toThrow("A council role object needs a non-empty role.");
+    await expect(run([{ role: "a", model: 42 }, "b", "c"]))
+      .rejects.toThrow('Council role "a" has a non-string model or thinking.');
+    await expect(run([{ role: "a", model: "p/two" }, { role: "a" }, "b", "c"]))
+      .rejects.toThrow('Council role "a" appears twice with different settings.');
+    await expect(run(["a", "b", "c", "d", "e", "f", "g", "h", "i"])).rejects.toThrow("3–8 distinct");
+    expect(calls).toBe(0);
+  });
+
+  it("runs a six-seat Council", async () => {
+    const labels: string[] = [];
+    const result = await runSkill("fabric-council", {
+      π: { task: "decide", roles: JSON.stringify(["a", "b", "c", "d", "e", "f"]), synthesis: "" },
+      workflow, phase, parallel,
+      agent: async (_prompt: string, options: { label: string }) => { labels.push(options.label); return "ok"; },
+    });
+
+    expect(result).toMatchObject({ status: "success", coverage: { requested: 6, completed: 6 } });
+    expect(labels).toHaveLength(7);
   });
 
   it("returns Fusion responses only when judging fails", async () => {

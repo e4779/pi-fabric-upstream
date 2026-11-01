@@ -135,7 +135,7 @@ describe("participant latest-history action", () => {
     } finally { f.view.dispose(); f.state.clear(); }
   });
 
-  it("does not activate from a selection drag and recomputes bounds after resize/picker", () => {
+  it("does not activate from a selection drag and recomputes bounds after resize/follow", () => {
     const f = fixture();
     try {
       f.frame(); f.view.handleInput("\x1b[5~");
@@ -154,7 +154,9 @@ describe("participant latest-history action", () => {
       f.view.handleMouse(mouse("press", 1, row));
       expect(f.loadLatest).toHaveBeenCalledTimes(1);
       f.view.handleInput("\x1b[5~"); f.frame();
-      f.view.handleInput("\x0e");
+      // Paging back to the bottom follows again and retires the stale hitbox.
+      f.view.handleInput("\x1b[6~");
+      expect(f.state.view("child").following).toBe(true);
       expect(f.frame().join("\n")).not.toContain("↓ Jump");
       f.view.handleMouse(mouse("press", 1, row));
       expect(f.loadLatest).toHaveBeenCalledTimes(1);

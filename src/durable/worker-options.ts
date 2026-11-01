@@ -9,16 +9,19 @@ export interface DurableWorkerOptions {
   provider?: string;
   thinking?: ThinkingLevel;
   tools?: string[];
+  excludeTools?: string[];
   noTools?: "all";
   extensions: string[];
   noExtensions: boolean;
+  noSkills: boolean;
+  skills: string[];
   appendSystemPrompt: string;
 }
 
 /** Internal worker protocol, deliberately not a second general-purpose Pi CLI. */
 export function parseDurableWorkerOptions(argv: readonly string[], cwd = process.cwd()): DurableWorkerOptions {
   const options: DurableWorkerOptions = {
-    directory: "", runId: "", extensions: [], noExtensions: false, appendSystemPrompt: "",
+    directory: "", runId: "", extensions: [], noExtensions: false, noSkills: false, skills: [], appendSystemPrompt: "",
   };
   const prompts: string[] = [];
   for (let i = 0; i < argv.length; i++) {
@@ -26,7 +29,8 @@ export function parseDurableWorkerOptions(argv: readonly string[], cwd = process
     if (flag === "--no-session") continue;
     if (flag === "--no-extensions") { options.noExtensions = true; continue; }
     if (flag === "--no-tools") { options.noTools = "all"; continue; }
-    if (!["--mode", "--durable-directory", "--durable-run-id", "--session", "--model", "--provider", "--thinking", "--tools", "-e", "--extension", "--append-system-prompt"].includes(flag)) {
+    if (flag === "--no-skills") { options.noSkills = true; continue; }
+    if (!["--mode", "--durable-directory", "--durable-run-id", "--session", "--model", "--provider", "--thinking", "--tools", "--exclude-tools", "-e", "--extension", "--skill", "--append-system-prompt"].includes(flag)) {
       throw new Error(`Unsupported durable worker option: ${flag}`);
     }
     const value = argv[++i];
@@ -43,7 +47,9 @@ export function parseDurableWorkerOptions(argv: readonly string[], cwd = process
         options.thinking = value as ThinkingLevel;
         break;
       case "--tools": options.tools = value.split(",").map(tool => tool.trim()).filter(Boolean); break;
+      case "--exclude-tools": options.excludeTools = value.split(",").map(tool => tool.trim()).filter(Boolean); break;
       case "-e": case "--extension": options.extensions.push(value.startsWith("builtin:") ? value : path.resolve(cwd, value)); break;
+      case "--skill": options.skills.push(path.resolve(cwd, value)); break;
       case "--append-system-prompt": prompts.push(value); break;
     }
   }

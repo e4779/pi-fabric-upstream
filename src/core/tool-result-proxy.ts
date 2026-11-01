@@ -48,6 +48,16 @@ const valueFromContent = (content: ToolContent): unknown => {
   return { content };
 };
 
+// A cut-off projection keeps a real prefix of the original text, at least
+// half of what it returns, and drops the rest. A placeholder shares little or
+// nothing with the original, so it never counts as one.
+const isCutOff = (patched: string, original: string): boolean => {
+  const limit = Math.min(patched.length, original.length);
+  let shared = 0;
+  while (shared < limit && patched.charCodeAt(shared) === original.charCodeAt(shared)) shared++;
+  return shared < original.length && shared * 2 >= patched.length;
+};
+
 export class FabricToolResultProxy implements FabricNestedToolResultProxy {
   constructor(readonly runner: () => ExtensionRunner | undefined) {}
 
@@ -89,7 +99,26 @@ export class FabricToolResultProxy implements FabricNestedToolResultProxy {
     ) {
       return patchedDetails.result;
     }
-    if (patchedContent !== content) return valueFromContent(patchedContent);
-    return request.value;
+    if (patchedContent === content) return request.value;
+    // A content-only patch replaces a string result.
+    if (typeof request.value === "string") return valueFromContent(patchedContent);
+    // A structured value keeps its shape only when the patch shows it kept
+    // the value. Text that still parses as JSON is a redaction or rewrite that
+    // kept the shape, so the program receives the parsed value. A generic
+    // output cap keeps the start of the JSON projection and cuts the rest;
+    // applying that text would hand the program a truncated string where it
+    // expects an array or object, so the original stays and
+    // `maxNestedResultChars` still bounds it. Anything else, such as a
+    // placeholder that hides the value, replaces it as before: middleware
+    // that hides a result must not fail open.
+    if (!patchedContent.every((part) => part.type === "text")) return valueFromContent(patchedContent);
+    const patchedText = textFromContent(patchedContent);
+    const originalText = textForValue(request.value);
+    if (patchedText === originalText) return request.value;
+    try {
+      return JSON.parse(patchedText) as unknown;
+    } catch {
+      return isCutOff(patchedText, originalText) ? request.value : patchedText;
+    }
   }
 }

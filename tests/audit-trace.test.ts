@@ -259,8 +259,9 @@ return true;
       outcome: "failed",
       failureStage: "invoke",
     });
-    expect(modelsResult.success).toBe(true);
-    expect(modelsResult.value).toEqual([]);
+    // A registry failure surfaces to the program instead of an empty list.
+    expect(modelsResult.success).toBe(false);
+    expect(modelsResult.error).toContain("models-failure-secret");
     expect(modelsResult.trace.operations[0]).toMatchObject({
       ref: "fabric.discovery.models",
       outcome: "failed",
@@ -582,7 +583,7 @@ return true;
       stage: "validate",
       // TypeBox messages describe only schema expectations and never echo
       // argument values, so they are safe to surface.
-      expectedError: "Call failed during validate: Invalid arguments for demo.echo: must be string",
+      expectedError: "Call failed during validate: Invalid arguments for demo.echo: /value: must be string",
     },
     {
       name: "provider invocation",
@@ -1096,6 +1097,12 @@ return true;
       Array(8).fill({ id: "actor-reviewer" }),
     );
     expect(JSON.stringify(trace)).not.toContain("secret");
+  });
+
+  it("reads old and malformed omitted-call summaries safely", () => {
+    expect(readFabricExecutionRenderDetails({ omittedCalls: { count: 3, done: 2 } }).omittedCalls).toEqual({ count: 3, done: 2 });
+    expect(readFabricExecutionRenderDetails({ omittedCalls: { count: 3, done: 2, failed: 99 } }).omittedCalls).toEqual({ count: 3, done: 2, failed: 2 });
+    expect(readFabricExecutionRenderDetails({ omittedCalls: { count: 3, done: 2, failed: -1 } }).omittedCalls).toEqual({ count: 3, done: 2 });
   });
 
   it("persists bounded mixed-output highlighting metadata", () => {

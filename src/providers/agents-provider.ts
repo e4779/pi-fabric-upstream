@@ -21,6 +21,7 @@ import {
   type ProviderParticipantRegistry,
 } from "../topology/provider-participants.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
+import type { SlashCommandInfo } from "@earendil-works/pi-coding-agent";
 import {
   DEFAULT_LIFECYCLE_COALESCE_MS,
   LifecycleDeliveryScheduler,
@@ -74,12 +75,16 @@ import {
 import {
   FUZZY_RESOLUTION_MARKERS,
   aliasThinking,
-  resolveAvailablePiModel,
+  assertExactModelRequest,
+  resolvePiModelSelector,
   resolveFabricModel,
   type FabricModelCandidate,
+  type FabricModelMatch,
 } from "../core/model-resolution.js";
 import { loadModelUsage } from "../core/model-usage.js";
+import { resolveAgentDir } from "../core/agent-dir.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "./agents-actions.js";
+import { FabricTraceSafeError } from "../audit/trace.js";
 import { actionArgNormalizer } from "./arg-normalization.js";
 import { isFabricThinking } from "../thinking.js";
 import { normalizeAgentRunRequest } from "../agents/request.js";
@@ -109,7 +114,7 @@ const displaySafeCwd = (cwd: string): string => {
 };
 
 const agentStartedMessage = (handle: AgentHandleInfo): string =>
-  `Agent ${handle.name} started via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}`;
+  `Agent ${handle.name} ${handle.status === "queued" ? "queued for a slot" : "started"} via ${handle.runner}/${handle.transport}${handle.attachCommand ? ` · ${handle.attachCommand}` : ""} · cwd ${displaySafeCwd(handle.cwd)}`;
 
 // Resolve source and executor reasoning channels for the trajectory handoff
 // boundary. The executor model must be registered to transfer at all; an
@@ -177,6 +182,21 @@ const longerTimeoutOverride = (
 const checkedRunner = (value: unknown, fallback: FabricAgentRunner): FabricAgentRunner => {
   if (value === undefined) return fallback;
   if (!isFabricRunnerId(value)) throw new Error(`Invalid Fabric agent runner: ${JSON.stringify(value)}`);
+  return value;
+};
+
+const MAX_MODEL_KEY_CHARS = 256;
+const MODEL_KEY_RULE =
+  `model must be a string of 1 to ${MAX_MODEL_KEY_CHARS} characters (an exact key from agents.models())`;
+
+// Count code points, as the schema's minLength/maxLength do, not UTF-16 units.
+const isModelKey = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && [...value].length <= MAX_MODEL_KEY_CHARS;
+
+/** agents.models({ model }): an exact, untrimmed key; undefined means the unfiltered list. */
+const checkedModelKey = (value: unknown): string | undefined => {
+  if (value === undefined) return undefined;
+  if (!isModelKey(value)) throw new Error(`agents.models ${MODEL_KEY_RULE}`);
   return value;
 };
 
@@ -352,12 +372,33 @@ const actorRequest = (
 // lexicon; no agents-specific table remains.
 export const normalizeAgentsArgs = actionArgNormalizer(() => AGENTS_ACTION_DESCRIPTORS);
 
+/** True when a null argument is model or a spelling the normalizer repairs to model. */
+const nullModelSpelling = (args: Record<string, unknown>): boolean =>
+  Object.entries(args).some(
+    ([key, value]) => value === null && "model" in normalizeAgentsArgs("models", { [key]: "" }),
+  );
+
+/**
+ * Refuse an invalid agents.models model while preparing it. Normalization both
+ * here and after preparation deletes a null optional field, which would turn
+ * the lookup into the full list, so the schema check cannot be relied on.
+ */
+const refuseInvalidModelsModel = (
+  args: Record<string, unknown>,
+  prepared: Record<string, unknown>,
+): void => {
+  const invalid = prepared.model === undefined ? nullModelSpelling(args) : !isModelKey(prepared.model);
+  if (invalid) throw new FabricTraceSafeError(`Invalid arguments for agents.models: ${MODEL_KEY_RULE}`);
+};
+
 export class AgentsProvider implements FabricProvider {
   readonly #transcripts = new AgentTranscriptReader();
   readonly #router: AgentMessageRouter;
   readonly name = "agents";
   /** Session registry of `provider:` participants; stop/steer/followUp route there. */
   providerParticipants: ProviderParticipantRegistry | undefined;
+  /** This session's commands (pi.getCommands()); the `skills` option resolves against its skills. */
+  sessionCommands: (() => readonly SlashCommandInfo[]) | undefined;
   readonly description =
     "The user-facing Main target, one-shot Pi or Claude Code agents, and persistent mailbox actors over process, tmux, screen, LocalTerm, or Herdr";
 
@@ -429,23 +470,62 @@ export class AgentsProvider implements FabricProvider {
   #resolvePiModel(
     model: string,
     context: FabricInvocationContext,
+    modelMatch?: FabricModelMatch,
   ): string {
     let available: FabricModelCandidate[] = [];
+    let registryError: unknown;
     try {
       available = context.extensionContext.modelRegistry.getAvailable().map((candidate) => ({
         provider: String(candidate.provider),
         id: String(candidate.id),
         ...(typeof candidate.name === "string" ? { name: candidate.name } : {}),
       }));
-    } catch {
-      // The authoritative visible set is empty when registry discovery fails.
+    } catch (error) {
+      // The authoritative visible set is empty when registry discovery fails;
+      // the resolution error names the registry failure.
+      registryError = error;
     }
-    const resolved = resolveAvailablePiModel(model, {
+    const resolved = resolvePiModelSelector(model, {
       aliases: this.modelsConfig().aliases,
       available,
       lastUsed: loadModelUsage(),
-    });
+      ...(registryError === undefined ? {} : { registryError }),
+    }, modelMatch);
     return `${resolved.provider}/${resolved.id}`;
+  }
+
+  /** Roots for named agent files. Project files load only for a project the host trusts. */
+  #agentFileRoots(context: FabricInvocationContext) {
+    const trusted = context.extensionContext?.isProjectTrusted;
+    return {
+      agentDir: resolveAgentDir(),
+      projectRoot: this.manager.projectRoot,
+      projectTrusted: typeof trusted === "function" && trusted.call(context.extensionContext) === true,
+    };
+  }
+
+  /**
+   * Resolve args.agent into the request before anything else reads it, so model aliases,
+   * runner checks and the durable-spawn refusal all see the file's values. The loader is
+   * imported here, at first use; a call without agent never touches it.
+   */
+  async #applyAgentFile(
+    args: Record<string, unknown>,
+    context: FabricInvocationContext,
+    residency?: unknown,
+  ): Promise<Record<string, unknown>> {
+    if (args.agent === undefined) return args;
+    const { resolveAgentFile, applyAgentDefinition } = await import("../agents/agent-files.js");
+    const definition = resolveAgentFile(String(args.agent), this.#agentFileRoots(context));
+    if (residency === "durable" && definition.request.systemPrompt !== undefined && args.systemPrompt === undefined) {
+      throw new Error(
+        `Agent "${definition.name}" (${definition.path}) has instructions, which a durable agents.spawn does not accept. Spawn without residency: "durable" or remove the file body.`,
+      );
+    }
+    if (definition.warnings.length > 0) {
+      context.update(`Agent "${definition.name}" (${definition.path}): ${definition.warnings.join("; ")}`);
+    }
+    return applyAgentDefinition(args, definition);
   }
 
   #resolvePiModelArgs(
@@ -454,8 +534,14 @@ export class AgentsProvider implements FabricProvider {
     runnerOverride?: FabricAgentRunner,
   ): Record<string, unknown> {
     const runner = runnerOverride ?? checkedRunner(args.runner, this.manager.config.runner);
+    // Exact matching is checked before the non-Pi early return so it can never be skipped silently.
+    assertExactModelRequest({ modelMatch: args.modelMatch, runner, model: args.model });
     if (runner !== "pi" && runner !== "pi-durable") return args;
     const model = typeof args.model === "string" ? args.model.trim() : "";
+    if (args.modelMatch === "exact") {
+      // No alias, closest or fuzzy step, and no alias thinking level.
+      return { ...args, model: this.#resolvePiModel(model, context, "exact") };
+    }
     if (!model) return args;
     const thinking = isFabricThinking(args.thinking)
       ? args.thinking
@@ -500,7 +586,9 @@ export class AgentsProvider implements FabricProvider {
     actionName: string,
     args: Record<string, unknown>,
   ): Record<string, unknown> {
-    return normalizeAgentsArgs(actionName, args);
+    const prepared = normalizeAgentsArgs(actionName, args);
+    if (actionName === "models") refuseInvalidModelsModel(args, prepared);
+    return prepared;
   }
 
   async handoff(
@@ -605,10 +693,15 @@ export class AgentsProvider implements FabricProvider {
   ): Promise<unknown> {
     switch (actionName) {
       case "run": {
+        const runArgs = await this.#applyAgentFile(args, context);
         const handle = await this.manager.spawn(
-          this.#applySeed(
-            args,
-            runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
+          await this.#applyChildSkills(
+            runArgs,
+            this.#applySeed(
+              runArgs,
+              runRequest(this.#resolvePiModelArgs(runArgs, context), context, this.manager, this.modelsConfig()),
+              context,
+            ),
             context,
           ),
           context.signal,
@@ -632,11 +725,19 @@ export class AgentsProvider implements FabricProvider {
       case "handoff":
         return this.handoff(args, context);
       case "spawn": {
-        const request = this.#applySeed(
-          args,
-          runRequest(this.#resolvePiModelArgs(args, context), context, this.manager, this.modelsConfig()),
+        const spawnArgs = await this.#applyAgentFile(args, context, args.residency);
+        const request = await this.#applyChildSkills(
+          spawnArgs,
+          this.#applySeed(
+            spawnArgs,
+            runRequest(this.#resolvePiModelArgs(spawnArgs, context), context, this.manager, this.modelsConfig()),
+            context,
+          ),
           context,
         );
+        if (request.residency === "durable" && request.queue === true) {
+          throw new Error('queue: true is not supported with residency: "durable"');
+        }
         if (request.residency === "durable") this.#assertUnconfinedDurable();
         const kernel = this.manager.resolveKernel(request);
         const { kernel: _requestedKernel, ...requestWithScope } = request;
@@ -684,7 +785,18 @@ export class AgentsProvider implements FabricProvider {
           context.update(`Waiting for durable agent ${status.name}`);
           return this.residency.waitAgent(id, context.signal);
         }
-        const status = this.manager.status(id);
+        let status: ReturnType<AgentManager["status"]>;
+        try {
+          status = this.manager.status(id);
+        } catch (error) {
+          // A durable run another root session of this project spawned.
+          if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
+          if (!this.residency?.hasProjectAgent(id)) throw error;
+          const durable = this.residency.statusAgent(id);
+          context.activity?.({ type: "entity", id, kind: "agent", name: durable.name });
+          context.update(`Waiting for durable agent ${durable.name}`);
+          return this.residency.waitProjectAgent(id, context.signal);
+        }
         context.activity?.({ type: "entity", id, kind: "agent", name: status.name });
         return waitWithProgress(
           this.manager,
@@ -715,6 +827,8 @@ export class AgentsProvider implements FabricProvider {
           if (terminalAgentStatuses.has(result.status)) this.residency.acknowledgeCompletion(id);
           return result;
         }
+        // Another root session's run: read it, but leave its completion receipt to that session.
+        if (this.residency?.hasProjectAgent(id)) return this.residency.statusAgent(id);
         const known = this.participants.get(id);
         if (known && !known.local) return known;
         try {
@@ -753,6 +867,14 @@ export class AgentsProvider implements FabricProvider {
           this.participants.list({ scope: "project", kinds: ["root"] });
       case "peers":
         return this.participants.peers();
+      case "departed":
+        return this.participants.departed?.(
+          typeof args.limit === "number" ? { limit: args.limit } : {},
+        ) ?? [];
+      case "definitions": {
+        const { listAgentFiles } = await import("../agents/agent-files.js");
+        return listAgentFiles(this.#agentFileRoots(context), (notice) => context.update(notice));
+      }
       case "subscribe": {
         const events = Array.isArray(args.events)
           ? args.events.filter(isFabricLifecycleEventType)
@@ -790,11 +912,14 @@ export class AgentsProvider implements FabricProvider {
         return this.lifecycle.unsubscribe(String(args.id));
       case "models": {
         const runner = checkedRunner(args.runner, this.manager.config.runner);
+        const exactKey = checkedModelKey(args.model);
         const runnerAdapter = requireAgentRunner(runner);
+        const matching = <T extends { key: string }>(models: readonly T[]): T[] =>
+          exactKey === undefined ? [...models] : models.filter((model) => model.key === exactKey);
         if (!BUILT_IN_RUNNER_IDS.has(runner)) {
           // A registered runner discovers its own models; none means an advisory empty list.
           return runnerAdapter.models
-            ? [...await runnerAdapter.models({ cwd: this.manager.cwd, refresh: args.refresh === true })]
+            ? matching(await runnerAdapter.models({ cwd: this.manager.cwd, refresh: args.refresh === true }))
             : [];
         }
         if (runner === "veda") {
@@ -806,27 +931,25 @@ export class AgentsProvider implements FabricProvider {
         }
         if (runner === "claude") {
           const models = await this.manager.claudeModels(args.refresh === true);
-          return models.map((model) => ({
+          return matching(models.map((model) => ({
             runner: "claude",
             provider: "claude",
             id: model.value,
             name: model.displayName,
             key: `claude/${model.value}`,
             ...model,
-          }));
+          })));
         }
-        try {
-          const available = context.extensionContext.modelRegistry.getAvailable();
-          return available.map((model) => ({
-            runner,
-            provider: String(model.provider),
-            id: String(model.id),
-            name: String(model.name ?? model.id),
-            key: `${model.provider}/${model.id}`,
-          }));
-        } catch {
-          return [];
-        }
+        // A registry failure rejects: an empty list would read as "no models".
+        const available = context.extensionContext.modelRegistry.getAvailable();
+        return matching(available.map((model) => ({
+          runner,
+          provider: String(model.provider),
+          id: String(model.id),
+          name: String(model.name ?? model.id),
+          key: `${model.provider}/${model.id}`,
+        })));
+
       }
       case "switchModel": {
         const query = typeof args.model === "string" ? args.model.trim() : "";
@@ -843,8 +966,11 @@ export class AgentsProvider implements FabricProvider {
             id: String(model.id),
             ...(typeof model.name === "string" ? { name: model.name } : {}),
           }));
-        } catch {
-          available = [];
+        } catch (error) {
+          throw new Error(
+            `agents.switchModel could not read the model registry: ${error instanceof Error ? error.message : String(error)}`,
+            { cause: error },
+          );
         }
         if (available.length === 0) {
           throw new Error(
@@ -921,6 +1047,12 @@ export class AgentsProvider implements FabricProvider {
       }
       case "stop":
         return this.stopParticipant(String(args.id));
+      case "sleep":
+      case "wake": {
+        const id = String(args.id);
+        await (actionName === "sleep" ? this.manager.sleep(id) : this.manager.wake(id));
+        return { id, requested: actionName };
+      }
       case "cleanup": {
         const id = String(args.id);
         return this.residency?.hasAgent(id)
@@ -1175,7 +1307,14 @@ export class AgentsProvider implements FabricProvider {
             ...(before !== undefined ? { before } : {}),
           });
         }
-        return this.manager.readLog(id, { lines, ...(before !== undefined ? { before } : {}) });
+        try {
+          return this.manager.readLog(id, { lines, ...(before !== undefined ? { before } : {}) });
+        } catch (error) {
+          // A durable run another root session of this project spawned.
+          if (!(error instanceof Error && /Unknown Fabric agent/.test(error.message))) throw error;
+          if (!this.residency?.hasProjectAgent(id)) throw error;
+          return this.residency.readAgentLog(id, { lines, ...(before !== undefined ? { before } : {}) });
+        }
       }
       default:
         throw new Error(`Unknown agents action: ${actionName}`);
@@ -1274,6 +1413,29 @@ export class AgentsProvider implements FabricProvider {
   }
 
   /** seed: "branch" forks the caller's completed turns; "snippet" prefixes recent text. */
+  /**
+   * Resolve the `skills` option (from the call or an agent file) against this
+   * session's skills before anything starts. An unknown name fails here. The
+   * resolver is imported at first use; a call without skills never loads it.
+   */
+  async #applyChildSkills(
+    args: Record<string, unknown>,
+    request: AgentRunRequest,
+    context: FabricInvocationContext,
+  ): Promise<AgentRunRequest> {
+    if (args.skills === undefined) return request;
+    const { childSkillsSelection, resolveChildSkills, sessionSkills } = await import("../agents/child-skills.js");
+    const selection = childSkillsSelection(args.skills);
+    if (!selection) return request;
+    if (request.residency === "durable") {
+      throw new Error(
+        'A durable agents.spawn does not accept skills (an agent file\'s skills and context.skills count too). Spawn without residency: "durable" or leave skills out.',
+      );
+    }
+    const childSkills = resolveChildSkills(selection, sessionSkills(this.sessionCommands?.() ?? []), (message) => context.update(message));
+    return { ...request, childSkills };
+  }
+
   #applySeed(
     args: Record<string, unknown>,
     request: AgentRunRequest,

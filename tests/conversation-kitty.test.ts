@@ -23,7 +23,7 @@ beforeEach(() => {
 afterEach(() => { setCapabilities(capabilities); vi.restoreAllMocks(); });
 const header = (line: string) => Object.fromEntries(/\x1b_G([^;]*);/.exec(line)![1]!.split(",").map((part) => part.split("=")));
 
-describe("native tool images inside ctrl+shift+a", () => {
+describe("native tool images inside the participant conversation view", () => {
   for (const Renderer of [TuiMainScreen, TuiAltScreen]) for (const scrollbar of ["always", "auto", "hidden"] as const) {
     it(`scrolls, resizes, switches targets and restores Main (${Renderer.name}, ${scrollbar})`, () => {
       const terminal = new KittyTerminal();
@@ -110,12 +110,6 @@ describe("native tool images inside ctrl+shift+a", () => {
         tui.renderNow();
         expect(terminal.placements.size).toBe(0);
         entry.scroll = anchor;
-        tui.renderNow();
-        expect(terminal.placements).toEqual(new Set([id]));
-        terminal.input("\x0e");
-        tui.renderNow();
-        expect(terminal.placements.size).toBe(0);
-        terminal.input("\x1b");
         tui.renderNow();
         expect(terminal.placements).toEqual(new Set([id]));
         terminal.columns = 14;

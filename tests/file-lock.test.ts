@@ -2,6 +2,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { encodeOwnerIdentityLine } from "../src/core/atomic-write.js";
 import {
   FileLockTimeoutError, withExclusiveFileLock, withExclusiveFileLockAsync,
   type ExclusiveLockOptions,
@@ -46,6 +47,29 @@ describe.each(["sync", "async"] as const)("%s file-lock recovery", (mode) => {
     vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
     await expect(run(options, () => "recovered")).resolves.toBe("recovered");
     expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  const deadSignal = () => {
+    vi.spyOn(process, "kill").mockImplementation(() => { throw Object.assign(new Error("gone"), { code: "ESRCH" }); });
+  };
+
+  it("recovers a fresh lock at once when its local owner is provably dead", async () => {
+    const { lock, options } = setup(`token\n123456\n${Date.now()}\n${encodeOwnerIdentityLine()}\n`, false);
+    deadSignal();
+    await expect(run(options, () => "recovered")).resolves.toBe("recovered");
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it.each(["legacy", "foreign namespace"])("keeps a fresh %s lock with a dead pid", async (kind) => {
+    const own = JSON.parse(encodeOwnerIdentityLine()) as Record<string, unknown>;
+    const identityLine = kind === "legacy" ? "" : `${JSON.stringify({ ...own, pidNamespace: "pid:[1]" })}\n`;
+    const owner = `token\n123456\n${Date.now()}\n${identityLine}`;
+    const { lock, options } = setup(owner, false);
+    deadSignal();
+    const operation = vi.fn(() => "wrong");
+    await expect(run(options, operation)).rejects.toBeInstanceOf(FileLockTimeoutError);
+    expect(operation).not.toHaveBeenCalled();
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe(owner);
   });
 
   it.each([`${Date.now() - 60_000}`, "invalid"])("protects a live owner with timestamp %s", async (timestamp) => {
@@ -105,4 +129,46 @@ it("keeps the event loop responsive during contention and succeeds after release
   } finally {
     clearTimeout(pulse);
   }
+});
+
+describe.each(["sync", "async"] as const)("%s file-lock short-lock leaks (#323)", (mode) => {
+  const run = async (options: ExclusiveLockOptions, operation: () => string) =>
+    mode === "sync" ? withExclusiveFileLock(options, operation) : withExclusiveFileLockAsync(options, operation);
+
+  it("partial owner: publishes the owner file atomically, never empty at the lock path", async () => {
+    const { lock, options } = setup();
+    fs.rmSync(lock, { recursive: true });
+    const ownerPath = path.join(lock, "owner");
+    const writeFileSync = fs.writeFileSync;
+    const targets: string[] = [];
+    vi.spyOn(fs, "writeFileSync").mockImplementation(((file: fs.PathOrFileDescriptor, data: unknown, opts?: unknown) => {
+      targets.push(String(file));
+      if (String(file).startsWith(`${ownerPath}.`)) expect(fs.existsSync(ownerPath)).toBe(false);
+      return writeFileSync(file, data as string, opts as fs.WriteFileOptions);
+    }) as typeof fs.writeFileSync);
+    await expect(run(options, () => "ok")).resolves.toBe("ok");
+    expect(targets).not.toContain(ownerPath);
+    expect(targets.some((target) => target.startsWith(`${ownerPath}.`))).toBe(true);
+  });
+
+  it("partial owner: keeps a fresh lock with an empty owner file until the stale window passes", async () => {
+    const { lock, options } = setup("", false);
+    await expect(run(options, () => "wrong")).rejects.toBeInstanceOf(FileLockTimeoutError);
+    expect(fs.readFileSync(path.join(lock, "owner"), "utf8")).toBe("");
+    const past = new Date(Date.now() - 60_000);
+    fs.utimesSync(lock, past, past);
+    await expect(run(options, () => "recovered")).resolves.toBe("recovered");
+    expect(fs.existsSync(lock)).toBe(false);
+  });
+
+  it("hold ceiling: reaps a live same-host owner's leaked lock and keeps a young one", async () => {
+    const leaked = setup(`leaked\n${process.pid}\n${Date.now() - 3_600_000}\n${encodeOwnerIdentityLine()}\n`);
+    await expect(run(leaked.options, () => "recovered")).resolves.toBe("recovered");
+    expect(fs.existsSync(leaked.lock)).toBe(false);
+
+    const owner = `held\n${process.pid}\n${Date.now() - 5_000}\n${encodeOwnerIdentityLine()}\n`;
+    const young = setup(owner, false);
+    await expect(run(young.options, () => "wrong")).rejects.toBeInstanceOf(FileLockTimeoutError);
+    expect(fs.readFileSync(path.join(young.lock, "owner"), "utf8")).toBe(owner);
+  });
 });

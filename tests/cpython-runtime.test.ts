@@ -260,6 +260,120 @@ describe.skipIf(!hasPython)("CPythonRuntime", () => {
     expect(writes).toEqual(["execute"]);
   });
 
+  it.skipIf(process.platform === "win32").each(["read", "write", ...(process.platform === "linux" ? ["filter"] : [])])(
+    "retains sandbox startup diagnostics when %s fails before stderr and close", async (source) => {
+      vi.mocked(fsPromises.access).mockResolvedValue(undefined);
+      const stderr = new PassThrough();
+      const channel = new Duplex({
+        read() {},
+        write(_chunk, _encoding, callback) {
+          if (source === "write") callback(new Error("write EPIPE"));
+          else callback();
+        },
+      });
+      const filter = new PassThrough();
+      const child = Object.assign(new EventEmitter(), {
+        pid: undefined, stdout: new PassThrough(), stderr,
+        stdio: [null, null, null, channel, filter], kill: vi.fn(),
+      });
+      vi.mocked(childProcess.spawn).mockImplementation(() => {
+        setImmediate(() => {
+          if (source === "read") channel.emit("error", new Error("read ECONNRESET"));
+          if (source === "filter") filter.emit("error", new Error("write EPIPE"));
+          // Separate turns: IPC errors can be delivered before stderr and exit.
+          setImmediate(() => {
+            stderr.write("sandbox startup refused: namespace unavailable\n");
+            child.emit("exit", 1, null);
+            child.emit("close", 1, null);
+          });
+        });
+        return child as unknown as ReturnType<typeof childProcess.spawn>;
+      });
+      const host = vi.fn(echo);
+      const result = await new CPythonRuntime(binary, true).execute("return await schema.status()", host, options);
+      expect(result.terminationReason).toBe("runtime_error");
+      expect(result.error).toContain("sandbox process exited before returning a result (1)");
+      expect(result.error).toContain("sandbox startup refused: namespace unavailable");
+      expect(result.error).toContain(source === "read" ? "read ECONNRESET" : "write EPIPE");
+      expect(result.logs).toContain("sandbox startup refused: namespace unavailable");
+      expect(host).not.toHaveBeenCalled();
+      expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("does not accept buffered completion after a latched transport failure", async () => {
+    const channel = new Duplex({
+      read() {},
+      write(_chunk, _encoding, callback) {
+        callback();
+        queueMicrotask(() => channel.push([
+          JSON.stringify({ type: "call", id: 1, ref: "schema.status", args: {} }),
+          JSON.stringify({ type: "call", id: 2, ref: "schema.status", args: {} }),
+          JSON.stringify({ type: "result", result: { terminationReason: "completed", value: "wrong success" } }),
+          "",
+        ].join("\n")));
+      },
+    });
+    const child = Object.assign(new EventEmitter(), {
+      pid: undefined, stdout: new PassThrough(), stderr: new PassThrough(),
+      stdio: [null, null, null, channel], kill: vi.fn(),
+    });
+    vi.mocked(childProcess.spawn).mockReturnValue(child as unknown as ReturnType<typeof childProcess.spawn>);
+    const host = vi.fn(async () => {
+      channel.emit("error", new Error("read ECONNRESET"));
+      return "ignored";
+    });
+    const result = await run("return 1", host);
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toBe("CPython IPC failed: read ECONNRESET");
+    expect(host).toHaveBeenCalledTimes(1);
+    expect(channel.destroyed).toBe(true);
+  });
+
+  it.skipIf(process.platform === "win32").each(["bound", "abort"])(
+    "keeps a live child's IPC failure generic and %s settlement", async (ending) => {
+      vi.mocked(fsPromises.access).mockResolvedValue(undefined);
+      const controller = new AbortController();
+      const channel = new Duplex({ read() {}, write(_chunk, _encoding, callback) { callback(); } });
+      const filter = new PassThrough();
+      const child = Object.assign(new EventEmitter(), {
+        pid: undefined, stdout: new PassThrough(), stderr: new PassThrough(),
+        stdio: [null, null, null, channel, filter], kill: vi.fn(),
+      });
+      vi.mocked(childProcess.spawn).mockImplementation(() => {
+        setImmediate(() => {
+          channel.emit("error", new Error("read ECONNRESET"));
+          if (ending === "abort") controller.abort();
+        });
+        return child as unknown as ReturnType<typeof childProcess.spawn>;
+      });
+      const started = Date.now();
+      const result = await new CPythonRuntime(binary, true).execute("return 1", echo, { ...options, signal: controller.signal });
+      expect(Date.now() - started).toBeLessThan(2000);
+      expect(result.terminationReason).toBe(ending === "abort" ? "aborted" : "runtime_error");
+      expect(result.error).toBe(ending === "abort" ? "Execution cancelled" : "CPython IPC failed: read ECONNRESET");
+      expect(result.error).not.toMatch(/sandbox|isolation/i);
+      expect(filter.writableEnded).toBe(process.platform === "linux");
+      expect(channel.destroyed).toBe(true);
+      expect(child.kill).toHaveBeenCalledWith("SIGKILL");
+    },
+  );
+
+  it.skipIf(process.platform === "win32")("reports real early child exits with stderr rather than only a broken IPC channel", async () => {
+    const { spawn } = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+    vi.mocked(childProcess.spawn).mockImplementation((_command, _args, spawnOptions) =>
+      spawn(binary, ["-I", "-B", "-c", 'import sys; sys.stderr.write("startup refused\\n"); sys.exit(23)'], spawnOptions),
+    );
+    const host = vi.fn(echo);
+    const result = await run("return await schema.status()", host);
+    expect(result.terminationReason).toBe("runtime_error");
+    expect(result.error).toContain("process exited before returning a result (23)");
+    expect(result.error).toContain("startup refused");
+    expect(result.logs).toContain("startup refused");
+    expect(host).not.toHaveBeenCalled();
+    expect(childProcess.spawn).toHaveBeenCalledTimes(1);
+  });
+
   it("bounds non-cooperative host calls after guest failure", async () => {
     const started = Date.now();
     const result = await run('await asyncio.gather(schema.status(), memory.sessions())', async (ref) => {

@@ -993,7 +993,7 @@ export class FabricDashboard implements Component, Focusable {
       ["Views", "1 Activity · 2 unified Topology"],
       ...(this.onConversation ? [["Chat", "Shift+C opens the selected participant conversation · Esc returns to Main"]] : []),
       ["Topology", "Main branches into Participants (sessions, agents, actors) and Mesh (namespaced topics and hierarchical state); traffic travels on decaying edges"],
-      ["Motion", "r replay/live · space pause/play · ←/→ step · +/- speed · H history · M reduced motion"],
+      ["Motion", "r replay/live · space pause/play · ←/→ step · +/- speed · H history · M reduced motion (pins the model on an editable actor row)"],
       ["Runs", "[ older · ] newer · f cycle status filter"],
       ...(mainActions.length > 1 ? [["Main", mainActions.join(" · ")]] : []),
       ...(agentActions.length > 1 ? [["Agents", agentActions.join(" · ")]] : []),
@@ -1502,10 +1502,16 @@ export class FabricDashboard implements Component, Focusable {
       return `agent actions: ${actions.join(" · ")}`;
     }
     if (entity.kind === "meshParticipant") {
+      const armed =
+        this.pendingStop?.id === entity.value.id && this.pendingStop.expiresAt > Date.now();
       const actions = [
         this.canMessage(entity, "steer") ? "s steer" : undefined,
         this.canMessage(entity, "followUp") ? "u follow-up" : undefined,
-        this.canStop(entity) ? "x twice to stop" : undefined,
+        this.canStop(entity)
+          ? armed
+            ? "x again to stop"
+            : "x stop"
+          : undefined,
         "enter details",
       ].filter((value): value is string => Boolean(value));
       return `participant actions: ${actions.join(" · ")}`;
@@ -1711,10 +1717,16 @@ export class FabricDashboard implements Component, Focusable {
         : "Actor settings are read-only in this session.";
     }
     if (entity.kind === "meshParticipant") {
+      const armed =
+        this.pendingStop?.id === entity.value.id && this.pendingStop.expiresAt > Date.now();
       const actions = [
         this.canMessage(entity, "steer") ? "s steer over mesh" : undefined,
         this.canMessage(entity, "followUp") ? "u queue follow-up over mesh" : undefined,
-        this.canStop(entity) ? "x twice to stop" : undefined,
+        this.canStop(entity)
+          ? armed
+            ? "x again to confirm stop"
+            : "x stop"
+          : undefined,
       ].filter((value): value is string => Boolean(value));
       return actions.length > 0
         ? `Remote participant actions: ${actions.join(" · ")}`

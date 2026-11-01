@@ -246,6 +246,42 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     }, 90_000,
   );
 
+  // Both run the source worker so the probe tracks src/worker.ts, not a stale build.
+  const runSourceWorker = async (task: string): Promise<AgentRunResult> => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-source-worker-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 30_000, maxConcurrent: 1 }, {
+      workerPath: path.resolve("src/worker.ts"), piBinary, runRoot: root,
+    });
+    managers.push(manager);
+    return manager.run({ task, transport: "process" });
+  };
+
+  it("keeps a run completed when the child answered but does not exit after stdin closes", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "answer-then-linger";
+    const result = await runSourceWorker("answer then linger");
+    expect(result.status, result.error).toBe("completed");
+    expect(result.text).toBe("final answer");
+    expect(result.error).toBeUndefined();
+    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.filter((event) => event.type === "fabric_exit_warning")).toEqual([
+      { type: "fabric_exit_warning", warning: "child did not exit after stdin closed for 5000ms; terminated it after its final answer" },
+    ]);
+    const pid = events.find((event) => event.type === "fake_child_pid").pid;
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 30_000);
+
+  it("fails a lingering child whose last message was a tool call", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "tool-use-then-linger";
+    const result = await runSourceWorker("tool call then linger");
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("did not exit after stdin closed");
+    const events = fs.readFileSync(result.logFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    expect(events.some((event) => event.type === "fabric_exit_warning")).toBe(false);
+    const pid = events.find((event) => event.type === "fake_child_pid").pid;
+    expect(() => process.kill(pid, 0)).toThrow();
+  }, 30_000);
+
   it.each(["large-lifecycle", "large-lifecycle-retry"])(
     "preserves progress through oversized lifecycle history (%s)", async (behavior) => {
       process.env.FAKE_PI_BEHAVIOR = behavior;
@@ -597,6 +633,19 @@ describe.skipIf(!hasWorker)("AgentManager real worker e2e", () => {
     } finally {
       delete process.env.PI_FABRIC_INJECT_CRASH;
     }
+  });
+
+  it("keeps the declared fabric_exec display name as the run's milestone", async () => {
+    process.env.FAKE_PI_BEHAVIOR = "milestone";
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-e2e-"));
+    roots.push(root);
+    const config = { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 5_000, maxConcurrent: 1 };
+    const manager = new AgentManager(process.cwd(), config, { workerPath, piBinary, runRoot: root });
+    managers.push(manager);
+    const result = await manager.run({ task: "declare a milestone", transport: "process" });
+    expect(result.status).toBe("completed");
+    // Whitespace collapses, and later calls without a declaration leave it in place.
+    expect(result.milestone).toBe("Trace token refresh");
   });
 
   it("emits attributed tokens.usage events live and lands them in the budget ledger", async () => {

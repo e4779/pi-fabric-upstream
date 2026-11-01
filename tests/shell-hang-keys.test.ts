@@ -58,7 +58,7 @@ describe("shell hang keys", () => {
     const h = harness();
     expect(h.input(CTRL_B)).toEqual({ consume: true });
     expect(h.job.spilled).toBe(false);
-    expect(h.notify).not.toHaveBeenCalled();
+    expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("press Ctrl+B again"), "info");
     expect(h.input(CTRL_B)).toEqual({ consume: true });
     expect(h.job.spilled).toBe(true);
     expect(h.notify).toHaveBeenCalledWith(expect.stringContaining("still running"), "info");

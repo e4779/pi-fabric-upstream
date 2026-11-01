@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { writeFileAtomic } from "../core/atomic-write.js";
+import { takeMeshGrant } from "../verified/grants.js";
 import { validateMeshTopic, type MeshEvent, type MeshIdentity, type MeshStore } from "./store.js";
 
 /**
@@ -87,12 +88,12 @@ const readGrants = (store: Pick<MeshStore, "root">): MeshGrantFile => {
   throw new Error("Failed to read Fabric mesh grants: invalid format");
 };
 
-const writeGrants = (store: Pick<MeshStore, "root">, grants: MeshGrantRecord[]): void => {
+const writeGrants = (store: Pick<MeshStore, "root" | "durable">, grants: MeshGrantRecord[]): void => {
   const serialized = JSON.stringify({ format: 1, grants }, null, 2);
   if (Buffer.byteLength(serialized, "utf8") > MAX_GRANT_FILE_BYTES) {
     throw new Error(`Fabric mesh grants exceed ${MAX_GRANT_FILE_BYTES} bytes`);
   }
-  writeFileAtomic(grantsPath(store), serialized, { mode: 0o600 });
+  writeFileAtomic(grantsPath(store), serialized, { mode: 0o600, fsync: store.durable, durabilityRoot: store.root });
 };
 
 const info = (grant: MeshGrantRecord): MeshGrantInfo => ({
@@ -120,7 +121,7 @@ export const validateMeshKind = (kind: string): string => {
 
 /** Mints a grant; the token is returned once and never persisted. */
 export async function createMeshGrant(
-  store: Pick<MeshStore, "root" | "maxEventBytes" | "transact">,
+  store: Pick<MeshStore, "root" | "durable" | "maxEventBytes" | "transact">,
   input: { topic: string; kind?: string; ttlMs: number; uses?: number; createdBy: MeshIdentity },
   now = Date.now(),
 ): Promise<{ grant: MeshGrantInfo; token: string }> {
@@ -152,7 +153,7 @@ export async function createMeshGrant(
 }
 
 export async function revokeMeshGrant(
-  store: Pick<MeshStore, "root" | "transact">,
+  store: Pick<MeshStore, "root" | "durable" | "transact">,
   grantId: string,
   now = Date.now(),
 ): Promise<{ revoked: boolean }> {
@@ -180,7 +181,7 @@ export function listMeshGrants(store: Pick<MeshStore, "root">, now = Date.now())
  * decrements in the same locked write as the append.
  */
 export async function postWithMeshGrant(
-  store: Pick<MeshStore, "root" | "transact">,
+  store: Pick<MeshStore, "root" | "durable" | "transact">,
   input: { token: string; topic?: string; kind?: string; data?: unknown },
   now = Date.now(),
 ): Promise<{ event: MeshEvent; grant: MeshGrantInfo }> {
@@ -202,27 +203,31 @@ export async function postWithMeshGrant(
       // Compare every candidate so timing does not depend on the match position.
       if (timingSafeEqual(presented, Buffer.from(grant.hash, "hex")) && match === undefined) match = grant;
     }
-    if (!match || !TOKEN_PATTERN.test(input.token)) throw new Error("Fabric mesh grant token is not valid or was revoked");
-    if (match.expiresAt <= now) throw new Error("Fabric mesh grant has expired");
-    if (match.uses <= 0) throw new Error("Fabric mesh grant has no uses left");
-    if (input.topic !== undefined && input.topic !== match.topic) {
-      throw new Error(`Fabric mesh grant does not cover topic ${input.topic}`);
+    // Decide over the exact record read under this lock; there is no policy fallback.
+    const plan = takeMeshGrant(match, { authenticated: TOKEN_PATTERN.test(input.token), now,
+      ...(input.topic !== undefined ? { topic: input.topic } : {}),
+      ...(input.kind !== undefined ? { kind: input.kind } : {}),
+    });
+    switch (plan.plan) {
+      case "Invalid": throw new Error("Fabric mesh grant token is not valid or was revoked");
+      case "Expired": throw new Error("Fabric mesh grant has expired");
+      case "Exhausted": throw new Error("Fabric mesh grant has no uses left");
+      case "Topic": throw new Error(`Fabric mesh grant does not cover topic ${input.topic}`);
+      case "Kind": throw new Error(`Fabric mesh grant does not cover kind ${input.kind}`);
+      case "Consume": break;
     }
-    if (match.kind !== undefined && input.kind !== undefined && input.kind !== match.kind) {
-      throw new Error(`Fabric mesh grant does not cover kind ${input.kind}`);
-    }
-    const kind = input.kind ?? match.kind ?? "external";
+    const accepted = match!;
     const event = append({
-      topic: match.topic,
-      kind,
-      from: { id: `external:${match.grantId}`, name: "external", kind: "agent" },
+      topic: plan.topic,
+      kind: plan.kind,
+      from: { id: `external:${accepted.grantId}`, name: "external", kind: "agent" },
       ...(input.data !== undefined ? { data: input.data } : {}),
       origin: "external",
       untrusted: true,
-      grantId: match.grantId,
-      maxEventBytes: match.maxEventBytes,
+      grantId: accepted.grantId,
+      maxEventBytes: accepted.maxEventBytes,
     });
-    const updated: MeshGrantRecord = { ...match, uses: match.uses - 1 };
+    const updated: MeshGrantRecord = { ...accepted, uses: plan.uses };
     writeGrants(store, grants.map((grant) => grant === match ? updated : grant));
     return { event, grant: info(updated) };
   });

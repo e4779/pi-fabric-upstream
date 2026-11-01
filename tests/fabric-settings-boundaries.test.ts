@@ -51,6 +51,7 @@ describe("settings module boundaries", () => {
 
   it("keeps capture list callbacks and summary updates within its section builder", () => {
     const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    config.fullCodeMode = false;
     config.capture.keepVisible = [];
     const apply = vi.fn();
     const item = buildCaptureSection({
@@ -66,6 +67,27 @@ describe("settings module boundaries", () => {
     list.applyChange("capture.keepVisible.read", "true");
     expect(apply).toHaveBeenCalledExactlyOnceWith("capture.keepVisible", ["read"]);
     expect(listItem.currentValue).toBe("1 tool");
+  });
+
+  it.each([
+    ["full code", (config: typeof DEFAULT_FABRIC_CONFIG) => { config.fullCodeMode = true; }],
+    ["Schema enforce", (config: typeof DEFAULT_FABRIC_CONFIG) => {
+      config.fullCodeMode = false;
+      config.schema = { ...config.schema, mode: "enforce" };
+    }],
+  ])("marks the keepVisible row as having no effect in %s mode", (_mode, setMode) => {
+    const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+    setMode(config);
+    config.capture.keepVisible = ["fabric_exec", "read"];
+    const item = buildCaptureSection({
+      config, theme, apply: vi.fn(), persist: vi.fn(),
+      options: { keepVisibleCandidates: ["fabric_exec", "read"] },
+    });
+    const section = item.submenu!(item.currentValue, () => {});
+    if (!(section instanceof SectionSubmenu)) throw new Error("Expected a section");
+    const listItem = section.items.find(child => child.id === "capture.keepVisible")!;
+    expect(listItem.currentValue).toBe("2 tools (no effect)");
+    expect(listItem.description).toContain("foreground.tools");
   });
 
   it("retains exactly the public runtime exports and their implementation identities", () => {

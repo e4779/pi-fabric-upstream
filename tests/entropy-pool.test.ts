@@ -164,6 +164,28 @@ describe("mergeObservationWindow", () => {
     ]);
   });
 
+  it("never retracts an evicted value from the total twice (#273)", async () => {
+    const values = Array.from({ length: 33 }, (_, index) =>
+      obs("mcp.flags.set", "level", `v${String(index).padStart(2, "0")}`));
+    const cache = new SessionObservationCache();
+    const merges = [
+      async (pool: Parameters<typeof mergeObservationWindow>[0], windows: EntropyObservationWindow[]) =>
+        mergeObservationWindow(pool, windows),
+      mergeObservationWindowAsync,
+      (pool: Parameters<typeof mergeObservationWindow>[0], windows: EntropyObservationWindow[]) =>
+        cache.merge(pool, windows),
+    ];
+    for (const merge of merges) {
+      const first = await merge(undefined, [window("s.jsonl", values)]);
+      expect(levelEntry(first)!.total).toBe(POOL_TRACKED_VALUES);
+      const kept = levelEntry(first)!.values.map((item) => obs("mcp.flags.set", "level", item.value));
+      const second = await merge(first.file, [window("s.jsonl", kept)]);
+      const entry = levelEntry(second)!;
+      expect(entry.values).toHaveLength(POOL_TRACKED_VALUES);
+      expect(entry.total).toBe(POOL_TRACKED_VALUES);
+    }
+  });
+
   it("is deterministic for identical merges", () => {
     const windows = [
       window("a.jsonl", [obs("mcp.flags.set", "level", "info", 3), obs("mcp.flags.set", "level", "warn")]),
@@ -201,6 +223,25 @@ describe("observation pool store", () => {
     expect(fs.existsSync(path.join(path.dirname(target), "observation-pool.lock"))).toBe(false);
   });
 
+  it("recomputes a stale total from retained counts instead of rejecting the pool (#273)", async () => {
+    const agentDir = makeTempDir();
+    const merged = mergeObservationWindow(undefined, [
+      window("a.jsonl", [obs("mcp.flags.set", "level", "info", 3), obs("mcp.flags.set", "level", "warn")]),
+    ]);
+    const stale = {
+      ...merged.file,
+      entries: merged.file.entries.map((entry) => ({ ...entry, total: -1 })),
+    };
+    const target = path.join(agentDir, "fabric", "entropy", "observation-pool.json");
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, JSON.stringify(stale));
+    expect(loadObservationPool(agentDir)).toEqual({ file: merged.file });
+    expect(await loadObservationPoolAsync(agentDir)).toEqual({ file: merged.file });
+    expect((await updateObservationPoolAsync(agentDir, [
+      window("b.jsonl", [obs("mcp.flags.set", "level", "info")]),
+    ])).written).toBe(true);
+    expect(levelEntry({ ...merged, file: loadObservationPool(agentDir).file! })!.total).toBe(5);
+  });
 
   it("round-trips the pool, no-ops identical writes, and surfaces damage", async () => {
     const agentDir = makeTempDir();

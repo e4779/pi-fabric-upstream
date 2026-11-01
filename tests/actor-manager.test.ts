@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import { ActorManager, ActorRegistryOwnershipError } from "../src/actors/manager.js";
+import { ActorMeshMonitor } from "../src/actors/mesh-monitor.js";
+import { ActorRegistryStore } from "../src/actors/registry-store.js";
 import type { FabricCapabilityRequirement } from "../src/components/types.js";
 import type { FabricCapabilityViewLease } from "../src/core/action-registry.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
@@ -86,6 +89,18 @@ afterEach(async () => {
 });
 
 describe("ActorManager", () => {
+  it("serializes concurrent creates and releases the queue after a rejection", async () => {
+    const { actors } = setup();
+    const results = await Promise.allSettled([
+      actors.create({ name: "same", instructions: "First." }),
+      actors.create({ name: "same", instructions: "Second." }),
+    ]);
+    expect(results.map((result) => result.status)).toEqual(["fulfilled", "rejected"]);
+    expect((results[1] as PromiseRejectedResult).reason.message).toMatch(/already active/);
+    expect(actors.list().filter((actor) => actor.name === "same")).toHaveLength(1);
+    await expect(actors.create({ name: "next", instructions: "Next." })).resolves.toMatchObject({ name: "next" });
+  });
+
   it("uses event monitoring where supported and polling fallback on Windows", async () => {
     const { mesh } = setup();
     const tail = vi.spyOn(mesh, "tail");
@@ -365,6 +380,25 @@ describe("ActorManager", () => {
     });
   });
 
+  it("keeps capability requirements through a global template export and import round trip", async () => {
+    const acquire = vi.fn(async (): Promise<FabricCapabilityViewLease> => {
+      throw new Error("not activated in this test");
+    });
+    const { actors, root } = setup(false, undefined, acquire);
+    const requires = [{ ref: "demo.echo" }, { ref: "optional.missing", optional: true }];
+    const source = await actors.create({
+      name: "bounded",
+      instructions: "Use only committed capabilities.",
+      requires: ["demo.echo", { ref: "optional.missing", optional: true }],
+    });
+    const templates = new GlobalActorRegistry(path.join(root, "agent"), 64 * 1024);
+    const template = templates.create(actors.definition(source.id));
+    const imported = await actors.create(templates.toRequest(template, "bounded copy"));
+    expect(actors.status(imported.id).requirements).toEqual(requires);
+    expect(actors.definition(imported.id).requires).toEqual(requires);
+    expect(acquire).not.toHaveBeenCalled();
+  });
+
   it("keeps mailbox work queued until required capabilities become available", async () => {
     let available = false;
     const release = vi.fn(async () => {});
@@ -479,6 +513,582 @@ describe("ActorManager", () => {
     expect(other.owns(actor.id)).toBe(false);
   });
 
+  it("does not acquire an orphan when its registry write fails, and retries later", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "failed-adoption", instructions: "Wait." });
+    await state.actors.close();
+    let rootAlive = false;
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(() => {
+      rootAlive = true; // Prevent immediate retries until the failed state is inspected.
+      throw new Error("injected registry failure");
+    });
+    const successorIdentity = { ...state.identity, id: "session:successor", sessionId: "successor" };
+    const successor = new ActorManager("successor", successorIdentity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session",
+      rootId: successorIdentity.id, canManageActor: () => undefined, lineageAlive: () => rootAlive,
+    });
+    actorManagers.push(successor);
+    try {
+      await waitFor(() => write.mock.calls.length > 0);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(successor.status(actor.id).rootId).toBe(state.identity.id);
+      expect(new ActorRegistryStore(path.join(state.root, "actors")).records().find((row) => row.id === actor.id)?.rootId).toBe(state.identity.id);
+    } finally {
+      write.mockRestore();
+    }
+    rootAlive = false;
+    await waitFor(() => successor.owns(actor.id), 4_000);
+    expect(successor.status(actor.id).rootId).toBe(successorIdentity.id);
+  });
+
+  it("defers repeated failed adoption writes, lets timers run, and recovers", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "retry-orphan", instructions: "Wait." });
+    await state.actors.close();
+    const originalWrite = ActorRegistryStore.prototype.write;
+    let failing = true;
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(function (this: ActorRegistryStore, rows) {
+      if (failing) throw new Error("persistent failure");
+      return originalWrite.call(this, rows);
+    });
+    vi.useFakeTimers();
+    const schedule = vi.spyOn(ActorMeshMonitor.prototype, "schedule");
+    const successorIdentity = { ...state.identity, id: "session:retry", sessionId: "retry" };
+    const successor = new ActorManager("retry", successorIdentity, state.mesh, { ...state.meshConfig, actorPollMs: 2_000 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session",
+      rootId: successorIdentity.id, canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      const heartbeat = vi.fn();
+      setTimeout(heartbeat, 25);
+      expect(successor.owns(actor.id)).toBe(false);
+      await vi.advanceTimersByTimeAsync(350);
+      expect(heartbeat).toHaveBeenCalledOnce();
+      const monitor = schedule.mock.instances[0] as ActorMeshMonitor;
+      for (let i = 0; i < 100; i++) {
+        expect(successor.owns(actor.id)).toBe(false);
+        monitor.schedule();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(successor.status(actor.id).rootId).toBe(state.identity.id);
+      expect(new ActorRegistryStore(path.join(state.root, "actors")).records().find((row) => row.id === actor.id)?.rootId).toBe(state.identity.id);
+      failing = false;
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(successor.owns(actor.id)).toBe(true);
+      expect(successor.status(actor.id).rootId).toBe(successorIdentity.id);
+    } finally {
+      vi.useRealTimers();
+      schedule.mockRestore();
+      write.mockRestore();
+    }
+  });
+
+  it("adopts a healthy orphan promptly despite a persistently failing row", async () => {
+    const state = setup(true);
+    const poison = await state.actors.create({ name: "poison", instructions: "Wait." });
+    const healthy = await state.actors.create({ name: "healthy", instructions: "Wait." });
+    await state.actors.close();
+    const originalWrite = ActorRegistryStore.prototype.write;
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(function (this: ActorRegistryStore, rows) {
+      if (rows.some((row) => typeof row === "object" && row !== null && "id" in row && row.id === poison.id && "rootId" in row && row.rootId === "session:fair")) throw new Error("poison row");
+      return originalWrite.call(this, rows);
+    });
+    vi.useFakeTimers();
+    const identity = { ...state.identity, id: "session:fair", sessionId: "fair" };
+    const successor = new ActorManager("fair", identity, state.mesh, { ...state.meshConfig, actorPollMs: 2_000 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session",
+      rootId: identity.id, canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      expect(successor.owns(poison.id)).toBe(false);
+      await vi.advanceTimersByTimeAsync(2_100);
+      expect(write.mock.calls.length).toBeGreaterThanOrEqual(2);
+      expect(successor.owns(healthy.id)).toBe(true);
+      expect(successor.owns(poison.id)).toBe(false);
+    } finally {
+      await successor.close();
+      vi.useRealTimers();
+      write.mockRestore();
+    }
+  });
+
+  it("bounds sustained retries across many orphans and eventually adopts all", async () => {
+    const state = setup(true);
+    const actors = [];
+    for (let i = 0; i < 40; i++) actors.push(await state.actors.create({ name: `orphan-${i}`, instructions: "Wait." }));
+    await state.actors.close();
+    const originalWrite = ActorRegistryStore.prototype.write;
+    let failing = true;
+    const attempted = new Set<string>();
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(function (this: ActorRegistryStore, rows) {
+      const adopted = rows.find((row) => typeof row === "object" && row !== null && "rootId" in row && row.rootId === "session:bulk");
+      if (adopted && typeof adopted === "object" && "id" in adopted) attempted.add(String(adopted.id));
+      if (failing) throw new Error("persistent failure");
+      return originalWrite.call(this, rows);
+    });
+    vi.useFakeTimers();
+    const identity = { ...state.identity, id: "session:bulk", sessionId: "bulk" };
+    const successor = new ActorManager("bulk", identity, state.mesh, { ...state.meshConfig, actorPollMs: 2_000 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session",
+      rootId: identity.id, canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(write.mock.calls.length).toBeGreaterThanOrEqual(40);
+      expect(write.mock.calls.length).toBeLessThanOrEqual(61);
+      expect(attempted.size).toBe(40);
+      expect(actors.every((actor) => !successor.owns(actor.id))).toBe(true);
+      const before = write.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(write.mock.calls.length - before).toBeLessThanOrEqual(5);
+      failing = false;
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(actors.every((actor) => successor.owns(actor.id))).toBe(true);
+    } finally {
+      await successor.close();
+      vi.useRealTimers();
+      write.mockRestore();
+    }
+  });
+
+  it("keeps a microtask-started adopted actor and cancels its drain on close", async () => {
+    const state = setup(true, undefined, async () => { throw new Error("not used by creator"); });
+    const actor = await state.actors.create({ name: "adoption-live", instructions: "Old.", requires: ["demo.echo"] });
+    await state.actors.close();
+    const root = path.join(state.root, "actors");
+    const identity = { ...state.identity, id: "session:live", sessionId: "live" };
+    let runSignal: AbortSignal | undefined;
+    let successor!: ActorManager;
+    const original = ActorRegistryStore.prototype.withLock;
+    let injected = false;
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function (this: ActorRegistryStore, operation, signal) {
+      if (!signal || injected) return original.call(this, operation, signal);
+      injected = true;
+      const result = await original.call(this, () => {
+        const rows = this.entries();
+        const row = rows.find((value) => typeof value === "object" && value !== null && "id" in value && value.id === actor.id) as Record<string, unknown>;
+        row.instructions = "Latest locked instruction.";
+        row.model = "latest-model";
+        this.write(rows);
+        return operation();
+      }, signal);
+      successor.tell(actor.id, "start in the commit microtask");
+      return result;
+    });
+    successor = new ActorManager("live", identity, state.mesh, { ...state.meshConfig, actorPollMs: 60_000 }, state.agents, () => {}, {
+      actorRoot: root, persistent: true, claimResidency: "session", rootId: identity.id,
+      canManageActor: () => undefined, lineageAlive: () => false,
+      acquireCapabilityView: async (_requirements, signal) => {
+        runSignal = signal;
+        return await new Promise<FabricCapabilityViewLease>((_resolve, reject) => {
+          if (signal.aborted) reject(new Error("aborted"));
+          else signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
+    });
+    actorManagers.push(successor);
+    try {
+      successor.owns(actor.id);
+      await waitFor(() => runSignal !== undefined);
+      expect(successor.status(actor.id)).toMatchObject({ model: "latest-model" });
+      const row = new ActorRegistryStore(root).records().find((value) => value.id === actor.id);
+      expect(row?.instructions).toBe("Latest locked instruction.");
+      await successor.close();
+      expect(runSignal?.aborted).toBe(true);
+      const saved = new ActorRegistryStore(root).records().find((value) => value.id === actor.id);
+      expect(saved).toMatchObject({ instructions: "Latest locked instruction.", model: "latest-model" });
+    } finally {
+      lock.mockRestore();
+    }
+  });
+
+  it("preserves an adopted drain when another actor becomes owned and waits for shutdown", async () => {
+    const state = setup(true, undefined, async () => { throw new Error("creator must not run"); });
+    const first = await state.actors.create({ name: "acquire-live", instructions: "Live.", requires: ["demo.echo"] });
+    const second = await state.actors.create({ name: "acquire-next", instructions: "Next." });
+    await state.actors.close();
+    const identity = { ...state.identity, id: "session:acquire", sessionId: "acquire" };
+    let secondOwned = false;
+    let signal: AbortSignal | undefined;
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const successor = new ActorManager("acquire", identity, state.mesh, { ...state.meshConfig, actorPollMs: 60_000 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session", rootId: identity.id,
+      canManageActor: (id) => id === second.id ? secondOwned : undefined, lineageAlive: () => false,
+      acquireCapabilityView: async (_requirements, runSignal) => {
+        signal = runSignal;
+        await gate;
+        throw new Error("finished");
+      },
+    });
+    actorManagers.push(successor);
+    try {
+      successor.owns(first.id);
+      await waitFor(() => successor.owns(first.id));
+      successor.tell(first.id, "run");
+      await waitFor(() => signal !== undefined);
+      secondOwned = true;
+      expect(successor.owns(second.id)).toBe(true);
+      expect(signal?.aborted).toBe(false);
+      let closed = false;
+      const closing = successor.close().then(() => { closed = true; });
+      expect(signal?.aborted).toBe(true);
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      finish();
+      await closing;
+      expect(closed).toBe(true);
+    } finally { finish(); }
+  });
+
+  it("keeps a live actor and retries a failed acquisition registry read", async () => {
+    const state = setup(true, undefined, async () => { throw new Error("creator must not run"); });
+    const first = await state.actors.create({ name: "read-live", instructions: "Live.", requires: ["demo.echo"] });
+    const second = await state.actors.create({ name: "read-next", instructions: "Next." });
+    await state.actors.close();
+    let secondOwned = false;
+    let signal: AbortSignal | undefined;
+    const successor = new ActorManager("read-acquire", state.identity, state.mesh, { ...state.meshConfig, actorPollMs: 60_000 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true,
+      canManageActor: (id) => id === first.id || secondOwned,
+      acquireCapabilityView: async (_requirements, runSignal) => {
+        signal = runSignal;
+        return await new Promise<FabricCapabilityViewLease>((_resolve, reject) => {
+          runSignal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      },
+    });
+    actorManagers.push(successor);
+    const originalRead = ActorRegistryStore.prototype.read;
+    let fail = false;
+    const read = vi.spyOn(ActorRegistryStore.prototype, "read").mockImplementation(function (this: ActorRegistryStore) {
+      if (fail) { fail = false; throw new Error("transient read"); }
+      return originalRead.call(this);
+    });
+    try {
+      successor.tell(first.id, "run");
+      await waitFor(() => signal !== undefined);
+      secondOwned = true;
+      fail = true;
+      expect(successor.owns(second.id)).toBe(false);
+      expect(signal?.aborted).toBe(false);
+      expect(successor.status(first.id)).toMatchObject({ id: first.id, status: "running" });
+      expect(successor.owns(second.id)).toBe(true);
+      expect(signal?.aborted).toBe(false);
+      await successor.close();
+      expect(signal?.aborted).toBe(true);
+    } finally { read.mockRestore(); }
+  });
+  it.each([
+    { change: "rename", active: false },
+    { change: "delete", active: false },
+    { change: "rename", active: true },
+    { change: "delete", active: true },
+  ])("reconciles remote $change after ownership loss (active drain: $active)", async ({ change, active }) => {
+    let owned = true;
+    let signal: AbortSignal | undefined;
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const state = setup(true, () => owned, async (_requirements, runSignal) => {
+      signal = runSignal;
+      await gate;
+      throw new Error("finished");
+    });
+    const actor = await state.actors.create({ name: "before-loss", instructions: "Live.", requires: ["demo.echo"] });
+    if (active) {
+      state.actors.tell(actor.id, "run");
+      await waitFor(() => signal !== undefined);
+    }
+    const registryPath = path.join(state.root, "actors", "actors.json");
+    const registry = JSON.parse(fs.readFileSync(registryPath, "utf8")) as { actors: Array<{ id: string; name: string }> };
+    if (change === "rename") registry.actors.find((row) => row.id === actor.id)!.name = "after-loss";
+    else registry.actors = registry.actors.filter((row) => row.id !== actor.id);
+    fs.writeFileSync(registryPath, JSON.stringify(registry));
+    const originalRead = ActorRegistryStore.prototype.read;
+    let fail = false;
+    const read = vi.spyOn(ActorRegistryStore.prototype, "read").mockImplementation(function (this: ActorRegistryStore) {
+      if (fail) { fail = false; throw new Error("transient read"); }
+      return originalRead.call(this);
+    });
+    try {
+      owned = false;
+      // Sync accepts the changed fingerprint before refresh fences the old owner.
+      expect(state.actors.owns(actor.id)).toBe(false);
+      if (active) expect(signal?.aborted).toBe(true);
+      fail = true;
+      expect(state.actors.list().find((row) => row.id === actor.id)?.name).toBe("before-loss");
+      if (active) {
+        // Successful reads must not replace an actor whose drain is still live.
+        expect(state.actors.list().find((row) => row.id === actor.id)?.name).toBe("before-loss");
+        finish();
+      }
+      await waitFor(() => {
+        const row = state.actors.list().find((item) => item.id === actor.id);
+        return change === "rename" ? row?.name === "after-loss" : row === undefined;
+      });
+    } finally {
+      finish();
+      read.mockRestore();
+    }
+  });
+
+  it("defers reacquisition until a lost actor's drain settles", async () => {
+    const state = setup(true, undefined, async () => { throw new Error("creator must not run"); });
+    const actor = await state.actors.create({ name: "loss-drain", instructions: "Live.", requires: ["demo.echo"] });
+    await state.actors.close();
+    let owned = true;
+    let signal: AbortSignal | undefined;
+    let finish!: () => void;
+    const gate = new Promise<void>((resolve) => { finish = resolve; });
+    const successor = new ActorManager("loss", state.identity, state.mesh, { ...state.meshConfig, actorPollMs: 60_000 }, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, canManageActor: () => owned,
+      acquireCapabilityView: async (_requirements, runSignal) => {
+        signal = runSignal;
+        await gate;
+        throw new Error("finished");
+      },
+    });
+    actorManagers.push(successor);
+    try {
+      successor.tell(actor.id, "run");
+      await waitFor(() => signal !== undefined);
+      owned = false;
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(signal?.aborted).toBe(true);
+      owned = true;
+      expect(successor.owns(actor.id)).toBe(false);
+      finish();
+      await waitFor(() => successor.owns(actor.id));
+    } finally { finish(); }
+  });
+  it("retains adopted actors and retries a failed post-commit registry read", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "adoption-read", instructions: "Keep me." });
+    await state.actors.close();
+    const root = path.join(state.root, "actors");
+    const identity = { ...state.identity, id: "session:read", sessionId: "read" };
+    const originalLock = ActorRegistryStore.prototype.withLock;
+    const originalRead = ActorRegistryStore.prototype.read;
+    let failRead = false;
+    let failures = 0;
+    let failedCall = 0;
+    const read = vi.spyOn(ActorRegistryStore.prototype, "read").mockImplementation(function (this: ActorRegistryStore) {
+      if (failRead) { failRead = false; failures++; failedCall = read.mock.calls.length; throw new Error("transient read"); }
+      return originalRead.call(this);
+    });
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function (this: ActorRegistryStore, operation, signal) {
+      const result = await originalLock.call(this, operation, signal);
+      if (signal && result === true) failRead = true;
+      return result;
+    });
+    const successor = new ActorManager("read", identity, state.mesh, { ...state.meshConfig, actorPollMs: 60_000 }, state.agents, () => {}, {
+      actorRoot: root, persistent: true, claimResidency: "session", rootId: identity.id,
+      canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      successor.owns(actor.id);
+      await waitFor(() => failures === 1);
+      expect(successor.list()).toEqual(expect.arrayContaining([expect.objectContaining({ id: actor.id, rootId: identity.id })]));
+      await waitFor(() => read.mock.calls.length > failedCall);
+      expect(successor.status(actor.id)).toMatchObject({ rootId: identity.id });
+      expect(successor.owns(actor.id)).toBe(true);
+    } finally {
+      lock.mockRestore();
+      read.mockRestore();
+    }
+  });
+
+  it("reloads changed rows before the next adoption", async () => {
+    const state = setup(true);
+    const first = await state.actors.create({ name: "first-reload", instructions: "First." });
+    const second = await state.actors.create({ name: "second-reload", instructions: "Old." });
+    await state.actors.close();
+    const root = path.join(state.root, "actors");
+    const store = new ActorRegistryStore(root);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let locked!: () => void;
+    const written = new Promise<void>((resolve) => { locked = resolve; });
+    const original = ActorRegistryStore.prototype.withLock;
+    let firstLock = true;
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function (this: ActorRegistryStore, operation, signal) {
+      const result = await original.call(this, operation, signal);
+      if (signal && firstLock) { firstLock = false; locked(); await gate; }
+      return result;
+    });
+    const identity = { ...state.identity, id: "session:reload", sessionId: "reload" };
+    const successor = new ActorManager("reload", identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: root, persistent: true, claimResidency: "session", rootId: identity.id,
+      canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      successor.owns(first.id);
+      await written;
+      const rows = store.entries();
+      const row = rows.find((value) => typeof value === "object" && value !== null && "id" in value && value.id === second.id) as Record<string, unknown>;
+      row.instructions = "Latest from disk.";
+      store.write(rows);
+      release();
+      await waitFor(() => store.records().find((value) => value.id === second.id)?.rootId === identity.id);
+      expect(store.records().find((value) => value.id === second.id)?.instructions).toBe("Latest from disk.");
+    } finally {
+      release();
+      lock.mockRestore();
+    }
+  });
+
+  it("continues after a refresh while adoption is pending without another poll", async () => {
+    const state = setup(true);
+    const first = await state.actors.create({ name: "pending-first", instructions: "First." });
+    const second = await state.actors.create({ name: "pending-second", instructions: "Second." });
+    await state.actors.close();
+    const root = path.join(state.root, "actors");
+    const store = new ActorRegistryStore(root);
+    const rows = store.entries();
+    const secondRow = rows.find((row) => typeof row === "object" && row !== null && "id" in row && row.id === second.id)!;
+    store.write(rows.filter((row) => row !== secondRow));
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let notify!: () => void;
+    const written = new Promise<void>((resolve) => { notify = resolve; });
+    const original = ActorRegistryStore.prototype.withLock;
+    let firstLock = true;
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function (this: ActorRegistryStore, operation, signal) {
+      const result = await original.call(this, operation, signal);
+      if (signal && firstLock) { firstLock = false; notify(); await gate; }
+      return result;
+    });
+    const identity = { ...state.identity, id: "session:wakeup", sessionId: "wakeup" };
+    const successor = new ActorManager("wakeup", identity, state.mesh, { ...state.meshConfig, actorPollMs: 60_000 }, state.agents, () => {}, {
+      actorRoot: root, persistent: true, claimResidency: "session", rootId: identity.id,
+      canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      successor.owns(first.id);
+      await written;
+      store.write([...store.entries(), secondRow]);
+      successor.list(); // Discover the new row while the first attempt is pending.
+      release();
+      await waitFor(() => store.records().find((row) => row.id === second.id)?.rootId === identity.id, 1_000);
+    } finally {
+      release();
+      lock.mockRestore();
+    }
+  });
+
+  it("cancels a real adoption lock wait on close without cancelling other callers", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "locked-close", instructions: "Wait." });
+    await state.actors.close();
+    const actorRoot = path.join(state.root, "actors");
+    const lockPath = path.join(actorRoot, "actors.json.lock");
+    fs.mkdirSync(lockPath);
+    fs.writeFileSync(path.join(lockPath, "owner"), `held\n${process.pid}\n${Date.now()}\n`);
+    const originalLock = ActorRegistryStore.prototype.withLock;
+    let adoptionWait: Promise<unknown> | undefined;
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(function (this: ActorRegistryStore, operation, signal) {
+      const pending = originalLock.call(this, operation, signal);
+      if (signal) adoptionWait = pending.catch(() => "aborted");
+      return pending;
+    });
+    const identity = { ...state.identity, id: "session:locked", sessionId: "locked" };
+    const successor = new ActorManager("locked", identity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot, persistent: true, claimResidency: "session", rootId: identity.id,
+      canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(adoptionWait).toBeDefined();
+      const otherOperation = vi.fn(() => "other acquired");
+      const other = new ActorRegistryStore(actorRoot).withLock(otherOperation);
+      await successor.close();
+      let timeout!: NodeJS.Timeout;
+      const result = await Promise.race([adoptionWait, new Promise((resolve) => { timeout = setTimeout(() => resolve("timeout"), 300); })]);
+      clearTimeout(timeout);
+      expect(result).toBe("aborted");
+      expect(otherOperation).not.toHaveBeenCalled();
+      expect(fs.existsSync(lockPath)).toBe(true);
+      expect(new ActorRegistryStore(actorRoot).records().find((row) => row.id === actor.id)?.rootId).toBe(state.identity.id);
+      fs.rmSync(lockPath, { recursive: true });
+      await expect(other).resolves.toBe("other acquired");
+    } finally {
+      fs.rmSync(lockPath, { recursive: true, force: true });
+      lock.mockRestore();
+    }
+  });
+
+  it("cancels failed adoption retries on close", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "closed-retry", instructions: "Wait." });
+    await state.actors.close();
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(() => { throw new Error("failure"); });
+    vi.useFakeTimers();
+    const successorIdentity = { ...state.identity, id: "session:closed", sessionId: "closed" };
+    const successor = new ActorManager("closed", successorIdentity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session",
+      rootId: successorIdentity.id, canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      expect(successor.owns(actor.id)).toBe(false);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(write).toHaveBeenCalledTimes(1);
+      await successor.close();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(write).toHaveBeenCalledTimes(1);
+      expect(successor.owns(actor.id)).toBe(false);
+    } finally {
+      vi.useRealTimers();
+      write.mockRestore();
+    }
+  });
+
+  it("does not adopt when close wins while the registry lock is pending", async () => {
+    const state = setup(true);
+    const actor = await state.actors.create({ name: "pending-close", instructions: "Wait." });
+    await state.actors.close();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let finished!: () => void;
+    const completed = new Promise<void>((resolve) => { finished = resolve; });
+    const originalLock = ActorRegistryStore.prototype.withLock;
+    const lock = vi.spyOn(ActorRegistryStore.prototype, "withLock").mockImplementation(async function (this: ActorRegistryStore, operation) {
+      await gate;
+      try { return await originalLock.call(this, operation); } finally { finished(); }
+    });
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write");
+    const successorIdentity = { ...state.identity, id: "session:pending-close", sessionId: "pending-close" };
+    const successor = new ActorManager("pending-close", successorIdentity, state.mesh, state.meshConfig, state.agents, () => {}, {
+      actorRoot: path.join(state.root, "actors"), persistent: true, claimResidency: "session",
+      rootId: successorIdentity.id, canManageActor: () => undefined, lineageAlive: () => false,
+    });
+    actorManagers.push(successor);
+    try {
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(lock).toHaveBeenCalledOnce();
+      await successor.close();
+      release();
+      await completed;
+      expect(write).not.toHaveBeenCalled();
+      expect(successor.owns(actor.id)).toBe(false);
+      expect(new ActorRegistryStore(path.join(state.root, "actors")).records().find((row) => row.id === actor.id)?.rootId).toBe(state.identity.id);
+    } finally {
+      release();
+      lock.mockRestore();
+      write.mockRestore();
+    }
+  });
+
   it("adopts orphaned project actors after the creating root is gone", async () => {
     const state = setup(true);
     const actor = await state.actors.create({
@@ -525,7 +1135,7 @@ describe("ActorManager", () => {
 
     // Adoption completes through the fenced registry write; ownership only
     // holds once the rebound rootId is persisted.
-    await waitFor(() => successor.owns(actor.id));
+    await waitFor(() => successor.owns(actor.id), 4_000);
     expect(successor.status(actor.id).rootId).toBe(successorIdentity.id);
     expect(successor.tell(actor.id, "run after orphan takeover")).toMatchObject({
       queued: true,
@@ -1566,6 +2176,65 @@ describe("ActorManager", () => {
     expect(reply.text).toBe("fake worker complete");
     await waitFor(() => actors.status(actor.id).status === "idle");
     expect(actors.status(actor.id)).toMatchObject({ status: "idle", name: "supervisor" });
+  });
+
+  it("refuses an active namesake before validating the replacement", async () => {
+    const { actors } = setup();
+    const active = await actors.create({ name: "planner", instructions: "Plan." });
+    await expect(actors.create({ name: "planner", instructions: "" }))
+      .rejects.toThrow(`already active (${active.id})`);
+  });
+
+  it("refuses stopped-name creation before validation or persistence and permits explicit removal", async () => {
+    const { actors, root } = setup(true);
+    const stopped = await actors.create({ name: "planner", instructions: "Plan." });
+    await actors.stop(stopped.id);
+    const sessionFile = actors.status(stopped.id).sessionFile!;
+    fs.writeFileSync(sessionFile, "old session contents\n");
+    const registry = path.join(root, "actors", "actors.json");
+    const before = fs.readFileSync(registry, "utf8");
+    const remove = vi.spyOn(actors, "remove");
+    const mkdir = vi.spyOn(fs, "mkdirSync").mockImplementation(() => { throw new Error("injected persistence failure"); });
+    try {
+      for (const instructions of ["", "Replace."]) {
+        await expect(actors.create({ name: "planner", instructions })).rejects.toThrow(/remove it explicitly/);
+      }
+      const simultaneous = await Promise.allSettled([
+        actors.create({ name: "planner", instructions: "First." }),
+        actors.create({ name: "planner", instructions: "Second." }),
+      ]);
+      expect(simultaneous.every((result) => result.status === "rejected")).toBe(true);
+      expect(remove).not.toHaveBeenCalled();
+      expect(mkdir).not.toHaveBeenCalled();
+      expect(actors.status(stopped.id)).toMatchObject({ id: stopped.id, status: "stopped" });
+      expect(fs.readFileSync(sessionFile, "utf8")).toBe("old session contents\n");
+      expect(fs.readFileSync(registry, "utf8")).toBe(before);
+    } finally {
+      mkdir.mockRestore();
+      remove.mockRestore();
+    }
+    await actors.remove(stopped.id);
+    expect(fs.existsSync(sessionFile)).toBe(false);
+    const replacement = await actors.create({ name: "planner", instructions: "New." });
+    expect(replacement.id).not.toBe(stopped.id);
+  });
+
+  it("keeps a stopped actor when another creation's registry write fails", async () => {
+    const { actors, root } = setup(true);
+    const stopped = await actors.create({ name: "planner", instructions: "Plan." });
+    await actors.stop(stopped.id);
+    const sessionFile = actors.status(stopped.id).sessionFile!;
+    fs.writeFileSync(sessionFile, "old session\n");
+    const registry = path.join(root, "actors", "actors.json");
+    const before = fs.readFileSync(registry, "utf8");
+    const write = vi.spyOn(ActorRegistryStore.prototype, "write").mockImplementation(() => { throw new Error("injected registry failure"); });
+    try {
+      await expect(actors.create({ name: "other", instructions: "Work." })).rejects.toThrow("injected registry failure");
+      expect(write).toHaveBeenCalled();
+      expect(actors.status(stopped.id).status).toBe("stopped");
+      expect(fs.readFileSync(sessionFile, "utf8")).toBe("old session\n");
+      expect(fs.readFileSync(registry, "utf8")).toBe(before);
+    } finally { write.mockRestore(); }
   });
 
   it("haltAll skips idle and stopped actors and leaves them usable", async () => {

@@ -12,6 +12,11 @@ const RUNNER_ID_SOURCE = "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$";
 
 const runProperties = {
   task: { type: "string", description: "A self-contained task for the child agent" },
+  agent: {
+    type: "string",
+    minLength: 1,
+    description: "Name of an agent file (see agents.definitions()) whose instructions, model, tools, thinking and runtimes.fabric settings fill this request. Any field passed here wins over the file. An unknown name fails before the child starts.",
+  },
   name: { type: "string" },
   runner: {
     type: "string",
@@ -31,11 +36,23 @@ const runProperties = {
   model: {
     type: "string",
     description:
-      "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Claude runtime value or Veda backend model/alias are forwarded verbatim.",
+      "Pi provider/id copied from agents.models({ runner: \"pi\" }), a configured models.aliases name, or a search term resolved to the closest authenticated model (recency from pi-model-sort breaks ties). Reuse returned keys; never infer version numbers from agent names. Exact keys win; near-miss IDs resolve to the closest visible model on the same provider. Handles report the canonical model. Claude runtime value or Veda backend model/alias are forwarded verbatim. Set modelMatch: \"exact\" to turn off aliases and near-miss resolution.",
+  },
+  modelMatch: {
+    type: "string",
+    enum: ["exact"],
+    description:
+      "Pi runners only (pi, pi-durable). \"exact\" selects a listed provider/id without aliases, closest or fuzzy matching, or alias thinking; invalid selectors and other runners are refused before launch. Admission is strict and a child guard detects model switches and some payload rewrites. This is not a security guarantee or final-dispatch enforcement: later hooks, unknown API payloads, providers and extension-made calls can route data elsewhere; attribution checks may detect drift only after a call. Do not rely on it to prevent data disclosure. Omit for default resolution.",
   },
   persona: {
     type: "string",
     description: "Veda persona name for this run, such as frontend, reviewer, worker, or a custom persona.",
+  },
+  holdQuestions: {
+    type: "boolean",
+    const: true,
+    description:
+      "Hold this run's routed questions for a person. Each question becomes a root-held Fabric decision with a 30-day deadline (the longest allowed); only this run waits until it is answered (/fabric decisions, pi-fabric decisions answer, or decisions.answer from the main session). Needs agents.childQuestions \"route\" and a runner that declares questions; refused otherwise. The run's timeoutMs still applies.",
   },
   thinking: {
     type: "string",
@@ -110,7 +127,22 @@ const runProperties = {
   schema: { type: "object", description: "Optional JSON Schema for validated structured output" },
   systemPrompt: {
     type: "string",
-    description: "Optional extra system prompt body for this child run. Pi runners merge it below component guidance and forward it via --system-prompt; Claude runners receive it via --append-system-prompt. Useful for reliability-focused prompt rules on models with weak behavioral defaults.",
+    description: "Optional extra system prompt body for this child run. Fabric places it ahead of any component guidance. Pi and Claude runners append the result with --append-system-prompt, and Veda receives it as a <system_instructions> block in its prompt. Useful for reliability-focused prompt rules on models with weak behavioral defaults.",
+  },
+  skills: {
+    anyOf: [
+      { type: "boolean", const: false },
+      { type: "array", items: { type: "string", minLength: 1, maxLength: 128, pattern: "^[^/\\\\]+$" }, maxItems: 64 },
+      {
+        type: "object",
+        properties: {
+          preload: { type: "array", items: { type: "string", minLength: 1, maxLength: 128, pattern: "^[^/\\\\]+$" }, maxItems: 64 },
+          inherit: { type: "boolean" },
+        },
+        additionalProperties: false,
+      },
+    ],
+    description: "Pi runners only: the child's skills, by name, resolved against this session's skills. false: no skills. A list: those skills preloaded in full, plus this session's other skills. { preload, inherit: false }: only the preloaded skills. Omit to keep the child's own skill discovery. An unknown name fails before launch.",
   },
   persistSession: {
     type: "boolean",
@@ -150,7 +182,15 @@ const actorInvocationProperties = {
 
 const spawnSchema = {
   ...runSchema,
-  properties: { ...runProperties, residency: residencySchema },
+  properties: {
+    ...runProperties,
+    residency: residencySchema,
+    queue: {
+      type: "boolean",
+      description:
+        "Return a handle with status \"queued\" at once instead of waiting inside this call for a free agents.maxConcurrent slot. The run starts when a slot frees, even after this program ends; wait, status, list, and stop accept the id meanwhile, and stop cancels it without launching. Validation errors still reject the call. Omitted or false keeps the default: spawn waits for a slot.",
+    },
+  },
 };
 
 const handoffCompactionSchema = {
@@ -210,6 +250,13 @@ const idSchema = {
   required: ["id"],
   additionalProperties: false,
 };
+
+const parkResultSchema = (requested: "sleep" | "wake") => ({
+  type: "object",
+  properties: { id: { type: "string" }, requested: { const: requested } },
+  required: ["id", "requested"],
+  additionalProperties: false,
+});
 
 const lifecycleEventSchema = {
   type: "string",
@@ -305,6 +352,22 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "read",
   },
   {
+    name: "departed",
+    description: "List root Pi sessions that are no longer live, newest first: status stopped (closed cleanly) or lost (lease expired without closing), with sessionId, cwd, label and lastSeenAt. Live sessions are never included.",
+    inputSchema: {
+      type: "object",
+      properties: { limit: { type: "number", minimum: 1 } },
+      additionalProperties: false,
+    },
+    risk: "read",
+  },
+  {
+    name: "definitions",
+    description: "List the named agent files that agents.run and agents.spawn accept in agent: name, description, path, scope (user or project), the file it shadows, and warnings for ignored fields. A file that cannot be read appears with an error.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    risk: "read",
+  },
+  {
     name: "peers",
     description: "List other live root Pi sessions sharing this project mesh. The dashboard-owning session remains Main; these targets are named peers.",
     inputSchema: { type: "object", properties: {}, additionalProperties: false },
@@ -348,12 +411,19 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "models",
     description:
-      "List models exposed by the selected runner. Claude models are enumerated from the installed Claude Code runtime, not hard-coded.",
+      "List models exposed by the selected runner. Claude models are enumerated from the installed Claude Code runtime, not hard-coded. Pass model to look up one exact key instead of reading the whole list. Veda returns an empty list: pass its backend model or alias directly as model.",
     inputSchema: {
       type: "object",
       properties: {
         runner: { type: "string", pattern: RUNNER_ID_SOURCE, maxLength: 64 },
         refresh: { type: "boolean" },
+        model: {
+          type: "string",
+          minLength: 1,
+          maxLength: 256,
+          description:
+            "Exact model key (the key field of an unfiltered entry, e.g. provider/id or claude/<value>). Returns only the entries whose key matches exactly and case-sensitively, with no alias or fuzzy resolution; an unknown key returns [].",
+        },
       },
       additionalProperties: false,
     },
@@ -384,6 +454,21 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
     risk: "agent",
   },
   {
+    name: "sleep",
+    description:
+      "Park an idle hosted run in this session. Only runners that declare the sleep capability accept it. The run stays running and status shows sleeping: true once the runner reports it.",
+    inputSchema: idSchema,
+    outputSchema: parkResultSchema("sleep"),
+    risk: "agent",
+  },
+  {
+    name: "wake",
+    description: "Resume a hosted run in this session that agents.sleep parked. Needs the runner's sleep capability.",
+    inputSchema: idSchema,
+    outputSchema: parkResultSchema("wake"),
+    risk: "agent",
+  },
+  {
     name: "cleanup",
     description: "Remove a completed agent's run files and optional Git worktree",
     inputSchema: {
@@ -400,7 +485,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "create",
     description:
-      'Create a persistent actor with independently selected session or project storage. Use scope "global" to save a reusable project-independent template instead of a live actor.',
+      'Create a persistent actor with independently selected session or project storage. A stopped live actor with the same name must be explicitly removed first. Use scope "global" to save a reusable project-independent template instead of a live actor.',
     inputSchema: {
       type: "object",
       properties: {
@@ -564,7 +649,7 @@ export const AGENTS_ACTION_DESCRIPTORS: FabricActionDescriptor[] = [
   {
     name: "compact",
     description:
-      "Request an advisory compaction of a running Pi-runner child agent's context at its next safe boundary (between its own turns), preserving the child's accumulated context. Rejected for Claude-runner children. The child pi core applies the compaction; Fabric only forwards the intent.",
+      "Request an advisory compaction of a running Pi-runner child agent's context at its next safe boundary (between its own turns), preserving the child's accumulated context. Rejected for Claude and Veda children and for registered runners without the compaction capability. The child pi core applies the compaction; Fabric only forwards the intent.",
     inputSchema: {
       type: "object",
       properties: {

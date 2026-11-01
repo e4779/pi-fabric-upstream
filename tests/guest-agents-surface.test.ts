@@ -3,6 +3,7 @@ import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
 import { CPYTHON_CHILD_SOURCE } from "../src/runtime/cpython-child-source.js";
 import { guestTypeDeclarations } from "../src/runtime/guest-types.js";
 import { GUEST_SETUP, QuickJsRuntime } from "../src/runtime/quickjs-runtime.js";
+import { typeCheckFabricCode } from "../src/runtime/type-checker.js";
 
 // AgentsProvider.invoke implements every descriptor, and the audit projection,
 // docs, and arg repair all spell the same refs. Only the TypeScript prelude
@@ -32,6 +33,24 @@ describe("guest agents surface", () => {
     const api = slice(guestTypeDeclarations(true), "interface FabricAgentsApi {", "\n}");
     const declared = names(api, /^ {2}"?([A-Za-z_$][\w$]*)"?\(/gm);
     expect(IMPLEMENTED.filter((name) => !declared.has(name))).toEqual([]);
+  });
+
+  it("types an exact model lookup through agents.models", () => {
+    const declarations = guestTypeDeclarations(true);
+    const accepted = typeCheckFabricCode(
+      `const [pinned] = await agents.models({ runner: "pi", model: "unified/claude-sonnet-5-5" });
+       const key: string | undefined = pinned?.key;
+       return key;`,
+      declarations,
+      true,
+    );
+    expect(accepted.errors).toEqual([]);
+    const wrongType = typeCheckFabricCode(
+      "await agents.models({ model: 42 }); return null;",
+      declarations,
+      true,
+    );
+    expect(wrongType.errors.length).toBeGreaterThan(0);
   });
 
   it("routes the template actions through the host bridge", async () => {

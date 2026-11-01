@@ -162,8 +162,6 @@ describe("participant scrollbar integration", () => {
       expect(f.renderer.mock.calls.at(-1)?.[1]).toBe(mode === "always" ? 39 : 40);
       expect(lines.some((line) => line.endsWith("┃"))).toBe(mode === "always");
       expect(lines.filter((line) => /^─+$/.test(line)).every((line) => line.length === 40)).toBe(true);
-      f.view.handleInput("\x0e");
-      expect(f.frame().some((line) => /[┃│█]$/.test(line))).toBe(false);
     } finally { f.view.dispose(); f.state.clear(); }
   });
 });

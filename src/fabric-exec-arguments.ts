@@ -13,6 +13,7 @@ const OPTIONAL_FABRIC_EXEC_KEYS = [
   "maxOutputTokens",
   "max_output_tokens",
   "display",
+  "background",
 ] as const;
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>

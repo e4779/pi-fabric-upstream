@@ -1,22 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { throwIfAborted, settleWithin } from "../async-settlement.js";
-import { providerTake, providerRevoke, type ProviderTicket, type StateText } from "../verified/generated/provider-kernel.js";
+import { providerTake, providerRevoke, type ProviderTicket } from "../verified/provider.js";
 import type { FabricInvocationContext, FabricScopedProviderResult } from "../protocol.js";
 import type { FabricProviderBinding, FabricProviderBindings } from "./provider-bindings.js";
-
-const encode = (text: string): StateText => {
-  let result: StateText = { $: "Nil" };
-  for (let i = text.length - 1; i >= 0; i--) result = { $: "Con", head: text.charCodeAt(i), tail: result };
-  return result;
-};
-const decode = (text: StateText): string => {
-  const result: string[] = [];
-  for (let rest = text; rest.$ === "Con"; rest = rest.tail) {
-    if (rest.head < 0 || rest.head > 65535) throw new Error("Invalid provider plan text");
-    result.push(String.fromCharCode(rest.head));
-  }
-  return result.join("");
-};
 
 export interface ProviderOperation {
   binding: FabricProviderBinding;
@@ -41,15 +27,12 @@ export class ProviderOperations {
   prepare(input: ProviderOperation): (signal?: AbortSignal) => Promise<unknown> {
     const { binding, ref, mode } = input;
     const payload = randomUUID();
-    // Large tool arguments stay in a private slot, not millions of Bend cells.
+    // Large tool arguments stay in a private slot; the kernel sees only its name.
     // Snapshot/slot fidelity remains an explicit host-adapter assumption.
     const args = structuredClone(input.args);
     const replay = mode === "replay" ? structuredClone(input.replayValue) : undefined;
     const identity = (target: string) => JSON.stringify([binding.id, String(binding.generation), mode, target]);
-    let ticket: ProviderTicket = {
-      $: "Ticket", grant: { $: "Grant", active: true, key: encode(identity(ref)) },
-      expected: encode(input.descriptor), payload: encode(payload),
-    };
+    let ticket: ProviderTicket = { active: true, key: identity(ref), expected: input.descriptor, payload };
     return signal => {
       const attempt = ticket;
       ticket = providerRevoke(ticket); // Reserve before awaits, even for failed attempts.
@@ -60,13 +43,13 @@ export class ProviderOperations {
         };
         throwIfAborted(context.signal);
         const observed = await input.observe(context);
-        const result = providerTake(attempt, encode(identity(observed.ref)), encode(observed.descriptor),
+        const result = providerTake(attempt, identity(observed.ref), observed.descriptor,
           context.signal.aborted || !this.bindings.binding(binding.id));
         if (result.plan.$ !== "Write") {
           throw new Error("Fabric provider operation denied: revoked, stale descriptor, wrong target, or spent ticket");
         }
-        const [id, generation, operation, target] = JSON.parse(decode(result.plan.key)) as string[];
-        if (decode(result.plan.value) !== payload || id !== binding.id || generation !== String(binding.generation) || operation !== mode || target !== ref) {
+        const [id, generation, operation, target] = JSON.parse(result.plan.key) as string[];
+        if (result.plan.value !== payload || id !== binding.id || generation !== String(binding.generation) || operation !== mode || target !== ref) {
           throw new Error("Invalid provider execution plan");
         }
         const separator = target.indexOf(".");

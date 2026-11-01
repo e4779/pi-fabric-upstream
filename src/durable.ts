@@ -49,14 +49,14 @@ async function runtime(): Promise<Runtime> {
     const require = createRequire(import.meta.url);
     for (const name of ["@earendil-works/pi-durable", "@earendil-works/chord"]) {
       const metadata = require(`${name}/package.json`) as { version?: string };
-      if (metadata.version !== "1.3.0") throw new Error(`Unsupported ${name} version ${metadata.version ?? "unknown"}; expected 1.3.0`);
+      if (metadata.version !== "1.4.0") throw new Error(`Unsupported ${name} version ${metadata.version ?? "unknown"}; expected 1.4.0`);
     }
     return Promise.all([import("@earendil-works/pi-durable"), import("@earendil-works/chord/context")]);
   })
     .then(([durable, context]) => ({ durable, context }))
     .catch((cause: unknown) => {
       runtimePromise = undefined;
-      throw new Error(`Pi durable runner requires pinned dependencies @earendil-works/pi-durable@1.3.0 and @earendil-works/chord@1.3.0: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+      throw new Error(`Pi durable runner requires pinned dependencies @earendil-works/pi-durable@1.4.0 and @earendil-works/chord@1.4.0: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
     });
 }
 const hash = (value: string): string => createHash("sha256").update(value).digest("hex");
@@ -80,6 +80,8 @@ interface OpenRun {
 export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurableRunner {
   if (!options.models || !options.registry || typeof options.env !== "function") throw new Error("Pi durable requires host models, registry and environment");
   const storage = options.storage;
+  // HarnessOptions.models may be a getter so hosts can swap catalogs; read it at each use, as the Harness does.
+  const currentModels = () => typeof options.models === "function" ? options.models() : options.models;
   const directory = storage.kind === "jsonl" ? path.resolve(storage.directory) : undefined;
   if (storage.kind === "factory" && (!storage.identity || typeof storage.acquire !== "function")) throw new Error("Storage factory requires identity and exclusive acquire()");
   const identity = hash(storage.kind === "jsonl" ? `jsonl:${directory}` : `factory:${storage.identity}`);
@@ -113,8 +115,8 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     if (context.recursive) throw new Error("Pi durable does not support recursiveFabric");
     const modelKey = context.model ?? defaultModel;
     const model = modelKey ? allowed.get(modelKey) : undefined;
-    if (!model || !options.models.getModel(model.provider, model.modelId)) throw new Error(`Unknown or disallowed Pi durable model: ${modelKey ?? "(missing explicit provider/model)"}`);
-    const catalogModel = options.models.getModel(model.provider, model.modelId)!;
+    if (!model || !currentModels().getModel(model.provider, model.modelId)) throw new Error(`Unknown or disallowed Pi durable model: ${modelKey ?? "(missing explicit provider/model)"}`);
+    const catalogModel = currentModels().getModel(model.provider, model.modelId)!;
     const input = durableInput(context, catalogModel.input.includes("image"));
     if (context.thinking && ((!catalogModel.reasoning && context.thinking !== "off") || catalogModel.thinkingLevelMap?.[context.thinking] === null)) throw new Error(`Unsupported thinking level: ${context.thinking}`);
     const snapshot = options.registry.snapshot();
@@ -189,10 +191,10 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     const selected = validate(context);
     const rt = await runtime();
     const { getSupportedThinkingLevels } = await import("@earendil-works/pi-ai/models");
-    if (!getSupportedThinkingLevels(options.models.getModel(selected.model.provider, selected.model.modelId)!).includes(context.thinking ?? "off")) throw new Error(`Unsupported thinking level: ${context.thinking ?? "off"}`);
+    if (!getSupportedThinkingLevels(currentModels().getModel(selected.model.provider, selected.model.modelId)!).includes(context.thinking ?? "off")) throw new Error(`Unsupported thinking level: ${context.thinking ?? "off"}`);
     const ctx = rt.context.BACKGROUND_CONTEXT;
     const run = await open(loc.runId, selected);
-    const Manifest = rt.durable.defineDoc<{ fingerprint: string }>({ kind: "fabric.durable.request", version: 1, scope: "conversation", history: "latest", fork: "initial", initial: () => ({ fingerprint: selected.fingerprint }) });
+    const Manifest = rt.durable.defineDoc<{ fingerprint: string }>({ kind: "fabric.durable.request", version: 1, scope: "conversation", history: "latest", fork: "initial", initial: () => ({ fingerprint: selected.fingerprint }), checkpointWhen: () => true });
     let conversation = await run.harness.conversation(rt.durable.ROOT_CONVERSATION_ID, ctx);
     if (!conversation && admit) conversation = await run.harness.root(ctx, { agent: { model: selected.model, tools: selected.tools, thinkingLevel: context.thinking ?? "off", cwd: context.cwd, instructions: selected.input.instructions }, init: async (tx, id) => { await tx.doc(Manifest, id); } });
     if (!conversation) throw new Error("Pi durable attach found no existing conversation; outcome indeterminate (not resubmitted)");
@@ -271,7 +273,7 @@ export function createPiDurableRunner(options: PiDurableRunnerOptions): PiDurabl
     capabilities: Object.freeze({ recursiveFabric: false, steer: true, followUp: true, persistentSessions: false, kernels: false, handoff: false, modelDiscovery: true, imageInput: true, compaction: false, questions: false, sleep: false, writePolicy: false }),
     defaultModel: () => defaultModel,
     models: () => [...allowed.values()].flatMap(ref => {
-      const model = options.models.getModel(ref.provider, ref.modelId);
+      const model = currentModels().getModel(ref.provider, ref.modelId);
       return model ? [{ runner: id, provider: ref.provider, id: ref.modelId, key: `${ref.provider}/${ref.modelId}`, name: model.name, input: [...model.input], reasoning: model.reasoning, contextWindow: model.contextWindow, maxTokens: model.maxTokens }] : [];
     }),
     prepare(context) { if (sealed) throw new Error("Pi durable runner is closed"); validate(context); return { version: 1, backend: "pi-durable", storage: identity, runId: context.id } satisfies PiDurableLocator; },

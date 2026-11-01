@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { addCloneFirstWorktree } from "./clone-first-worktree.js";
+import { addCloneFirstWorktree, removeWorktree, worktreeRollbackError } from "./clone-first-worktree.js";
 import { executeFile } from "./transports/process-utils.js";
 import { fabricWorktreePath } from "./worktree-paths.js";
 
@@ -86,8 +86,10 @@ export class WorktreeManager {
       if (!output) throw new Error("Git did not return a worktree root");
       gitRoot = fs.realpathSync(output);
       sourcePrefix = prefix.stdout.trim();
-    } catch {
-      throw new Error("Worktree isolation requires a Git repository");
+    } catch (error) {
+      const failure = error as Error & { stderr?: string };
+      const detail = (failure.stderr?.trim() || failure.message || String(error)).split("\n", 1)[0]!.slice(0, 500);
+      throw new Error(`Worktree isolation requires a Git repository: ${detail}`, { cause: error });
     }
     const branch = `pi-fabric/${safeLabel(name)}-${id.slice(0, 8)}`;
     const worktreePath = fabricWorktreePath(gitRoot, id);
@@ -97,7 +99,14 @@ export class WorktreeManager {
       branch: { flag: "-b", name: branch },
       startPoint: "HEAD",
     });
-    const canonicalWorktreePath = fs.realpathSync(worktreePath);
+    let canonicalWorktreePath: string;
+    try {
+      canonicalWorktreePath = fs.realpathSync(worktreePath);
+    } catch (error) {
+      try { await removeWorktree(gitRoot, worktreePath, branch); }
+      catch (cleanupError) { throw worktreeRollbackError(gitRoot, worktreePath, branch, error, cleanupError); }
+      throw error;
+    }
     const baseRef = await executeFile("git", ["rev-parse", "HEAD"], { cwd: worktreePath, timeoutMs: GIT_SUMMARY_TIMEOUT_MS })
       .then((result) => result.stdout.trim() || undefined, () => undefined);
     const prefix = preserveSourceSubdirectory ? worktreePrefixParts(sourcePrefix) : undefined;
@@ -187,17 +196,8 @@ export class WorktreeManager {
   async cleanup(id: string, deleteBranch = false): Promise<boolean> {
     const lease = this.#leases.get(id);
     if (!lease) return false;
-    await executeFile("git", ["worktree", "remove", "--force", lease.path], {
-      cwd: lease.gitRoot,
-      timeoutMs: 60_000,
-    });
-    if (deleteBranch) {
-      await executeFile("git", ["branch", "-D", lease.branch], {
-        cwd: lease.gitRoot,
-        timeoutMs: 30_000,
-      });
-    }
-    this.#leases.delete(id);
+    await removeWorktree(lease.gitRoot, lease.path, deleteBranch ? lease.branch : undefined);
+    if (this.#leases.get(id) === lease) this.#leases.delete(id);
     return true;
   }
 }

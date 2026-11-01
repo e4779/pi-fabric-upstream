@@ -60,22 +60,27 @@ await compact.request({
   instructions: "Keep the failing test name and the file map; drop the rest.",
   preserve: ["Auth regression is still open", "tests/auth.test.ts"], // optional
   requestedBy: "model", // optional, default "model"
+  seed: "Start phase 2: wire the API", // optional, queued after the commit as a labelled Fabric message
 });
 
 // Read the pending intent and the last committed/failed compaction info.
 const status = await compact.status();
-// { pending?: { reason?, instructions?, preserve?, requestedBy, requestedAt },
+// { pending?: { reason?, instructions?, preserve?, seed?, requestedBy, requestedAt },
 //   last?:   { at, requestedBy, status: "committed"|"cancelled"|"failed",
-//             summary?, tokensBefore?, estimatedTokensAfter?, error? },
+//             summary?, tokensBefore?, estimatedTokensAfter?, error?, seeded? },
 //   lastAuto?: { at, trigger: "headroom"|"tokens"|"ratio", committed },
 //   owner: "fabric"|"pi"|"external"|"none",
-//   outputReserveTokens }
+//   outputReserveTokens,
+//   claim?: { name, version, branchSummary, actions }, // under a claim
+//   ownerStatus? }                                      // owner's own report
 
 // Read context pressure. Never compacts; the program decides what to do.
 const pressure = await compact.pressure();
 // { tokens, contextWindow, fraction, headroomTokens,
 //   band: "ok"|"warn"|"urgent"|"unknown", outputReserveTokens,
-//   thresholdFraction?, thresholdTokens?, owner }
+//   thresholdFraction?, thresholdTokens?, owner,
+//   claim?: { name, version },                          // under a claim
+//   ownerPressure?: { stage, thresholds? } }            // owner's ladder
 
 // Keep a bounded focus list in every Fabric summary until it is cleared.
 await compact.carry({ add: ["Auth regression is still open"] });
@@ -121,8 +126,32 @@ restart, and tree navigation restore it without extra state, and a branch
 keeps its own list. A malformed latest entry reads as an empty list. Custom
 entries never enter the model context. The rendered block is bounded to
 3 KiB like the request block; compaction details record
-`carry: { count, renderedOmittedBytes }`. With `compaction.engine: "pi"` or
-another compaction owner, the list is stored but not rendered.
+`carry: { count, renderedOmittedBytes }`. With `compaction.engine: "pi"`, or
+when an extension wins compaction by load order without a claim, the list is
+stored but not rendered. Under a [compaction owner claim](#compaction-owner-claim)
+the list belongs to the owner and Fabric stores nothing.
+
+##### Carry update contract
+
+Fabric applies one `compact.carry` call to the current list in this order.
+A claim owner that takes `carry` applies the same rules to its own list, so
+the call means the same thing either way.
+
+1. Fabric validates the call first. It accepts only `items`, `add`, and
+   `remove` (arrays of at most 16 strings of 1 to 2048 characters) and
+   `clear` (a boolean).
+2. A call without `items`, `add`, `remove`, or `clear: true` reads the
+   list and changes nothing.
+3. `clear: true` starts from an empty list; otherwise the update starts from
+   the current list.
+4. `items` replaces the list.
+5. `remove` drops every item exactly equal to one of its strings.
+6. `add` appends, in order, each item that is not already present.
+7. Duplicates are dropped; the first occurrence stays.
+8. The result must hold at most 16 items, each not blank and at most 2048
+   characters and 2048 UTF-8 bytes. Otherwise the whole call is rejected
+   and the list is unchanged.
+9. Fabric writes no entry when the result equals the current list.
 
 With only `instructions` present, Fabric forwards it as ordinary Pi
 `customInstructions`. Manual `/compact` text and programmatic requests then
@@ -190,7 +219,186 @@ not an automatically inferred conversational objective.
 - On any other error, Fabric clears the intent and `last` records
   `status: "failed"` with the message. A synchronous throw from `compact()`
   itself follows the same failure path.
+- A `seed` (at most 8192 characters, not blank) is sent only after
+  `onComplete`. Fabric sends it as a labelled custom message, never as a
+  user message, because the compaction removes the context that showed a
+  program wrote it:
 
+  ```ts
+  pi.sendMessage({
+    customType: "fabric-compaction-seed",
+    content: "A Fabric program requested this continuation when it compacted the context. It is not a message from the user.\n"
+      + `<fabric-compaction-seed>\n${escaped}\n</fabric-compaction-seed>`,
+    display: true,
+    details: { version: 1 },
+  }, { triggerTurn: true, deliverAs: "followUp" });
+  ```
+
+  Pi gives the model a custom message as user-role text without its type or
+  details, so the first line carries the origin. Fabric escapes `&`, `<`,
+  and `>` in the seed, so it cannot close the wrapper, and no slash command
+  or template expands. The seed is queued after the compaction commits; a
+  prompt submitted during the compaction runs first. Pi defers a
+  turn-starting message sent during `agent_settled` until the settle
+  finishes, then runs deferred prompts and messages in submission order.
+  `last.seeded` is `true` once Fabric handed the seed to Pi. A cancelled
+  or failed commit never sends it. The seed applies to Fabric's own
+  controller whatever summarizer runs, including `compaction.engine: "pi"`.
+  Under a claim the owner receives the seed instead and sends it the same
+  way (see below).
+
+### Compaction owner claim
+
+Another extension can take compaction from Fabric without
+`compaction.engine: "pi"`, which would also hand `/tree` summaries to Pi.
+The owner emits `pi-fabric:compaction-owner:v1`
+(`FABRIC_COMPACTION_OWNER_EVENT` in `pi-fabric/protocol`) from its
+`session_start` handler or later:
+
+```ts
+import {
+  FABRIC_COMPACTION_OWNER_EVENT,
+  type FabricCompactionOwnerClaimV1,
+  type FabricCompactionOwnerHandleV1,
+} from "pi-fabric/protocol";
+
+let claim: FabricCompactionOwnerHandleV1 | undefined;
+const lifetime = new AbortController();
+pi.on("session_start", (_event, ctx) => {
+  // Fabric may answer after emit returns, so wait for the reply with a timeout.
+  const giveUp = setTimeout(() => lifetime.abort(), 5_000); // no reply: Fabric is not loaded
+  pi.events.emit(FABRIC_COMPACTION_OWNER_EVENT, {
+    version: 1,
+    type: "claim",
+    owner: { name: "example-owner", version: "1.4.0" },
+    actions: {
+      request: { fields: ["instructions", "preserve", "seed"], handler: (request, { signal }) => focus(request, signal) },
+      carry: { fields: ["items", "add", "remove", "clear"], handler: (update) => ({ items: carry(update) }) },
+      status: { handler: () => ({ stage: ladder.stage }) },
+      pressure: { handler: () => ({ stage: ladder.stage, thresholds: { fold: 0.7, compact: 0.9 } }) },
+      cancel: { handler: () => cancelPending() },
+    },
+    // branchSummary: true, // also take /tree summaries
+    signal: lifetime.signal,
+    reply: (result) => {
+      clearTimeout(giveUp);
+      if (!result.ok) {
+        ctx.ui.notify(result.error, "warning");
+        return;
+      }
+      if (lifetime.signal.aborted) {
+        result.handle.withdraw(); // granted after the claimant gave up
+        return;
+      }
+      claim = result.handle;
+      if (result.carry) adoptCarry(result.carry); // Fabric's list at cut-over
+    },
+  } satisfies FabricCompactionOwnerClaimV1);
+});
+```
+
+The first message loads Fabric's claim code, so `reply` is called once, after
+`emit` returns (a Fabric that answers during `emit` is also valid; accept
+both). If it never comes, Fabric is not loaded: abort the claim's `signal` and
+carry on without it. If `{ ok: true }` arrives after you gave up, call
+`handle.withdraw()`. Fabric refuses a claim whose `signal` is already aborted
+when it handles it. It handles messages in the order they were emitted and reads
+each field when it handles the message, so do not change the message after
+emitting it. A message still queued at Fabric's `session_shutdown` is refused:
+a claim gets `{ ok: false, error }` saying Fabric is shutting down. If the
+claim code fails to load, the reply is `{ ok: false, error }` naming the failure.
+
+A successful reply is `{ ok: true, handle, carry? }`. `carry` is a frozen
+copy of Fabric's carry-forward items when the claim was made: the list the
+owner takes over, because `compact.carry` now goes to the owner. It is
+absent when Fabric has not started the session yet, which happens when the
+owner's `session_start` handler runs before Fabric's. The owner then reads
+the latest `pi-fabric-compact-carry` custom entry on the branch itself
+(`data: { version: 1, items }`).
+
+While the claim is held:
+
+- Fabric's `session_before_compact` handler returns nothing, before its
+  threshold deferral. Fabric produces no summary and never cancels the
+  owner's compaction. The owner's own `session_before_compact` handler
+  decides; when it returns nothing, Pi's summarizer runs.
+- Fabric's settled-boundary threshold and headroom trigger stay off.
+- `/tree` summaries stay with Fabric's configured engine unless the claim
+  sets `branchSummary: true`.
+- `compact.request`, `compact.carry`, and `compact.cancel` go to the owner.
+  Fabric validates arguments as usual, then passes a fresh copy holding only
+  the fields the owner declared. An undeclared action or field fails with an
+  error naming the owner (`compaction owner example-owner@1.4.0: ...`),
+  and nothing is recorded, stored, or forwarded. `request` returns
+  `{ requested: true, intent, claim, result? }`. `intent` is a receipt that
+  describes what went to the owner; Fabric records none of it, so
+  `compact.status().pending` stays empty. `carry` handlers return
+  `{ items }` and should apply the [carry update contract](#carry-update-contract)
+  to the owner's own list.
+- A request's `seed` reaches the owner only when it declares the `seed`
+  field, after the same checks as Fabric's own path. Fabric does not send
+  it. Send it after the owner's compaction commits, the way Fabric does: a
+  labelled custom message with `{ triggerTurn: true, deliverAs: "followUp" }`
+  whose text names its origin, not `sendUserMessage`.
+- `compact.cancel` first clears any intent Fabric recorded before the
+  claim. That intent would otherwise commit through the owner at the next
+  settle, with Fabric-encoded instructions and Fabric's seed. It then calls
+  the owner's `cancel`. The result says which happened:
+  `{ cancelled: true, claim, fabricIntentCleared, ownerCancelled, result? }`.
+  Without an owner `cancel`, the call succeeds when Fabric had an intent to
+  clear and fails otherwise.
+- `compact.status` adds `claim: { name, version, branchSummary, actions }`
+  and, when the owner supports `status`, `ownerStatus`. `compact.pressure`
+  adds `claim` and `ownerPressure: { stage, thresholds? }` beside Fabric's
+  band. Fabric omits its own `thresholdFraction` and `thresholdTokens`
+  there because they do not trigger under a claim.
+- Every handler receives `{ context, signal }` (`FabricCompactionOwnerCallV1`):
+  `request` and `carry` as the second argument, the others as the only
+  one. `context` is the invoking session's extension context when Fabric
+  has one. Fabric bounds each handler call at 30 seconds. When the calling program
+  is cancelled or the bound passes, Fabric aborts `signal` and fails the
+  program call at once with `compaction owner <name>@<version>:
+  compact.<action> was cancelled by the calling program` or
+  `... did not finish within 30 s`. Stop the work when `signal` aborts.
+- Owner handler results must be JSON of at most 16 KiB. A handler that throws
+  or returns an invalid shape fails the call with the owner's name. Pressure
+  threshold names `__proto__`, `constructor`, and `prototype` are refused.
+- An expected owner result does not raise Fabric's ownership warning.
+
+The handle's `fallback(event, ctx, { carry? })` returns Fabric's
+deterministic summary for a `session_before_compact` event: the same
+compiler, enrichers, and budget as Fabric's own hook, as
+`{ ok: true, compaction }` or `{ ok: false, reason }`. Return
+`{ compaction }` from the owner's handler when its model summary fails.
+`carry` replaces Fabric's stored carry list and must fit the
+`compact.carry` limits. The result carries Fabric's v2 details
+(`compactor: "fabric"`) plus `claimOwner`, the owner's name, so a
+provenance check can tell the owner's fallback from Fabric's own engine,
+which never sets `claimOwner`. The fallback works only while the claim is
+held.
+
+One claim at a time. A second claim gets `{ ok: false, error, holder }`,
+and Fabric shows a warning that names both owners. If the claimant's
+`reply` throws, Fabric withdraws the claim it just granted and reports the
+error as a warning (UI notice, else `console.warn`), because the owner never
+received its token. A message with no usable `reply` is also reported as a
+warning and dropped; nothing throws from `emit`. The claim ends when:
+
+- the holder calls `handle.withdraw()` or emits
+  `{ version: 1, type: "withdraw", token: handle.token, reply? }`. Any other
+  token is refused with `{ ok: false, error }` and the claim stays;
+- the claim's `signal` aborts; or
+- Fabric receives `session_shutdown`. Pi sends it on reload, session
+  replacement (new, resume, fork), and quit, then loads every extension
+  again, so the owner claims again from its next `session_start`. Fabric
+  clears the claim first, before any other shutdown work.
+
+Withdrawal restores Fabric's engine, thresholds, and `compact.*` behavior.
+Fabric validates the claim and copies only named fields, reading each once:
+`owner.name` and `owner.version` (printable text, at most 128 and 64
+characters), the five known actions with their handlers and known fields,
+`branchSummary`, and `signal`. Unknown keys, actions, or fields are
+rejected with a reply naming the problem.
 ### Agent compaction: `agents.compact`
 
 ```ts
@@ -268,6 +476,8 @@ see [compaction](compaction.md#headroom-trigger).
 | `src/compaction/pressure.ts` | Pure pressure projection from Pi's context usage, the active model, and config. |
 | `src/compaction/carry.ts` | Carry-forward entry codec, update semantics, and summary lines. |
 | `src/compaction/owner.ts` | Compaction owner classification and the once-per-session ownership warning. |
+| `src/compaction/claim.ts` | Compaction owner claim registry: one holder, token withdrawal, abort-signal and shutdown release, and the deterministic fallback. |
+| `src/protocol.ts` | `pi-fabric:compaction-owner:v1` message types and the validating, field-copying reader. |
 | `src/fabric-state.ts` | Constructs the controller with mesh-publish hooks, registers the provider, and resets on re-init or shutdown. |
 | `src/index.ts` | Invokes `state.compact.maybeCommit(context)` in the existing `agent_settled` handler. |
 | `src/agents/types.ts` | Extends `AgentSteerEntry["type"]` with `"compact"` and adds the optional `instructions` field. |

@@ -18,11 +18,13 @@ import {
   withCodePreviewShell,
 } from "./ui/code-preview-shell.js";
 import { fabricExecTitleHintCached } from "./ui/fabric-title-hint.js";
+import type { FabricTerminalTitle } from "./ui/terminal-title.js";
 import { Type } from "typebox";
 import {
+  createFabricPartialExecutionDetails,
   createFabricPersistedExecutionDetails,
   readFabricExecutionRenderDetails,
-} from "./audit/index.js";
+} from "./audit/details.js";
 import { DEFAULT_FABRIC_CONFIG } from "./config.js";
 import type { FabricState } from "./fabric-state.js";
 import { formatFailureProgress } from "./failure-progress.js";
@@ -63,6 +65,7 @@ import {
   restoreFabricWritePreviews,
   restoreLegacyBashCommands,
   safeTerminalText,
+  shellBackgroundShortcut,
   singleCallProgressLine,
   type FabricAgentPreview,
   type FabricCallHeadlinePreview,
@@ -124,18 +127,30 @@ const compactResultHeader = (
   theme: Theme,
   audits: FabricRenderAudit[],
   failed: boolean,
+  omittedCalls = 0,
+  omittedFailed = 0,
 ): string => {
-  const failedCalls = audits.filter((audit) => audit.success === false).length;
+  const failedCalls = audits.filter((audit) => audit.success === false).length + omittedFailed;
   const isFailed = failed || failedCalls > 0;
   return theme.fg(isFailed ? "error" : "success", `${isFailed ? "✗" : "✓"} Tools`) +
     theme.fg(
       "dim",
-      ` · ${countLabel(audits.length, "call")}${failedCalls > 0 ? ` · ${failedCalls} failed` : ""}`,
+      ` · ${countLabel(audits.length + omittedCalls, "call")}${failedCalls > 0 ? ` · ${failedCalls} failed` : ""}`,
     );
 };
 
 const countLabel = (count: number, singular: string): string =>
   `${count} ${count === 1 ? singular : `${singular}s`}`;
+
+/** A detached program's result arrives as a background event, not a tool result. */
+const FABRIC_DETACHED_OUTPUT_CHARS = 6_000;
+
+const fabricDetachedText = (taskId: string, elapsedMs: number, requested: boolean): string =>
+  `[fabric_exec ${requested ? "started in the background" : `moved to the background by the user after ${Math.max(1, Math.round(elapsedMs / 1_000))}s`} as task ${taskId}. ` +
+  "It keeps running with its tools, child agents, and approvals; its result arrives automatically as a background task event when it finishes. " +
+  "Continue independent work, or end this turn if you need the result. Do not start the same program again. " +
+  "The user can now steer you while it runs. Inspect with tools.call({ref:'tasks.get',args:{id}}); stop with tasks.stop. " +
+  "Its child agents stay steerable with agents.steer.]";
 
 export const createFabricExecTool = (
   state: FabricState,
@@ -143,7 +158,9 @@ export const createFabricExecTool = (
   pendingHandoffs: Map<string, PendingFabricHandoff>,
   decorateShell: FabricToolShellDecorator = withCodePreviewShell,
   toolDisplay?: FabricToolDisplayController,
+  terminalTitle?: FabricTerminalTitle,
 ): ToolDefinition<any, any, any> => {
+  const managedHost = state.managedHostOptions;
   const python = toolKernel(state) === "python";
   const monty = python && state.config.executor.pythonRuntime === "monty";
   const repeatGuard = new FabricRepeatGuard(FABRIC_REPEAT_WARN, FABRIC_REPEAT_BLOCK);
@@ -163,14 +180,18 @@ export const createFabricExecTool = (
       );
     },
     label: "Fabric",
-    description: python
+    description: managedHost
+      ? "Execute type-checked TypeScript in the managed QuickJS runtime. See the managed execution guidance for authorized tool contracts."
+      : python
       ? monty
         ? "Execute Python through Fabric's configured Monty sandbox. Monty runs a Python subset with VM resource limits, no native filesystem/network/environment access, and only host-mediated tools. Each invocation starts fresh. This is the exclusive model tool path in full code mode and Schema enforce mode."
         : "Execute Python through Fabric’s configured CPython kernel for Pi core tools, MCP, providers, discovery, and extensions. Each call uses a fresh process. Native execution is trusted code; Schema enforce requires OS isolation. This is the exclusive model tool path in full code mode and Schema enforce mode."
       : "Execute code through Fabric's TypeScript kernel: type-checked TypeScript by default, unmodified JavaScript with executor.codemodeProfile native. Both support nativeTools; native mode places Pi-compatible calls on tools and Fabric discovery on fabric.tools. Compose Pi core tools, MCP, Fabric providers, discovery, and extensions. QuickJS is isolated by default; the optional Node/Bun process is an unsafe trusted-code escape hatch. In full code mode, and always in Schema enforce mode, this is the exclusive model tool path.",
-    promptSnippet:
-      "Pi core tools, MCP, Fabric providers, discovery, and extensions",
-    promptGuidelines: [
+    promptSnippet: managedHost ? `Authorized host tools (${managedHost.providers.join(", ") || "none"}) and deterministic computation`
+      : "Pi core tools, MCP, Fabric providers, discovery, and extensions",
+    promptGuidelines: managedHost ? [
+      "Batch independent operations with bounded concurrency, keep dependent calls ordered, inspect results, and return compact evidence.",
+    ] : [
       python
         ? "Batch independent operations in one `fabric_exec` Python program with `asyncio.gather`; await dependent/conditional steps sequentially. Coalesce independent replacements into one `await pi.edit(path=..., edits=[...])`. Return only the compact final JSON-compatible value."
         : "Batch independent operations in one `fabric_exec` program (`Promise.all` for parallel, sequential `await` for ordered), not one call per tool; keep dependent/conditional steps sequential. Coalesce non-dependent replacements from one file snapshot into one `pi.edit({path, edits:[...]})`; use `all:true` only for intentional repeated exact anchors. Return only the compact final value; intermediate results stay in the sandbox.",
@@ -202,7 +223,9 @@ export const createFabricExecTool = (
     // back to Record<string, string> before Pi validates.
     parameters: Type.Object({
       code: Type.String({
-        description: python
+        description: managedHost
+          ? "TypeScript async function body. Top-level await and return are supported. Named payloads are available as π.key. Follow the managed execution guidance for discovery and tool calls."
+          : python
           ? monty
             ? "Python async function body executed by Monty, a sandboxed Python subset (not CPython). Top-level await/return and asyncio.gather are supported. Use only Monty's supported syntax/modules; native imports, filesystem, network, and environment are unavailable. Host globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await dict/keyword calls; use native dict results r['output']. Payloads: π.key or payloads['key']. Return JSON-compatible data; each invocation starts fresh."
             : "Python async function body executed by CPython. Top-level await and return are supported; standard-library imports are available. Globals: tools, mcp, memory, state, schema, compact, cache, thinking, components, agents, mesh; full-code mode adds pi and extensions. Await host calls using a dict or keyword arguments. Results are native dicts/lists: r['output'], not r.output. Use asyncio.gather for concurrency. Named payloads are π.key or payloads['key']. Return a JSON-compatible value. Each call starts fresh."
@@ -236,6 +259,9 @@ export const createFabricExecTool = (
             "Optional whole-program deadline in ms for this invocation; raises (never lowers) the configured executor.timeoutMs, capped by executor.maxTimeoutMs",
         }),
       ),
+      background: Type.Optional(Type.Boolean({
+        description: "Run the program as a background task and return at once; its result arrives as a background task event. Use for long workflows (many agents) whose result you do not need before continuing.",
+      })),
       timeout_ms: Type.Optional(Type.Integer({ minimum: 1, description: "Hard whole-script deadline in milliseconds; cannot be extended or paused, capped by executor.maxTimeoutMs." })),
       maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Per-call output token budget (estimated at four characters per token), capped by executor.maxOutputChars." })),
       max_output_tokens: Type.Optional(Type.Integer({ minimum: 1, description: "Alias of maxOutputTokens." })),
@@ -486,13 +512,13 @@ export const createFabricExecTool = (
 
       if (isPartial) {
         const progress = details.progress;
-        if (audits.length === 0) {
+        if (audits.length === 0 && !details.omittedCalls) {
           const label = compact ? "Running…" : progress ?? "Running Fabric program…";
           return trackRows(
             new Text(theme.fg("warning", `◆ ${safeTerminalText(label)}`), 0, 0),
           );
         }
-        if (audits.length === 1) {
+        if (audits.length === 1 && !details.omittedCalls) {
           const audit = audits[0]!;
           const glyph =
             audit.success === undefined
@@ -501,6 +527,9 @@ export const createFabricExecTool = (
                 ? theme.fg("error", "✗")
                 : theme.fg("dim", "›");
           let text = `${glyph} ${nestedCallTitle(audit, theme, context?.invalidate, corePreviewContext)}`;
+          if (shellBackgroundShortcut(audit)) {
+            text += nl + theme.fg("dim", "Ctrl+B twice · background waiting shell");
+          }
           const previewLines = renderAgentToolPreviewLines(audit, theme, {
             expanded,
             showTools: showAgentToolPreview,
@@ -568,6 +597,7 @@ export const createFabricExecTool = (
               progress,
               expanded,
               preview,
+              omittedCalls: details.omittedCalls,
               core: corePreviewContext,
               showAgentToolPreview,
               spinner,
@@ -617,8 +647,9 @@ export const createFabricExecTool = (
         ];
       };
       const failed = details.success === false;
+      const omittedCalls = details.omittedCalls?.count ?? 0;
 
-      if (audits.length === 0) {
+      if (audits.length === 0 && omittedCalls === 0) {
         if (failed && details.error) {
           return trackRows(
             new Text(
@@ -653,7 +684,7 @@ export const createFabricExecTool = (
         );
       }
 
-      if (audits.length === 1) {
+      if (audits.length === 1 && omittedCalls === 0) {
         const audit = audits[0]!;
         let text = compact
           ? `${compactResultHeader(theme, audits, failed)}${nl}${nestedCallTitle(
@@ -724,16 +755,16 @@ export const createFabricExecTool = (
 
       const failedCalls = audits.filter(
         (audit) => audit.success === false,
-      ).length;
+      ).length + (details.omittedCalls?.failed ?? 0);
       const status = failed ? "failed" : "complete";
       const statusColor = failed ? "error" : "success";
       const metadata = [
-        countLabel(audits.length, "nested call"),
+        countLabel(audits.length + omittedCalls, "nested call"),
         failedCalls > 0 ? `${failedCalls} failed` : undefined,
         phases.length > 0 ? countLabel(phases.length, "phase") : undefined,
       ].filter((value): value is string => Boolean(value));
       let text = compact
-        ? compactResultHeader(theme, audits, failed)
+        ? compactResultHeader(theme, audits, failed, omittedCalls, details.omittedCalls?.failed ?? 0)
         : theme.fg(
             statusColor,
             `${failed ? "✗" : "✓"} Fabric ${status}`,
@@ -744,7 +775,7 @@ export const createFabricExecTool = (
 
       const callLimit = fabricMulticallCallLimit(expanded);
       const callsShown = audits.slice(0, callLimit);
-      const callsHidden = audits.length - callsShown.length;
+      const callsHidden = audits.length + omittedCalls - callsShown.length;
       let collapsedPreview:
         | { auditIndex: number; body: string; hidden: number }
         | undefined;
@@ -848,7 +879,8 @@ export const createFabricExecTool = (
       // keep the same coercion here for direct internal invocations.
       const joined = Array.isArray(params.code) ? params.code.join("\n") : params.code;
       const code = state.config.executor.kernel === "python" ? joined : repairFabricGuestCode(joined);
-      const repeat = repeatGuard.observe(code);
+      const strings = resolveFabricExecPayloads(params);
+      const repeat = repeatGuard.observe(code, strings);
       if (repeat.blocked) {
         return {
           content: [{ type: "text", text: fabricRepeatBlockText(repeat.count) }],
@@ -857,13 +889,23 @@ export const createFabricExecTool = (
         };
       }
       const runDisplay = normalizeRunDisplay(params.display);
-      const strings = resolveFabricExecPayloads(params);
       const tokenBudget = "tokenBudget" in params && typeof params.tokenBudget === "number"
         ? params.tokenBudget : undefined;
-      const result = await state.execution.execute({
+      // The declared milestone is the window title, and it holds until the next
+      // declared one: nested call detail never flickers in the tab.
+      terminalTitle?.show(context, runDisplay?.name);
+      const program = state.programTasks?.begin({
+        code,
+        ...(runDisplay?.name ? { description: runDisplay.name } : {}),
+        cwd: context.cwd,
+        ...(signal ? { parentSignal: signal } : {}),
+        jobs: () => state.shellJobs,
+      });
+      if (params.background === true) program?.detach();
+      const execution = state.execution.execute({
         code,
         ...(strings ? { strings } : {}),
-        signal,
+        signal: program?.signal ?? signal,
         parentToolCallId: toolCallId,
         context,
         ...(tokenBudget !== undefined ? { tokenBudget } : {}),
@@ -879,198 +921,236 @@ export const createFabricExecTool = (
             }
           : {}),
         onPartial(snapshot) {
-          onUpdate?.({
-            content: [{ type: "text", text: snapshot.progress ?? "" }],
-            details: {
-              progress: snapshot.progress,
-              audits: snapshot.audits,
-              phases: snapshot.phases,
-            },
+          program?.progress(snapshot.progress);
+          // A detached program no longer owns its tool card.
+          if (program?.job || !onUpdate) return;
+          const details = createFabricPartialExecutionDetails(snapshot);
+          onUpdate({
+            content: [{ type: "text", text: details.progress ?? "" }],
+            details,
           });
         },
       });
 
-      const selectedResultFormat =
-        params.resultFormat ?? state.config.executor.resultFormat;
-      const boundarySessionId = context.sessionManager.getSessionId();
-      const pendingHandoff = await state.claimHandoff(
-        result,
-        boundarySessionId,
-        selectedResultFormat,
-        toolCallId,
-      );
-      if (pendingHandoff) {
-        pendingHandoffs.set(toolCallId, pendingHandoff);
-        context.ui.setStatus(
-          "fabric-prewalk",
-          `waiting for fabric_exec boundary → ${String(pendingHandoff.args.model ?? "executor")}`,
+      const finishExecution = async (
+        result: Awaited<typeof execution>,
+        detached: boolean,
+      ) => {
+        const selectedResultFormat =
+          params.resultFormat ?? state.config.executor.resultFormat;
+        const boundarySessionId = context.sessionManager.getSessionId();
+        // A detached program finishes after its boundary turn: it cannot hand off.
+        const pendingHandoff = detached ? undefined : await state.claimHandoff(
+          result,
+          boundarySessionId,
+          selectedResultFormat,
+          toolCallId,
         );
-        // The nudge budget is spent and the arm still has no plan: the handoff
-        // proceeds rather than stalling the session, and that is worth saying.
-        if (pendingHandoff.readiness?.kind === "unplanned") {
-          context.ui.notify(
-            `Prewalk: handing off without a recorded plan after ${pendingHandoff.readiness.prompts} reminders.`,
-            "warning",
+        if (pendingHandoff) {
+          pendingHandoffs.set(toolCallId, pendingHandoff);
+          context.ui.setStatus(
+            "fabric-prewalk",
+            `waiting for fabric_exec boundary → ${String(pendingHandoff.args.model ?? "executor")}`,
+          );
+          // The nudge budget is spent and the arm still has no plan: the handoff
+          // proceeds rather than stalling the session, and that is worth saying.
+          if (pendingHandoff.readiness?.kind === "unplanned") {
+            context.ui.notify(
+              `Prewalk: handing off without a recorded plan after ${pendingHandoff.readiness.prompts} reminders.`,
+              "warning",
+            );
+          }
+        } else if (!detached && state.prewalk.planRequired(boundarySessionId)) {
+          // This boundary was withheld because the plan is still owed. Reflect the
+          // planning phase instead of leaving the footer reading "armed".
+          const prewalkStatus = state.prewalk.status();
+          context.ui.setStatus(
+            "fabric-prewalk",
+            prewalkStatus.state === "armed" ? `plan awaited → ${prewalkStatus.model}` : undefined,
           );
         }
-      } else if (state.prewalk.planRequired(boundarySessionId)) {
-        // This boundary was withheld because the plan is still owed. Reflect the
-        // planning phase instead of leaving the footer reading "armed".
-        const prewalkStatus = state.prewalk.status();
-        context.ui.setStatus(
-          "fabric-prewalk",
-          prewalkStatus.state === "armed" ? `plan awaited → ${prewalkStatus.model}` : undefined,
+        const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
+        const failureProgress = formatFailureProgress(result.trace);
+        const fullSections = [...result.logs];
+        if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
+        if (result.error) fullSections.push(`Runtime error: ${result.error}`);
+        if (failureProgress) fullSections.push(failureProgress);
+        if (repeat.warn) fullSections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
+        const fullRawOutput = fullSections.join("\n\n");
+        const outputBudget = modelOutputBudget(
+          Math.min(
+            state.config.executor.maxOutputChars,
+            (params.maxOutputTokens ?? params.max_output_tokens ?? Infinity) * 4,
+            detached ? FABRIC_DETACHED_OUTPUT_CHARS : Infinity,
+          ),
+          result.success,
         );
-      }
-      const fullFormattedValue = formatFabricValue(result.value, selectedResultFormat);
-      const failureProgress = formatFailureProgress(result.trace);
-      const fullSections = [...result.logs];
-      if (fullFormattedValue.text) fullSections.push(fullFormattedValue.text);
-      if (result.error) fullSections.push(`Runtime error: ${result.error}`);
-      if (failureProgress) fullSections.push(failureProgress);
-      if (repeat.warn) fullSections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
-      const fullRawOutput = fullSections.join("\n\n");
-      const outputBudget = modelOutputBudget(
-        Math.min(state.config.executor.maxOutputChars, (params.maxOutputTokens ?? params.max_output_tokens ?? Infinity) * 4),
-        result.success,
-      );
-      const outputWillTruncate = fullRawOutput.length > outputBudget;
-      const formattedValue = outputWillTruncate
-        ? formatFabricValue(
-            result.value,
-            selectedResultFormat,
-            outputBudget,
-          )
-        : fullFormattedValue;
-      const sections = [...result.logs];
-      const logPrefix = result.logs.join("\n\n");
-      if (formattedValue.text) sections.push(formattedValue.text);
-      if (result.error) sections.push(`Runtime error: ${result.error}`);
-      if (failureProgress) sections.push(failureProgress);
-      if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
-      const rawOutput = sections.join("\n\n");
-      const outputFormat =
-        formattedValue.language &&
-        formattedValue.text &&
-        (result.logs.length === 0 || !outputWillTruncate)
-          ? formattedValue.language
-          : undefined;
-      const outputFormatStartLine = result.logs.length > 0
-        ? countNewlines(logPrefix) + 2
-        : 0;
-      // Evaluated lazily at each return so the main path persists audits after
-      // their in-memory image payloads are stripped below.
-      const persistedRenderDetails = () =>
-        createFabricPersistedExecutionDetails({
-          ...result,
-          ...(outputFormat ? { outputFormat, outputFormatStartLine } : {}),
-          ...(outputFormat
-            ? {
-                outputFormatLines:
-                  formattedValue.highlightedLineCount
-                  ?? countNewlines(formattedValue.text) + 1,
-              }
-            : {}),
-        });
+        const outputWillTruncate = fullRawOutput.length > outputBudget;
+        const formattedValue = outputWillTruncate
+          ? formatFabricValue(
+              result.value,
+              selectedResultFormat,
+              outputBudget,
+            )
+          : fullFormattedValue;
+        const sections = [...result.logs];
+        const logPrefix = result.logs.join("\n\n");
+        if (formattedValue.text) sections.push(formattedValue.text);
+        if (result.error) sections.push(`Runtime error: ${result.error}`);
+        if (failureProgress) sections.push(failureProgress);
+        if (repeat.warn) sections.push(fabricRepeatWarnText(repeat.count, FABRIC_REPEAT_BLOCK));
+        const rawOutput = sections.join("\n\n");
+        const outputFormat =
+          formattedValue.language &&
+          formattedValue.text &&
+          (result.logs.length === 0 || !outputWillTruncate)
+            ? formattedValue.language
+            : undefined;
+        const outputFormatStartLine = result.logs.length > 0
+          ? countNewlines(logPrefix) + 2
+          : 0;
+        // Evaluated lazily at each return so the main path persists audits after
+        // their in-memory image payloads are stripped below.
+        const persistedRenderDetails = () =>
+          createFabricPersistedExecutionDetails({
+            ...result,
+            ...(outputFormat ? { outputFormat, outputFormatStartLine } : {}),
+            ...(outputFormat
+              ? {
+                  outputFormatLines:
+                    formattedValue.highlightedLineCount
+                    ?? countNewlines(formattedValue.text) + 1,
+                }
+              : {}),
+          });
 
-      if (result.typeErrors) {
-        const text = result.typeErrors
-          .map((error) =>
-            error.line > 0
-              ? `Line ${error.line}:${error.column} — ${error.message}`
-              : error.message,
-          )
-          .join("\n");
-        // Guidance parses the guest declarations; load it only on a type error.
-        const { typeErrorRecoveryHint } = await import("./type-error-guidance.js");
-        const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors);
-        const bounded = await boundModelOutput(
-          `Type errors; code was not executed:\n${text}${
-            recoveryHint ? `\n\n${recoveryHint}` : ""
-          }`,
+        if (result.typeErrors) {
+          const text = result.typeErrors
+            .map((error) =>
+              error.line > 0
+                ? `Line ${error.line}:${error.column} — ${error.message}`
+                : error.message,
+            )
+            .join("\n");
+          // Guidance parses the guest declarations; load it only on a type error.
+          const { typeErrorRecoveryHint } = await import("./type-error-guidance.js");
+          const recoveryHint = typeErrorRecoveryHint(code, result.typeErrors);
+          const bounded = await boundModelOutput(
+            `Type errors; code was not executed:\n${text}${
+              recoveryHint ? `\n\n${recoveryHint}` : ""
+            }`,
+            outputBudget,
+          );
+          return {
+            content: [{ type: "text" as const, text: bounded.text }],
+            details: persistedRenderDetails(),
+            isError: true,
+          };
+        }
+
+        const output = (await boundModelOutput(
+          rawOutput || "(no output)",
           outputBudget,
-        );
+          fullRawOutput || "(no output)",
+        )).text;
+        // In-place prewalk continuation arrives as an in-band context message on
+        // this boundary turn, so the loop must keep running: the executor's first
+        // request follows naturally. Terminating here would strand the
+        // continuation — no queued turn remains to carry it.
+        const inPlaceContinuation = pendingHandoff?.kind === "prewalk-in-place";
+        // A successful nested request ends the turn only after the whole program succeeds.
+        const nestedTerminate = result.success &&
+          result.audits.some((audit) => audit.terminate === true && audit.success === true);
+        const terminate =
+          !inPlaceContinuation &&
+          (pendingHandoff !== undefined ||
+            nestedTerminate ||
+            (result.success &&
+              typeof result.value === "object" &&
+              result.value !== null &&
+              "terminate" in result.value &&
+              result.value.terminate === true));
+        // A nested `pi.read` of an image returns image content blocks that
+        // normalizeResult stripped (the sandbox holds text only). The provider
+        // handed them out-of-band to each call audit; re-attach them here so
+        // pi core's ToolExecutionComponent renders a kitty image preview — the
+        // same path a native `read` takes — for single-call AND multitool
+        // reads. pi-vision-handoff keeps the image in the nested tool_result
+        // (its `context` hook swaps image→description on the LLM-bound
+        // fabric_exec clone), so every read audit carries its image here.
+        const mediaBlocks: FabricMediaBlock[] = [];
+        // Images the guest returned directly, hoisted out of the text channels by
+        // the media sanitizer; their descriptors remain in the text.
+        for (const block of result.media ?? []) mediaBlocks.push(block);
+        for (const audit of result.audits) {
+          if (audit.media) mediaBlocks.push(...audit.media);
+        }
+        const singleAudit = result.audits.length === 1 ? result.audits[0] : undefined;
+        // The read tool's own text note (e.g. "Read image file [image/png]"),
+        // captured after the handoff stripped pi's non-vision note. Used as
+        // the single-call body + content text so the preview shows the kitty
+        // image + the clean note (like pi core) instead of the handoff's
+        // verbose description. Multitool renders each read's note as its own
+        // call body, so the joined program return suffices as the content text
+        // there.
+        const mediaNote = singleAudit?.mediaNote;
+        // The base64 payload now lives in the result content; discard the
+        // duplicate in-memory audit copies before returning.
+        for (const audit of result.audits) {
+          delete audit.media;
+          delete audit.mediaNote;
+        }
+        const content: Array<{ type: "text"; text: string } | FabricMediaBlock> = [];
+        if (mediaBlocks.length > 0) {
+          // Mirror a native `read`: keep the image block(s) for pi core's kitty
+          // render alongside the short note. The handoff's `context` hook
+          // swaps each image for its description on the LLM-bound clone, so the
+          // text-only model still receives the description while the terminal
+          // shows the kitty image.
+          const textOutput =
+            singleAudit && mediaNote
+              ? mediaNote
+              : (output === "(no output)" ? "" : output);
+          if (textOutput) content.push({ type: "text", text: textOutput });
+          for (const block of mediaBlocks) content.push(block);
+          if (singleAudit && mediaNote) {
+            singleAudit.result = mediaNote;
+          }
+        } else {
+          content.push({ type: "text", text: output });
+        }
         return {
-          content: [{ type: "text", text: bounded.text }],
+          content,
           details: persistedRenderDetails(),
-          isError: true,
+          ...(result.usage ? { usage: result.usage } : {}),
+          ...(terminate ? { terminate: true } : {}),
+          ...(result.success ? {} : { isError: true }),
+        };
+      };
+
+      const raced = program
+        ? await program.race(execution)
+        : { detached: false as const, value: await execution };
+      if (raced.detached) {
+        void execution.then(
+          async (result) => {
+            const finished = await finishExecution(result, true);
+            const text = finished.content
+              .map((part) => (part.type === "text" ? part.text : "[image omitted]"))
+              .join("\n");
+            await program!.complete(text, !finished.isError);
+          },
+          (error: unknown) => program!.complete(
+            `Runtime error: ${error instanceof Error ? error.message : String(error)}`,
+            false,
+          ),
+        ).catch(() => undefined);
+        return {
+          content: [{ type: "text", text: fabricDetachedText(raced.job.id, raced.elapsedMs, params.background === true) }],
+          details: undefined,
         };
       }
-
-      const output = (await boundModelOutput(
-        rawOutput || "(no output)",
-        outputBudget,
-        fullRawOutput || "(no output)",
-      )).text;
-      // In-place prewalk continuation arrives as an in-band context message on
-      // this boundary turn, so the loop must keep running: the executor's first
-      // request follows naturally. Terminating here would strand the
-      // continuation — no queued turn remains to carry it.
-      const inPlaceContinuation = pendingHandoff?.kind === "prewalk-in-place";
-      const terminate =
-        !inPlaceContinuation &&
-        (pendingHandoff !== undefined ||
-          (result.success &&
-            typeof result.value === "object" &&
-            result.value !== null &&
-            "terminate" in result.value &&
-            result.value.terminate === true));
-      // A nested `pi.read` of an image returns image content blocks that
-      // normalizeResult stripped (the sandbox holds text only). The provider
-      // handed them out-of-band to each call audit; re-attach them here so
-      // pi core's ToolExecutionComponent renders a kitty image preview — the
-      // same path a native `read` takes — for single-call AND multitool
-      // reads. pi-vision-handoff keeps the image in the nested tool_result
-      // (its `context` hook swaps image→description on the LLM-bound
-      // fabric_exec clone), so every read audit carries its image here.
-      const mediaBlocks: FabricMediaBlock[] = [];
-      // Images the guest returned directly, hoisted out of the text channels by
-      // the media sanitizer; their descriptors remain in the text.
-      for (const block of result.media ?? []) mediaBlocks.push(block);
-      for (const audit of result.audits) {
-        if (audit.media) mediaBlocks.push(...audit.media);
-      }
-      const singleAudit = result.audits.length === 1 ? result.audits[0] : undefined;
-      // The read tool's own text note (e.g. "Read image file [image/png]"),
-      // captured after the handoff stripped pi's non-vision note. Used as
-      // the single-call body + content text so the preview shows the kitty
-      // image + the clean note (like pi core) instead of the handoff's
-      // verbose description. Multitool renders each read's note as its own
-      // call body, so the joined program return suffices as the content text
-      // there.
-      const mediaNote = singleAudit?.mediaNote;
-      // The base64 payload now lives in the result content; discard the
-      // duplicate in-memory audit copies before returning.
-      for (const audit of result.audits) {
-        delete audit.media;
-        delete audit.mediaNote;
-      }
-      const content: Array<{ type: "text"; text: string } | FabricMediaBlock> = [];
-      if (mediaBlocks.length > 0) {
-        // Mirror a native `read`: keep the image block(s) for pi core's kitty
-        // render alongside the short note. The handoff's `context` hook
-        // swaps each image for its description on the LLM-bound clone, so the
-        // text-only model still receives the description while the terminal
-        // shows the kitty image.
-        const textOutput =
-          singleAudit && mediaNote
-            ? mediaNote
-            : (output === "(no output)" ? "" : output);
-        if (textOutput) content.push({ type: "text", text: textOutput });
-        for (const block of mediaBlocks) content.push(block);
-        if (singleAudit && mediaNote) {
-          singleAudit.result = mediaNote;
-        }
-      } else {
-        content.push({ type: "text", text: output });
-      }
-      return {
-        content,
-        details: persistedRenderDetails(),
-        ...(result.usage ? { usage: result.usage } : {}),
-        ...(terminate ? { terminate: true } : {}),
-        ...(result.success ? {} : { isError: true }),
-      };
+      return finishExecution(raced.value, false);
     },
   }),
   {

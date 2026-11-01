@@ -62,7 +62,7 @@ describe("extension-only bootstrap", () => {
     vi.resetModules();
     compilerLoaded.mockClear();
     const { default: register, FABRIC_MANAGED_HOST_VERSION } = await import("../src/extension-bootstrap.js");
-    expect(FABRIC_MANAGED_HOST_VERSION).toBe(1);
+    expect(FABRIC_MANAGED_HOST_VERSION).toBe(2);
     const host = fixture();
     const originalRegister = host.pi.registerTool;
     await register(host.pi);

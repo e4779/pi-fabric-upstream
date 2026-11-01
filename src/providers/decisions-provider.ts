@@ -177,6 +177,10 @@ export class DecisionsProvider implements FabricProvider {
   constructor(
     readonly store: DecisionStore,
     readonly identity: MeshIdentity,
+    /** Bound for a wait with neither a call `timeoutMs` nor a decision deadline
+     * (`executor.maxTimeoutMs`): `decisions.wait` pauses the program deadline,
+     * so nothing else would end it in an unattended run. */
+    readonly unboundedWaitMs?: number,
   ) {}
 
   async list(request: FabricProviderListRequest): Promise<FabricActionDescriptor[]> {
@@ -205,11 +209,18 @@ export class DecisionsProvider implements FabricProvider {
         context.activity?.({ type: "progress", message: `Decision raised: ${record.title}` });
         return { id: record.id };
       }
-      case "wait":
-        return this.store.wait(assertDecisionId(args.id), {
-          ...(typeof args.timeoutMs === "number" ? { timeoutMs: args.timeoutMs } : {}),
+      case "wait": {
+        const id = assertDecisionId(args.id);
+        const timeoutMs = typeof args.timeoutMs === "number"
+          ? args.timeoutMs
+          : this.unboundedWaitMs !== undefined && (await this.store.get(id))?.deadline === undefined
+            ? this.unboundedWaitMs
+            : undefined;
+        return this.store.wait(id, {
+          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
           ...(context.signal ? { signal: context.signal } : {}),
         });
+      }
       case "list":
         return this.store.list({
           ...(typeof args.status === "string" ? { status: args.status as DecisionStatus } : {}),

@@ -88,6 +88,34 @@ describe("PiToolsProvider lifecycle", () => {
     expect(toolResult.toolCallId.startsWith(NESTED_TOOL_CALL_ID_PREFIX)).toBe(true);
   });
 
+  it("marks a foreground TUI shell before and during streamed output, but not RPC", async () => {
+    const operations: BashOperations = { exec: async (_command, _cwd, { onData }) => {
+      onData(Buffer.from("streamed\n"));
+      return { exitCode: 0 };
+    } };
+    const registry = registerWithRunner(makeRunner(), operations);
+    for (const { mode, background } of [
+      { mode: "tui", background: false },
+      { mode: "rpc", background: false },
+      { mode: "tui", background: true },
+    ] as const) {
+      const audits: FabricCallAudit[] = [];
+      const previews: unknown[] = [];
+      await registry.invoke("pi.bash", { command: "echo hello", ...(background ? { background: true } : {}) }, {
+        ...baseContext, audits,
+        update: () => previews.push(structuredClone(audits[0]?.preview)),
+        extensionContext: { ...baseContext.extensionContext, mode } as ExtensionContext,
+      });
+      const marked = previews.filter((preview) =>
+        (preview as { shellBackgroundShortcut?: boolean } | undefined)?.shellBackgroundShortcut === true);
+      if (mode === "tui" && !background) {
+        expect(marked).toContainEqual({ shellBackgroundShortcut: true });
+        expect(marked).toContainEqual(expect.objectContaining({ result: "streamed" }));
+      } else expect(marked).toHaveLength(0);
+      expect(audits[0]?.success).toBe(true);
+    }
+  });
+
   it("names the calling tool call on every replayed event", async () => {
     const events: { type: string; toolCallId: string; parentToolCallId?: string }[] = [];
     const record = (result?: unknown) => vi.fn(async (event: (typeof events)[number]) => {

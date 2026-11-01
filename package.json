@@ -1,6 +1,6 @@
 {
   "name": "pi-fabric",
-  "version": "0.117.2",
+  "version": "0.131.0",
   "description": "A programmable tool and agent runtime for Pi",
   "type": "module",
   "main": "./dist/index.js",
@@ -28,6 +28,18 @@
     "./durable": {
       "types": "./dist/durable.d.ts",
       "import": "./dist/durable.js"
+    },
+    "./durable-host": {
+      "types": "./dist/durable-host.d.ts",
+      "import": "./dist/durable-host.js"
+    },
+    "./durable-extension": {
+      "types": "./dist/durable-extension.d.ts",
+      "import": "./dist/durable-extension.js"
+    },
+    "./durable-extension/wasm": {
+      "types": "./dist/durable-extension-wasm.d.ts",
+      "import": "./dist/durable-extension-wasm.js"
     },
     "./mcp": {
       "types": "./dist/mcp.d.ts",
@@ -57,18 +69,16 @@
     "README.md",
     "LICENSE",
     "THIRD_PARTY_NOTICES.md",
-    "LAWS.bend",
-    "PROOF.bend",
     "proofs/",
-    "scripts/verified-kernels.mjs",
-    "scripts/test-verified-kernels.mjs"
+    "scripts/verified-kernels.ts"
   ],
   "scripts": {
-    "proof:generate": "node scripts/verified-kernels.mjs --write",
-    "proof:check": "node scripts/verified-kernels.mjs --check && node scripts/test-verified-kernels.mjs",
-    "proof:artifact": "node scripts/verified-kernels.mjs --artifact",
+    "proof:generate": "bun scripts/verified-kernels.ts --write",
+    "proof:check": "bun scripts/verified-kernels.ts --check",
+    "proof:artifact": "bun scripts/verified-kernels.ts --artifact",
     "proof:dist": "node scripts/smoke-verified-kernels.mjs",
-    "build": "bun run proof:artifact && node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json --emitDeclarationOnly && node scripts/build.mjs && bun run assert:build-artifacts",
+    "benchmark:verification": "node scripts/benchmark-verification.mjs",
+    "build": "bun run proof:artifact && node scripts/build-dist.mjs",
     "typecheck": "tsc --noEmit",
     "test:pi1": "bun run build && vitest run tests/pi1-sdk.test.ts tests/pi1-public-contract.test.ts tests/pi110-compaction-contract.test.ts",
     "test:jev:live": "PI_FABRIC_JEV_LIVE=1 vitest run tests/jev-live.test.ts",
@@ -127,15 +137,15 @@
   },
   "pi": {
     "extensions": [
-      "./dist/extension-bootstrap.js",
-      "./node_modules/pi-coralbricks-provider/index.ts"
+      "./dist/extension-bootstrap.js"
     ],
     "skills": [],
     "image": "https://raw.githubusercontent.com/fabric-runtime/pi-fabric/main/media/banner.svg"
   },
   "dependencies": {
-    "@earendil-works/chord": "1.3.0",
-    "@earendil-works/pi-durable": "1.3.0",
+    "@earendil-works/chord": "1.4.0",
+    "@earendil-works/pi-codemode": "1.4.0",
+    "@earendil-works/pi-durable": "1.4.0",
     "@jitl/quickjs-singlefile-mjs-release-sync": "^0.32.0",
     "@lezer/common": "^1.5.2",
     "@lezer/python": "^1.1.19",
@@ -145,33 +155,33 @@
     "cross-spawn": "^7.0.6",
     "diff": "^9.0.0",
     "mcporter": "^0.12.3",
-    "pi-coralbricks-provider": "1.0.32",
-    "pi-fabric-worker-sdk": "npm:@earendil-works/pi-coding-agent@1.3.0",
+    "pi-fabric-worker-sdk": "npm:@earendil-works/pi-coding-agent@1.4.0",
     "quickjs-emscripten-core": "^0.32.0",
     "shiki": "4.4.3",
     "typescript": "^6.0.3",
     "yaml": "^2.9.0"
   },
-  "bundledDependencies": [
-    "pi-coralbricks-provider"
-  ],
   "peerDependencies": {
     "@earendil-works/pi-agent-core": "*",
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "typebox": "*",
+    "@earendil-works/chord": ">=1.4.0",
+    "@earendil-works/pi-codemode": ">=1.4.0",
+    "@earendil-works/pi-durable": ">=1.4.0"
   },
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "1.3.0",
-    "@earendil-works/pi-ai": "1.3.0",
-    "@earendil-works/pi-coding-agent": "1.3.0",
-    "@earendil-works/pi-tui": "1.3.0",
-    "typebox": "1.3.27",
+    "@earendil-works/pi-agent-core": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-tui": "1.4.0",
     "@types/cross-spawn": "^6.0.6",
     "@types/node": "^26.1.2",
     "esbuild": "^0.25.12",
+    "gdp-wired": "0.31.1",
     "knip": "^6.29.0",
+    "typebox": "1.3.27",
     "vitest": "^4.1.10"
   },
   "workspaces": [
@@ -187,5 +197,16 @@
   },
   "optionalDependencies": {
     "jev-fabric": "0.8.0"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/chord": {
+      "optional": true
+    },
+    "@earendil-works/pi-codemode": {
+      "optional": true
+    },
+    "@earendil-works/pi-durable": {
+      "optional": true
+    }
   }
 }

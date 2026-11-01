@@ -184,7 +184,6 @@ interface WorkingEntry {
   ref: string;
   key: string;
   values: Map<string, { value: string | number | boolean; count: number }>;
-  total: number;
 }
 
 const workingFromPool = (
@@ -201,7 +200,6 @@ const workingFromPool = (
       ref: entry.ref,
       key: entry.key,
       values,
-      total: entry.total,
     });
   }
   return working;
@@ -216,12 +214,13 @@ const applyEntryDelta = (
   const entryId = `${ref}${SEPARATOR}${key}`;
   let entry = working.get(entryId);
   if (!entry) {
-    entry = { ref, key, values: new Map(), total: 0 };
+    entry = { ref, key, values: new Map() };
     working.set(entryId, entry);
   }
   const current = entry.values.get(valueKey);
+  // A tracked session's snapshot can still hold values the cap already
+  // evicted, so a retraction only removes what the entry still retains.
   const nextCount = (current?.count ?? 0) + weight;
-  entry.total += weight;
   if (nextCount > 0) {
     entry.values.set(valueKey, {
       value: current?.value ?? valueFromKey(valueKey),
@@ -230,7 +229,7 @@ const applyEntryDelta = (
   } else {
     entry.values.delete(valueKey);
   }
-  if (entry.values.size === 0 && entry.total <= 0) working.delete(entryId);
+  if (entry.values.size === 0) working.delete(entryId);
   return entryId;
 };
 
@@ -253,7 +252,6 @@ const enforceValueCap = (entry: WorkingEntry): void => {
       }
     }
     if (evictKey === undefined) return;
-    entry.total -= entry.values.get(evictKey)!.count;
     entry.values.delete(evictKey);
   }
 };
@@ -268,7 +266,9 @@ const serializePool = (
     .map((entry) => ({
       ref: entry.ref,
       key: entry.key,
-      total: entry.total,
+      // Derived, never accumulated: the total always equals the retained
+      // counts, whatever deltas and evictions the merge applied.
+      total: [...entry.values.values()].reduce((sum, item) => sum + item.count, 0),
       values: [...entry.values.values()]
         .map((item) => ({ value: item.value, count: item.count }))
         .sort(

@@ -130,7 +130,7 @@ return {"output": r["output"], "chars": len(text)}
 
 ### Shared host bridge, not TypeScript syntax
 
-Python uses the same host action namespaces: `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `agents`, `mesh`, and other registered Fabric providers. Full code mode also exposes `pi` and `extensions`; schema enforce uses the full-code bridge. Known actions use direct async calls, while computed refs use `tools.call`:
+Python uses the same host action namespaces: `tools`, `mcp`, `memory`, `state`, `schema`, `compact`, `agents`, and `mesh`. A provider another extension registers is a global named after it, for example `await context.task_add(title="x")`; see [program globals](providers.md#program-globals-and-types). Full code mode also exposes `pi` and `extensions`; schema enforce uses the full-code bridge. Known actions use direct async calls, while computed refs use `tools.call`:
 
 ```python
 hits = await tools.search({"query": "deployment status", "limit": 3})

@@ -1,6 +1,16 @@
-import { isFabricThinking, type FabricThinking } from "../thinking.js";
+import type { FabricThinking } from "../thinking.js";
+import { PROVIDER_MODEL_RE, normalizeModelAliases, type FabricModelAliases } from "./model-aliases.js";
 
-const PROVIDER_MODEL_RE = /^[^\s/]+\/[^\s]+$/;
+export { normalizeModelAliases };
+export type { FabricModelAlias, FabricModelAliases } from "./model-aliases.js";
+
+/** How a Pi `model` selector is matched. Omitted keeps alias, closest and fuzzy resolution. */
+export type FabricModelMatch = "exact";
+
+export const EXACT_MODEL_FORM_ERROR =
+  'modelMatch "exact" requires model in provider/id form, as listed by agents.models({ runner: "pi" }).';
+export const EXACT_MODEL_RUNNER_ERROR =
+  'modelMatch "exact" is supported only by the pi and pi-durable runners.';
 
 /** Minimal model view needed for resolution; satisfied by pi Model entries. */
 export interface FabricModelCandidate {
@@ -15,19 +25,6 @@ export type FabricModelResolution =
   | { kind: "ambiguous"; query: string; candidates: FabricModelCandidate[] }
   | { kind: "not-found"; query: string; tried?: string[] };
 
-/**
- * One configured alias: an ordered fallback chain plus an optional default
- * thinking level. The thinking level is a Fabric default for runs that select
- * the alias, below an explicit call/actor value and above the global
- * `agents.thinking` default.
- */
-export interface FabricModelAlias {
-  targets: string[];
-  thinking?: FabricThinking;
-}
-
-export type FabricModelAliases = Record<string, FabricModelAlias>;
-
 /** Markers reported in `via` when an inexact selector is fuzzy-resolved. */
 export const FUZZY_RESOLUTION_MARKERS = ["closest", "recent", "latest"] as const;
 
@@ -40,52 +37,6 @@ const sameModel = (
   right !== undefined &&
   left.provider.toLowerCase() === right.provider.toLowerCase() &&
   left.id.toLowerCase() === right.id.toLowerCase();
-
-/**
- * Normalize raw `models.aliases` config into alias name → ordered targets.
- * String targets degrade to one-element fallback chains. Entries whose name,
- * target list, or any `provider/model` target string is malformed are
- * dropped entirely, matching the lenient fallback style of the other config
- * normalizers (no partial alias survives with a silently missing target).
- */
-export const normalizeModelAliases = (input: unknown): FabricModelAliases => {
-  if (typeof input !== "object" || input === null || Array.isArray(input)) return {};
-  const aliases: FabricModelAliases = {};
-  for (const [rawName, rawValue] of Object.entries(input as Record<string, unknown>)) {
-    const name = rawName.trim();
-    if (!name) continue;
-    // Object entries carry {model, thinking?}; re-normalizing them keeps a
-    // config round trip through persisted state or a resident owner idempotent.
-    const entry =
-      typeof rawValue === "object" && rawValue !== null && !Array.isArray(rawValue)
-        ? (rawValue as { model?: unknown; targets?: unknown; thinking?: unknown })
-        : undefined;
-    const rawTargets = entry ? entry.model ?? entry.targets : rawValue;
-    const values = typeof rawTargets === "string" ? [rawTargets] : rawTargets;
-    if (!Array.isArray(values) || values.length === 0) continue;
-    const targets: string[] = [];
-    let valid = true;
-    for (const candidate of values) {
-      if (typeof candidate !== "string") {
-        valid = false;
-        break;
-      }
-      const target = candidate.trim();
-      if (!PROVIDER_MODEL_RE.test(target)) {
-        valid = false;
-        break;
-      }
-      if (!targets.includes(target)) targets.push(target);
-    }
-    if (valid && targets.length > 0) {
-      aliases[name] = {
-        targets,
-        ...(entry && isFabricThinking(entry.thinking) ? { thinking: entry.thinking } : {}),
-      };
-    }
-  }
-  return aliases;
-};
 
 /**
  * Default thinking level configured for a selector that names an alias, or
@@ -318,6 +269,7 @@ export const resolveFabricModel = (
 
 const unavailablePiModelError = (
   query: string,
+  registryError: unknown,
   resolution?: Extract<FabricModelResolution, { kind: "ambiguous" | "not-found" }>,
 ): Error => {
   const detail = resolution?.kind === "not-found" && resolution.tried !== undefined
@@ -325,8 +277,11 @@ const unavailablePiModelError = (
     : resolution?.kind === "ambiguous"
       ? ` Visible matches: ${resolution.candidates.map(modelKey).join(", ")}.`
       : "";
+  const registry = registryError === undefined
+    ? ""
+    : ` The model registry failed: ${registryError instanceof Error ? registryError.message : String(registryError)}.`;
   return new Error(
-    `Model ${JSON.stringify(query)} is not available to this Pi session.${detail} ` +
+    `Model ${JSON.stringify(query)} is not available to this Pi session.${detail}${registry} ` +
       'Use agents.models({ runner: "pi" }) to list the models visible to this session.',
   );
 };
@@ -343,6 +298,8 @@ export const resolveAvailablePiModel = (
     aliases: FabricModelAliases;
     available: readonly FabricModelCandidate[];
     lastUsed?: FabricModelUsage;
+    /** Why the visible set is empty, when reading the registry threw. */
+    registryError?: unknown;
   },
 ): FabricModelCandidate => {
   const query = selector.trim();
@@ -363,12 +320,70 @@ export const resolveAvailablePiModel = (
       options.lastUsed,
     )?.model;
     if (closest) return closest;
-    throw unavailablePiModelError(query);
+    throw unavailablePiModelError(query, options.registryError);
   }
 
   const resolution = resolveFabricModel(query, options);
   if (resolution.kind === "resolved" || resolution.kind === "already-active") {
     return resolution.model;
   }
-  throw unavailablePiModelError(query, resolution);
+  throw unavailablePiModelError(query, options.registryError, resolution);
+};
+
+/**
+ * Resolve a Pi participant selector with no alias, closest-match or fuzzy step.
+ * The selector must be a provider/id the visible registry lists. Matching keeps
+ * the case-insensitive rule of every other exact lookup here (an identical
+ * spelling is preferred), and the returned candidate carries the registry's own casing. Used when a request sets
+ * `modelMatch: "exact"`, where a model that is not listed must be refused rather
+ * than replaced by a different one.
+ */
+export const resolveExactAvailablePiModel = (
+  selector: string,
+  options: { available: readonly FabricModelCandidate[]; registryError?: unknown },
+): FabricModelCandidate => {
+  const query = selector.trim();
+  if (!PROVIDER_MODEL_RE.test(query)) throw new Error(EXACT_MODEL_FORM_ERROR);
+  // An identical spelling wins, so registry entries that differ only by case never trade places.
+  const exact = options.available.find((model) => modelKey(model) === query)
+    ?? options.available.find((model) => modelKey(model).toLowerCase() === query.toLowerCase());
+  if (exact) return exact;
+  throw unavailablePiModelError(query, options.registryError);
+};
+
+/** Resolve a Pi selector by the request's match mode; omitted keeps alias, closest and fuzzy resolution. */
+export const resolvePiModelSelector = (
+  selector: string,
+  options: {
+    aliases: FabricModelAliases;
+    available: readonly FabricModelCandidate[];
+    lastUsed?: FabricModelUsage;
+    registryError?: unknown;
+  },
+  modelMatch?: FabricModelMatch,
+): FabricModelCandidate =>
+  modelMatch === "exact"
+    ? resolveExactAvailablePiModel(selector, options)
+    : resolveAvailablePiModel(selector, options);
+
+/**
+ * Structural checks for an exact-match request that need no model registry:
+ * only Pi runners resolve against the Pi registry, and the model must be a
+ * provider/id. Refusing a non-Pi runner is deliberate: its model string is
+ * forwarded verbatim to a backend that may apply its own aliases, so forwarding
+ * it could not honour "exactly this model".
+ */
+export const assertExactModelRequest = (request: {
+  modelMatch?: unknown;
+  runner: string;
+  model?: unknown;
+}): void => {
+  if (request.modelMatch === undefined) return;
+  if (request.modelMatch !== "exact") {
+    throw new Error(`Invalid Fabric agent modelMatch: ${JSON.stringify(request.modelMatch)}`);
+  }
+  if (request.runner !== "pi" && request.runner !== "pi-durable") throw new Error(EXACT_MODEL_RUNNER_ERROR);
+  if (typeof request.model !== "string" || !PROVIDER_MODEL_RE.test(request.model.trim())) {
+    throw new Error(EXACT_MODEL_FORM_ERROR);
+  }
 };

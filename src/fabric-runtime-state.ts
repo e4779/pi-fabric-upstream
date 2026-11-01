@@ -1,10 +1,12 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { FabricHostPolicy } from "./core/host-policy.js";
 import { resolveAgentDir } from "./core/agent-dir.js";
 import { loadHostSdk } from "./core/host-sdk.js";
 import { requestChildTraceContext } from "./agents/trace-context-request.js";
 import {
-  resolveAvailablePiModel,
+  resolvePiModelSelector,
   type FabricModelCandidate,
+  type FabricModelMatch,
 } from "./core/model-resolution.js";
 import { loadModelUsage } from "./core/model-usage.js";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -18,7 +20,10 @@ import { DEFAULT_SHELL_HANG_MS, FabricShellJobStore } from "./core/shell-jobs.js
 import { GlobalActorRegistry } from "./actors/global-registry.js";
 import { buildActorContext } from "./actors/context.js";
 import { actorDeliveryNotice } from "./actors/delivery-policy.js";
-import { prepareFabricActorHostPayload } from "./actors/host-event-payload.js";
+import {
+  prepareFabricActorContextPayload,
+  prepareFabricActorHostPayload,
+} from "./actors/host-event-payload.js";
 import type { JevObservationHost } from "./jev/observation.js";
 import { resolveJevModelRoute } from "./jev/routes.js";
 import type { FabricActorHostEvent } from "./actors/types.js";
@@ -33,6 +38,7 @@ import {
 } from "./components/model-guidance.js";
 import { builtinModelGuidance } from "./components/builtin-guidance.js";
 import { FabricComponentSupervisor } from "./components/supervisor.js";
+import { warnProviderGlobalConflict } from "./provider-globals.js";
 import {
   createProviderComponent,
   FABRIC_COMPONENT_PROVIDER_NAMES,
@@ -56,7 +62,15 @@ import {
   type FabricCapabilityViewLease,
 } from "./core/action-registry.js";
 import { FabricSessionApprovals } from "./core/approval-controller.js";
-import { CompactController, type CompactLastCommit, type CompactPendingIntent } from "./core/compact-controller.js";
+import type { FabricActionPolicyHooks } from "./core/action-policy-hooks.js";
+import type { FabricQuestionRenderers } from "./fabric-state.js";
+import {
+  COMPACTION_SEED_DELIVERY,
+  CompactController,
+  type CompactLastCommit,
+  type CompactPendingIntent,
+} from "./core/compact-controller.js";
+import type { ActiveCompactionOwner } from "./compaction/claim.js";
 import { FabricToolResultProxy } from "./core/tool-result-proxy.js";
 import { FabricExecutionService, type FabricExecutionResult } from "./execution-service.js";
 import { RepairCompiler } from "./repairs/compiler.js";
@@ -134,6 +148,9 @@ import {
 import { AgentManager } from "./agents/manager.js";
 import { AgentCompletionInbox } from "./agents/completion-inbox.js";
 import { PeerPresenceNotifier } from "./topology/peer-presence.js";
+import { recordedPeerLabel, SessionLabelPresenter } from "./topology/session-label.js";
+import { sessionLabelSettings } from "./topology/session-label-settings.js";
+import type { HerdrAgentStatus } from "./agents/herdr-status.js";
 import { ShellEventInbox } from "./core/shell-inbox.js";
 import { FabricShellTimingBridge } from "./core/shell-timing.js";
 import { readFabricBashMiddleware } from "./core/shell-middleware.js";
@@ -171,6 +188,28 @@ import { captureLoadedFileIdentity, type FabricLoadedFileIdentity } from "./buil
 // captured at activation is the ground truth a reload-freshness check compares
 // the current disk file against.
 const FABRIC_RUNTIME_MODULE_IDENTITY = captureLoadedFileIdentity(import.meta.url);
+/** Longest shutdown waits for Fabric to clear its label and agent status from Herdr. */
+const HERDR_CLOSE_TIMEOUT_MS = 2_000;
+
+/** Wait for a Herdr cleanup, bounded so a stuck socket cannot hold up shutdown. */
+const closeWithinTimeout = async (closing: Promise<void>): Promise<void> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    closing.catch(() => undefined),
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, HERDR_CLOSE_TIMEOUT_MS);
+      timer.unref?.();
+    }),
+  ]);
+  clearTimeout(timer);
+};
+
+/** An interactive root session in a Herdr pane, where Herdr shows its state. */
+const herdrStatusAvailable = (context: ExtensionContext): boolean =>
+  context.mode === "tui" &&
+  process.env.HERDR_ENV === "1" &&
+  Boolean(process.env.HERDR_PANE_ID) &&
+  Boolean(process.env.HERDR_SOCKET_PATH);
 
 export interface FabricRuntimeStateOptions {
   managedHost?: FabricManagedHost;
@@ -178,15 +217,23 @@ export interface FabricRuntimeStateOptions {
   prewalk?: PrewalkController;
   prewalkDrift?: PrewalkDriftTracker;
   sessionApprovals?: FabricSessionApprovals;
+  actionPolicyHooks?: FabricActionPolicyHooks;
+  questionRenderers?: FabricQuestionRenderers;
   thinking?: FabricThinkingController;
   paths?: FabricRuntimePaths;
   entryIdentity?: FabricLoadedFileIdentity;
   /** Foreground tools declared beside fabric_exec; fences cache holds. */
   foregroundTools?: () => readonly string[];
+  /** The extension holding the compaction owner claim; compact.* routes there. */
+  compactionOwner?: (() => ActiveCompactionOwner | undefined) | undefined;
+  /** Restrictions the embedding host applied through FABRIC_HOST_POLICY_EVENT. */
+  hostPolicy?: FabricHostPolicy;
 }
 
 export class FabricRuntimeState {
   #registry: ActionRegistry | undefined;
+  readonly #actionPolicyHooks: FabricActionPolicyHooks | undefined;
+  readonly #questionRenderers: FabricQuestionRenderers | undefined;
   #config: FabricConfig | undefined;
   #execution: FabricExecutionService | undefined;
   #repairs: RepairCompiler | undefined;
@@ -194,6 +241,14 @@ export class FabricRuntimeState {
   #agents: AgentManager | undefined;
   #completionInbox: AgentCompletionInbox | undefined;
   #peerPresence: PeerPresenceNotifier | undefined;
+  #sessionLabel: SessionLabelPresenter | undefined;
+  /** Set at the session's first Fabric use; a new number is taken only then. */
+  #labelWanted = false;
+  #recordedLabel: string | undefined;
+  #labelUseStop: (() => void) | undefined;
+  #herdrStatus: HerdrAgentStatus | undefined;
+  #herdrStatusLoad: Promise<void> | undefined;
+  #herdrStatusWanted = false;
   #shellInbox: ShellEventInbox | undefined;
   #shellTiming: FabricShellTimingBridge | undefined;
   #actors: ActorDirectory | undefined;
@@ -212,6 +267,7 @@ export class FabricRuntimeState {
   #residency: ResidencyClient | undefined;
   #agentsProvider: AgentsProvider | undefined;
   #compact: CompactController | undefined;
+  readonly #compactionOwner: (() => ActiveCompactionOwner | undefined) | undefined;
   #schema: SchemaController | undefined;
   #componentSupervisor: FabricComponentSupervisor | undefined;
   #componentLoader: FabricComponentLoader | undefined;
@@ -220,6 +276,7 @@ export class FabricRuntimeState {
   #stopComponentWatch: (() => void) | undefined;
   readonly #componentTransitionSignatures = new Map<string, string>();
   readonly #componentTransitionPublications = new Set<Promise<void>>();
+  #componentPublishFailureLogged = false;
   #sessionCapabilityLease: FabricCapabilityViewLease | undefined;
   #unsubscribeCapturedCatalog: (() => void) | undefined;
   #cwd: string | undefined;
@@ -237,6 +294,7 @@ export class FabricRuntimeState {
   readonly #managedHost: FabricManagedHost | undefined;
   readonly #entryIdentity: FabricLoadedFileIdentity | undefined;
   readonly #foregroundTools: (() => readonly string[]) | undefined;
+  readonly #hostPolicy: FabricHostPolicy | undefined;
   #widgetDismissedAt = 0;
   #suppressResidentGuidanceSync = false;
 
@@ -249,12 +307,16 @@ export class FabricRuntimeState {
     this.prewalk = options.prewalk ?? new PrewalkController();
     this.prewalkDrift = options.prewalkDrift ?? new PrewalkDriftTracker();
     this.sessionApprovals = options.sessionApprovals ?? new FabricSessionApprovals();
+    this.#actionPolicyHooks = options.actionPolicyHooks;
+    this.#questionRenderers = options.questionRenderers;
     this.thinking = options.thinking ??
       new FabricThinkingController(pi, () => this.#config?.thinking?.bounds ?? {});
     this.#paths = options.paths;
     this.#managedHost = options.managedHost;
     this.#entryIdentity = options.entryIdentity;
     this.#foregroundTools = options.foregroundTools;
+    this.#compactionOwner = options.compactionOwner;
+    this.#hostPolicy = options.hostPolicy;
   }
 
   get initialized(): boolean {
@@ -332,6 +394,57 @@ export class FabricRuntimeState {
     return this.#participants?.peers() ?? [];
   }
 
+  /** Publish agent activity to Herdr, or withdraw it when ui.herdrStatus is off. */
+  #syncHerdrStatus(): void {
+    if (!this.#herdrStatusWanted) return;
+    if (this.#config?.ui.herdrStatus === false) {
+      const status = this.#herdrStatus;
+      this.#herdrStatus = undefined;
+      void status?.close();
+      return;
+    }
+    if (this.#herdrStatus) {
+      this.#herdrStatus.sync();
+      return;
+    }
+    if (this.#herdrStatusLoad || (this.#agents?.activity().length ?? 0) === 0) return;
+    const load = import("./agents/herdr-status.js")
+      .then(({ HerdrAgentStatus }) => {
+        if (this.#herdrStatusLoad !== load) return;
+        this.#herdrStatus = new HerdrAgentStatus({
+          events: this.pi.events,
+          activity: () => this.#agents?.activity() ?? [],
+        });
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (this.#herdrStatusLoad !== load) return;
+        this.#herdrStatusLoad = undefined;
+        this.#syncHerdrStatus();
+      });
+    this.#herdrStatusLoad = load;
+  }
+
+  /**
+   * Release Herdr holds and clear the pane metadata, and remove the label from
+   * the footer and Herdr names. Both run at once under one bound.
+   */
+  async #closeHerdr(): Promise<void> {
+    this.#herdrStatusWanted = false;
+    this.#herdrStatusLoad = undefined;
+    const status = this.#herdrStatus;
+    const label = this.#sessionLabel;
+    this.#herdrStatus = undefined;
+    this.#sessionLabel = undefined;
+    if (!status && !label) return;
+    await closeWithinTimeout(Promise.all([status?.close(), label?.close()]).then(() => undefined));
+  }
+
+  /** The project decision store, or undefined when the mesh is disabled. */
+  decisionStore(): DecisionStore | undefined {
+    return this.#decisions;
+  }
+
   componentGraph(): FabricComponentGraph {
     return this.#componentLoader?.graph() ?? { components: [], edges: [], cycles: [] };
   }
@@ -345,6 +458,38 @@ export class FabricRuntimeState {
 
   participantInfos(options: FabricParticipantListOptions = {}): FabricParticipantInfo[] {
     return this.#participants?.list(options) ?? [];
+  }
+
+  /** Read only this root's resident run metadata; never start or control the host. */
+  residentAgentForUi(id: string): import("./agents/types.js").AgentRunRecord | import("./agents/types.js").AgentHandleInfo | undefined {
+    if (!this.#residency?.hasAgent(id)) return undefined;
+    try { return this.#residency.statusAgent(id); } catch { return undefined; }
+  }
+
+  #wantLabel(): void {
+    if (this.#labelWanted) return;
+    this.#labelWanted = true;
+    this.#labelUseStop?.();
+    this.#labelUseStop = undefined;
+    // Publish now and show the new label at once, not at the next heartbeat. A
+    // refresh already in flight began before this use, so it may mint nothing.
+    const participants = this.#participants;
+    void (async () => {
+      await participants?.refresh();
+      if (participants && !participants.self().label) await participants.refresh();
+      await this.#sessionLabel?.sync();
+    })().catch(() => undefined);
+  }
+
+  /** A root session's own peer label, such as `FAB-3`, while `ui.sessionLabel.footer` shows it. */
+  sessionLabel(): string | undefined {
+    return this.#sessionLabel?.visibleLabel;
+  }
+
+  /** True while a root session waits for the directory to mint the label it will show. */
+  sessionLabelPending(): boolean {
+    // A label comes only from a recorded one or at first use; until then nothing is pending.
+    return (this.#labelWanted || this.#recordedLabel !== undefined) && (this.#sessionLabel?.labelPending ?? false);
   }
 
   async queueUserMessage(
@@ -438,6 +583,7 @@ export class FabricRuntimeState {
     this.#registry = new ActionRegistry(
       new FabricToolResultProxy(() => this.capturedTools.runner),
     );
+    this.#registry.setHostPolicy(this.#hostPolicy);
     this.#configureSpeculation();
     this.#unsubscribeCapturedCatalog?.();
     this.#unsubscribeCapturedCatalog = this.capturedTools.subscribe(() => {
@@ -543,6 +689,8 @@ export class FabricRuntimeState {
     }
     const sessionId = context.sessionManager.getSessionId();
     const { identity, mainAgentId } = resolveFabricIdentity(sessionId);
+    this.#labelWanted = false;
+    this.#recordedLabel = recordedPeerLabel(context, mainAgentId);
     await builtins.install(createProviderComponent({
       provider: "cache",
       description: "Local prompt-cache observations and scoped native warming",
@@ -587,6 +735,7 @@ export class FabricRuntimeState {
       meshRoot,
       this.#config.mesh.maxEventBytes,
       this.#config.mesh.maxReadEvents,
+      { durability: this.#config.mesh.durability },
     );
     const hostId = identity.kind === "main" ? mainAgentId : `runtime:${sessionId}`;
     this.#control = new FabricControlPlane(this.#mesh, identity, {
@@ -600,6 +749,10 @@ export class FabricRuntimeState {
       rootId: mainAgentId,
       identity,
       ownerIncarnation: this.#control.incarnation,
+      recordedLabel: () => this.#recordedLabel,
+      labelWanted: () => this.#labelWanted,
+      departedLimit: this.#config.mesh.departedLimit,
+      departedRetentionMs: this.#config.mesh.departedRetentionMs,
       ...(process.env.PI_FABRIC_OWNER_HOST_ID
         ? { selfOwnerHostId: process.env.PI_FABRIC_OWNER_HOST_ID }
         : {}),
@@ -625,6 +778,9 @@ export class FabricRuntimeState {
     this.#compact = new CompactController({
       onRequest: (intent) => void this.#publishCompactEvent("requested", intent),
       onCommit: (info) => void this.#publishCompactEvent(info.status, info),
+      // A labelled Fabric message, never a user prompt: the model reads who
+      // asked for it, and no slash command or template expands.
+      sendSeed: (message) => this.pi.sendMessage(message, COMPACTION_SEED_DELIVERY),
     });
     await builtins.install(createProviderComponent({
       provider: "compact",
@@ -632,19 +788,22 @@ export class FabricRuntimeState {
       create: () => new CompactProvider(this.#compact!, {
         config: () => (this.#config ?? DEFAULT_FABRIC_CONFIG).compaction,
         appendEntry: (customType, data) => this.pi.appendEntry(customType, data),
+        ...(this.#compactionOwner ? { owner: this.#compactionOwner } : {}),
       }),
     }));
     const agentConfig = enforceSchema
       ? { ...this.#config.agents, enabled: false }
       : this.#config.agents;
     const modelsConfig = this.#config.models;
-    const visiblePiModels = () => {
+    const readPiModels = () => {
       try {
-        return context.modelRegistry.getAvailable();
-      } catch {
-        return [];
+        return { models: context.modelRegistry.getAvailable() };
+      } catch (registryError) {
+        return { models: [], registryError };
       }
     };
+    // Status and residency sync stay fail-empty; resolution names the failure.
+    const visiblePiModels = () => readPiModels().models;
     const piModelState = (models = visiblePiModels()) => {
       const available: FabricModelCandidate[] = models.map((model) => ({
         provider: String(model.provider),
@@ -660,20 +819,29 @@ export class FabricRuntimeState {
         ...(defaultModel ? { defaultModel } : {}),
       };
     };
-    const resolveParticipantPiModel = (selector?: string) => {
-      const models = visiblePiModels();
+    const resolveParticipantPiModel = (selector?: string, modelMatch?: FabricModelMatch) => {
+      const { models, registryError } = readPiModels();
       const state = piModelState(models);
       const query = selector?.trim() || state.defaultModel || "";
-      const resolved = resolveAvailablePiModel(query, {
+      const resolved = resolvePiModelSelector(query, {
         aliases: state.aliases,
         available: state.available,
         lastUsed: loadModelUsage(),
-      });
+        ...(registryError === undefined ? {} : { registryError }),
+      }, modelMatch);
+      // The resolver returns the registry's own spelling. Match it case-sensitively
+      // first so entries that differ only by case cannot swap places: the model
+      // authenticated must be the entry the resolver chose, not an earlier twin.
+      // An exact request never falls back to the case-insensitive lookup.
       const model = models.find(
-        (candidate) =>
-          String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
-          String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
-      );
+        (candidate) => String(candidate.provider) === resolved.provider && String(candidate.id) === resolved.id,
+      ) ?? (modelMatch === "exact"
+        ? undefined
+        : models.find(
+            (candidate) =>
+              String(candidate.provider).toLowerCase() === resolved.provider.toLowerCase() &&
+              String(candidate.id).toLowerCase() === resolved.id.toLowerCase(),
+          ));
       if (!model) {
         throw new Error(
           `Model ${JSON.stringify(query)} is not available to this Pi session. ` +
@@ -732,8 +900,8 @@ export class FabricRuntimeState {
           keepRecentTokens: settings.keepRecentTokens,
         };
       },
-      preparePiModel: async (modelKey) => {
-        const resolved = resolveParticipantPiModel(modelKey);
+      preparePiModel: async (modelKey, options) => {
+        const resolved = resolveParticipantPiModel(modelKey, options?.modelMatch);
         const auth = await context.modelRegistry.getApiKeyAndHeaders(resolved.model);
         if (!auth.ok) throw new Error(auth.error);
         return resolved.key;
@@ -744,8 +912,17 @@ export class FabricRuntimeState {
       },
       onBackgroundComplete: (result) => completionInbox.enqueue(result),
       onResultConsumed: (id) => completionInbox.acknowledge(id),
-      onChildQuestion: (request) =>
-        routeChildQuestion(request, { context, ...(this.#decisions ? { store: this.#decisions } : {}) }),
+      onChildQuestion: (request) => {
+        // A child session's UI forwards to its parent, so only the main session renders.
+        const renderers = identity.kind === "main"
+          ? this.#questionRenderers?.active(this.#config?.ui.questionRenderers)
+          : undefined;
+        return routeChildQuestion(request, {
+          context,
+          ...(this.#decisions ? { store: this.#decisions } : {}),
+          ...(renderers ? { renderers } : {}),
+        });
+      },
       resolveChildTraceContext: (launch) =>
         requestChildTraceContext((event, value) => this.pi.events?.emit(event, value), launch),
     });
@@ -842,6 +1019,13 @@ export class FabricRuntimeState {
       },
     );
     this.#globalActors = new GlobalActorRegistry(resolveAgentDir(), this.#config.mesh.maxEventBytes);
+    const globalActorsError = this.#globalActors.loadError;
+    if (globalActorsError) {
+      // Global actor actions also fail with this error until the file reads again.
+      const detail = `${globalActorsError.message}. Global actor templates are unavailable until the file is repaired.`;
+      console.warn(`[pi-fabric] ${detail}`);
+      if (context.hasUI) context.ui.notify(`Pi Fabric: ${detail}`, "warning");
+    }
     this.#residency = ownsPersistentActorRegistry
       ? new ResidencyClient({
           config: {
@@ -901,6 +1085,22 @@ export class FabricRuntimeState {
       ),
     );
     this.#agents.subscribeUi(() => this.#participants?.scheduleRefresh());
+    // First Fabric use is a fabric_exec run or a running agent (actor workers
+    // run as agents). Store notifications alone are not use: loading idle
+    // actors or retained runs at startup must not take a number.
+    const agents = this.#agents;
+    const labelUse = [
+      this.activity.subscribe(() => { if (this.activity.runSummaries().length > 0) this.#wantLabel(); }),
+      agents.subscribeUi(() => { if (agents.activity().length > 0) this.#wantLabel(); }),
+    ];
+    this.#labelUseStop = () => { for (const stop of labelUse.splice(0)) stop?.(); };
+    // Herdr reports this pane idle when the root turn ends; tell it about the
+    // agents still running. Only a root shows them, and the presenter loads on
+    // the first run so sessions outside Herdr never pay for it.
+    if (mainAgent.local && herdrStatusAvailable(context)) {
+      this.#herdrStatusWanted = true;
+      this.#agents.subscribeUi(() => this.#syncHerdrStatus());
+    }
     this.#actors.subscribe(() => this.#participants?.scheduleRefresh());
     const providerParticipants = this.#providerParticipants;
     this.#participants.registerSource(() =>
@@ -920,6 +1120,7 @@ export class FabricRuntimeState {
       () => this.#config?.models ?? DEFAULT_FABRIC_CONFIG.models,
     );
     agentsProvider.providerParticipants = providerParticipants;
+    agentsProvider.sessionCommands = () => this.pi.getCommands();
     this.#agentsProvider = agentsProvider;
     this.#control.start((command, from, signal) =>
       agentsProvider.acceptControl(command, from, signal));
@@ -944,6 +1145,19 @@ export class FabricRuntimeState {
         enabled: () => this.#config?.mesh.peerNotices === true,
         cwd: context.cwd,
       });
+    }
+    // Only a root shows its label; a child's label belongs to its parent's view.
+    if (mainAgent.local) {
+      this.#sessionLabel = new SessionLabelPresenter(this.pi, context, {
+        label: () => this.#participants?.self().label,
+        participantId: () => this.#participants?.self().id,
+        settings: () => sessionLabelSettings((this.#config ?? DEFAULT_FABRIC_CONFIG).ui.sessionLabel),
+        shownInWidget: () => {
+          const ui = (this.#config ?? DEFAULT_FABRIC_CONFIG).ui;
+          return ui.enabled && ui.widget !== "hidden";
+        },
+      });
+      void this.#sessionLabel.sync();
     }
     this.#lifecycle.start();
     this.#residency?.start();
@@ -980,6 +1194,7 @@ export class FabricRuntimeState {
               },
             },
             authorize: (ref, parentToolCallId) => this.#schema!.authorize(ref, parentToolCallId),
+            actionPolicyHooks: this.#actionPolicyHooks,
             jevFabric: this.#shellJobs.durable,
           });
           const setDecisionProfile = (profile: string | null | undefined) => provider.setDecisionProfile(profile);
@@ -1065,6 +1280,7 @@ export class FabricRuntimeState {
     );
     this.#execution.nativeCodemode.setPersistence((type, data) => this.pi.appendEntry(type, data));
     this.#execution.setParticipantRegistry(this.#providerParticipants);
+    this.#execution.setActionPolicyHooks(this.#actionPolicyHooks);
     const events = this.pi.events;
     if (events) this.#execution.setEventEmitter((channel, data) => events.emit(channel, data));
     const decisions = this.#decisions;
@@ -1131,9 +1347,10 @@ export class FabricRuntimeState {
     if (!this.#config || !this.#cwd) return;
     next.schema.mode = this.#config.schema.mode;
     this.#speculation?.reset();
-    const previousComponents = structuredClone(this.#config.components);
     deepAssign(this.#config as unknown as Record<string, unknown>, next as unknown as Record<string, unknown>);
     this.#configureSpeculation();
+    void this.#sessionLabel?.sync();
+    this.#syncHerdrStatus();
     // The persisted master switch wins over any live arm: disabling prewalk
     // via /fabric settings (or an external config edit followed by a reload)
     // cancels the arm so no later boundary can claim behind the user's back.
@@ -1143,7 +1360,10 @@ export class FabricRuntimeState {
       if (context.hasUI) context.ui.setStatus("fabric-prewalk", undefined);
     }
     void (this.#componentControl?.reconcile(next.components) ?? this.#componentLoader?.reconcile(next.components))?.catch((error) => {
-      if (this.#config) this.#config.components = previousComponents;
+      // Restore what the loader still runs. A snapshot taken at call time would
+      // hold an earlier reload's entries when that reload is refused as well.
+      const active = this.#componentLoader?.entries();
+      if (this.#config && active) this.#config.components = active;
       const detail = error instanceof Error ? error.message : String(error);
       if (context.hasUI) context.ui.notify(`Pi Fabric component reload failed: ${detail}`, "error");
     });
@@ -1160,6 +1380,9 @@ export class FabricRuntimeState {
     const eligible = (): boolean => {
       const current = this.#config;
       if (!current?.speculation.enabled) return false;
+      // Hooks may deny even configured allows and can register dynamically.
+      // Run them only at normal approval, never speculatively or twice.
+      if (current.approvals.policyHooks === true) return false;
       return current.executor.kernel === "python"
         ? current.executor.pythonRuntime === "monty" || current.schema.mode === "enforce"
         : current.schema.mode === "enforce" || current.executor.runtime === "quickjs";
@@ -1308,20 +1531,17 @@ export class FabricRuntimeState {
       payload,
       this.#config.mesh.eventContextChars,
     );
-    const preparedContext = prepareFabricActorHostPayload(
+    const preparedContext = prepareFabricActorContextPayload(
       { digest, transcript },
       this.#config.mesh.eventContextChars,
-    ).payload;
-    const safeContext = isPlainObject(preparedContext)
-      ? preparedContext
-      : { digest: {}, transcript: [String(preparedContext)] };
+    );
     return observed + this.#actors.dispatchObservedHostEvent(
       event,
       {
         event,
         session: { id: context.sessionManager.getSessionId(), cwd: context.cwd },
-        digest: safeContext.digest ?? {},
-        transcript: safeContext.transcript ?? [],
+        digest: preparedContext.digest,
+        transcript: preparedContext.transcript,
         signal: {
           payload: prepared.payload,
           ...(prepared.media.length > 0 ? { media: prepared.media } : {}),
@@ -1364,9 +1584,25 @@ export class FabricRuntimeState {
         JSON.stringify(component.guidance ?? []),
       ].join("\u0001");
       if (this.#componentTransitionSignatures.get(component.id) === signature) continue;
+      // Recorded up front so a re-report while this publish is in flight is
+      // not published twice; forgotten again on failure so the next report
+      // of the same state retries instead of treating it as delivered.
       this.#componentTransitionSignatures.set(component.id, signature);
       const publication = this.publishHostLifecycle("component.state", component)
-        .catch(() => undefined);
+        .then(() => {
+          this.#componentPublishFailureLogged = false;
+        }, (error: unknown) => {
+          if (this.#componentTransitionSignatures.get(component.id) === signature) {
+            this.#componentTransitionSignatures.delete(component.id);
+          }
+          // A broken mesh fails every re-report of every waiting component, so
+          // log once per failure streak; a successful publish ends the streak.
+          if (this.#componentPublishFailureLogged) return;
+          this.#componentPublishFailureLogged = true;
+          console.warn(
+            `[pi-fabric] Component ${component.id} state publish failed (${error instanceof Error ? error.message : String(error)}); the next report retries. Further failures are not logged until a publish succeeds.`,
+          );
+        });
       this.#componentTransitionPublications.add(publication);
       void publication.finally(() => this.#componentTransitionPublications.delete(publication));
     }
@@ -1419,6 +1655,11 @@ export class FabricRuntimeState {
     }
     this.#externalProviders.set(provider.name, provider);
     if (this.#registry) this.#registry.register(provider, options);
+    // Direct registrations (forwarded now or replayed at activation) and
+    // discovery registrations all land here. Warning here, not in FabricState,
+    // keeps the name tables out of the startup graph. Once per name, and only
+    // under PI_FABRIC_DEBUG: a provider without a global is working as documented.
+    if (process.env.PI_FABRIC_DEBUG) warnProviderGlobalConflict(provider.name);
   }
 
   /** Withdraw a direct registration through the same retire/release path a
@@ -1457,6 +1698,9 @@ export class FabricRuntimeState {
   }
 
   async shutdown(): Promise<void> {
+    this.#labelUseStop?.();
+    this.#labelUseStop = undefined;
+    await this.#closeHerdr();
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#peerPresence?.close();
@@ -1482,7 +1726,7 @@ export class FabricRuntimeState {
     await this.#lifecycle?.close();
     await this.#control?.close();
     await this.#residency?.close();
-    await this.#actors?.close();
+    const actorsFailure = await this.#closeActors();
     await this.#agents?.close();
     await this.shellJobs.close();
     try {
@@ -1510,6 +1754,7 @@ export class FabricRuntimeState {
     this.#componentSupervisor = undefined;
     this.#componentLoader = undefined;
     this.#componentTransitionSignatures.clear();
+    this.#componentPublishFailureLogged = false;
     this.#componentTransitionPublications.clear();
     this.#sessionCapabilityLease = undefined;
     this.#unsubscribeCapturedCatalog?.();
@@ -1522,6 +1767,20 @@ export class FabricRuntimeState {
     this.#externalProviders.clear();
     this.prewalk.cancel();
     this.prewalkDrift.clear();
+    if (actorsFailure) throw actorsFailure.error;
+  }
+
+  // ActorManager.close() rejects when it cannot read the shared actor registry,
+  // because saving then would overwrite other hosts' rows. Teardown must still
+  // release everything after the actors, so callers report this failure once
+  // the rest of teardown has run.
+  async #closeActors(): Promise<{ error: unknown } | undefined> {
+    try {
+      await this.#actors?.close();
+      return undefined;
+    } catch (error) {
+      return { error };
+    }
   }
 
   // Publish a best-effort mesh event to the durable `fabric.compact` topic so
@@ -1529,17 +1788,17 @@ export class FabricRuntimeState {
   // Activity-only sessions (mesh disabled) silently skip this.
   #publishCompactEvent(kind: string, data: CompactPendingIntent | CompactLastCommit): void {
     if (!this.#mesh || !this.#identity || !this.#config?.mesh.enabled) return;
-    try {
-      void this.#mesh.publish({
-        topic: "fabric.compact",
-        kind,
-        from: this.#identity,
-        data,
-      });
-    } catch {
-      // Best-effort: a full event log or an oversized payload must not break
-      // the host compaction path.
-    }
+    // Best-effort: a full event log or an oversized payload must not break
+    // the host compaction path. MeshStore.publish is async, so every failure
+    // arrives as a rejection and must be handled here.
+    void this.#mesh.publish({
+      topic: "fabric.compact",
+      kind,
+      from: this.#identity,
+      data,
+    }).catch((error: unknown) => {
+      console.warn(`[pi-fabric] fabric.compact ${kind} publish failed (${error instanceof Error ? error.message : String(error)}).`);
+    });
   }
 
   #refreshRepairCatalog(): void {
@@ -1572,6 +1831,9 @@ export class FabricRuntimeState {
   async #closeInternal(): Promise<void> {
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
+    this.#labelUseStop?.();
+    this.#labelUseStop = undefined;
+    await this.#closeHerdr();
     this.#shellInbox?.close();
     this.#shellInbox = undefined;
     this.#shellTiming?.close();
@@ -1593,7 +1855,7 @@ export class FabricRuntimeState {
     await this.#lifecycle?.close();
     await this.#control?.close();
     await this.#residency?.close();
-    await this.#actors?.close();
+    const actorsFailure = await this.#closeActors();
     await this.#agents?.close();
     const externalNames = new Set(this.#externalProviders.keys());
     try {
@@ -1619,10 +1881,17 @@ export class FabricRuntimeState {
     this.#componentSupervisor = undefined;
     this.#componentLoader = undefined;
     this.#componentTransitionSignatures.clear();
+    this.#componentPublishFailureLogged = false;
     this.#componentTransitionPublications.clear();
     this.#sessionCapabilityLease = undefined;
     this.#unsubscribeCapturedCatalog?.();
     this.#unsubscribeCapturedCatalog = undefined;
+    if (actorsFailure) {
+      // Reinitialization goes on: the new generation reads the registry again,
+      // and its own saves keep refusing until the file is repaired.
+      const error = actorsFailure.error;
+      console.warn(`[pi-fabric] ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 }
 

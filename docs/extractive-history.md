@@ -101,7 +101,9 @@ classifies facts, preferences, goals or commands.
 ## Lifecycle, caching and failures
 
 The implementation imports lazily at an enabled `before_agent_start` boundary.
-It issues at most one batch for the current source user-entry turn. A `context`
+It issues at most one batch for the current source user-entry turn. A run that
+a custom message starts (Pi's `before_agent_start` with `messageType: "custom"`)
+has no query, so it drops any prepared view and prepares none. A `context`
 hook inserts one replay-safe ephemeral custom data message immediately before
 the last user message in the first request (normally the initiating prompt),
 after the existing history. That boundary and the view are frozen for the run:

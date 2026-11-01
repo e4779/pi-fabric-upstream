@@ -62,7 +62,7 @@ return {
 };
 ```
 
-Independent calls run in parallel, and the returned object enters the model context. Known providers support concise direct calls such as `mcp.fal_ai.get_model_schema(...)`, `memory.recall(...)`, `state.get()`, `schema.status()`, and `compact.status()`. Refs found or computed at runtime use `tools.call({ ref, args })` (TypeScript notation). Python uses `await tools.call({"ref": ref, "args": args})`, native dictionary results, and `asyncio.gather` for independent calls.
+Independent calls run in parallel, and the returned object enters the model context. Known providers support concise direct calls such as `mcp.fal_ai.get_model_schema(...)`, `memory.recall(...)`, `state.get()`, `schema.status()`, and `compact.status()`. A provider another extension registers gets a typed global named after it, such as `context.task_add(...)` ([program globals](docs/providers.md#program-globals-and-types)). Refs found or computed at runtime use `tools.call({ ref, args })` (TypeScript notation). Python uses `await tools.call({"ref": ref, "args": args})`, native dictionary results, and `asyncio.gather` for independent calls.
 
 To select Python, put this in `~/.pi/agent/fabric.json` or a trusted project's `.pi/fabric.json`, or use `/fabric settings` → **Executor** → **Kernel**:
 
@@ -78,6 +78,12 @@ Pi's native MCP can optionally supply selected servers beneath the same Fabric A
 
 Requires Node.js 24+ and Pi 1.0.0+. Monty's optional native package installs on supported platforms; only the explicit CPython escape hatch requires CPython 3.10+. Fabric warns when a detectable host is older than the required native loadout and nested-execution contracts.
 
+**0.126.1: quieter background optimization.** Automatic entropy improvement notices no longer interrupt the conversation. Background compilation, saved plans, and activation continue unchanged; use `/fabric entropy` to inspect entropy on demand.
+
+**0.126.0: idle warming for background work.** With Pi's `cacheWarming: "idle"` enabled, wake-capable spilled shell jobs re-price idle cache refreshes at certain continuation while preserving Pi's savings threshold and 30-minute idle horizon. UI-only monitors, interruption, provider errors, and abandoned branches are excluded; refreshes remain paid native `cache_warm` usage. The fullscreen dock now preserves other extensions' status rows. Policy verification also covers mesh grants, speculation, and budget admission, with 27 registered kernels and 75 counterexample-backed broken variants.
+
+**0.125.2: arbitrary-state policy proofs.** The dev-only gdp-wired prover is pinned to 0.30.1. Policy proof runs use `{from: 'any'}` and accept only `proven && checked && !assumes`, with counterexample-backed refusals for all 50 broken variants. Generated kernel bodies are unchanged, and default certificates need no environment override. Windows offline continuation tests use a platform-sized cold-start budget.
+
 **0.103.1: Pi 1.0 compatibility.** Full-code and Schema enforce loadouts own declarations through native `prepareLoadout`, including built-in codemode, tool search, MCP, late activation, and reload. Captured dispatch and core overrides retain native middleware; capture patches restore on the final shutdown lease without recursive wrapping. Run `bun run test:pi1` for public-contract, compiled SDK, and bundled-CLI regressions. Optional/audit mode retains the host loadout.
 
 **0.103.0: daemon primitives.** Headless, restart-safe sessions get small composable building blocks: a [runner contract](docs/agents.md#custom-runners) with hosted runs that persist a locator before start and never relaunch (`pi-fabric/runners`); durable [decisions](docs/decisions.md) with escalation chains, headless approvals, and routed child dialogs; mesh timers, scoped external grants, and the `pi-fabric` CLI; [saved programs](docs/programs.md) with host-invoked runs; host-issued principal and scope (`pi-fabric/scope`) that children only narrow; write confinement, context-inheriting spawn, and worktree results; provider participants, a foreground-tool policy, compaction pressure and carry-forward focus, [thinking control](docs/thinking.md), heartbeat liveness across PID namespaces, and incarnation-fenced control commands. New behavior is opt-in or additive. A configured `agents.runner` id that no extension registers is kept and warned about once per session, without falling back to `pi`.
@@ -90,7 +96,7 @@ Requires Node.js 24+ and Pi 1.0.0+. Monty's optional native package installs on 
 pi install npm:pi-fabric
 ```
 
-Fabric bundles the [Coral Bricks provider](docs/configuration.md#bundled-coral-bricks-provider): run `/login coralbricks` to use `coralbricks/*` models, or opt out with a package filter. Fabric's maintainers work at Coral Bricks.
+Fabric does not bundle third-party chat model provider extensions. Install third-party providers separately; see [provider configuration](docs/configuration.md#third-party-model-providers).
 
 <details>
 <summary>Other install methods</summary>
@@ -130,7 +136,7 @@ Pi loads advanced patterns after direct user invocation. Run `/skill:fabric-guid
 | A persistent watcher for one measurable goal | `/skill:fabric-supervisor Watch this migration until it is complete and tested.` |
 | A strict auditor for one feature design spec | `/skill:fabric-spec Implement docs/specs/checkout.md to the tee; nothing missing, nothing extra.` |
 | A quiet decision-point reviewer | `/skill:fabric-advisor Focus on migration correctness.` |
-| Same-model independent reviewers and one decision | `/skill:fabric-council Review this design for correctness, security, and operability.` |
+| Independent reviewers, optionally one model per seat, and one decision | `/skill:fabric-council Review this design for correctness, security, and operability.` |
 | Multi-model compare-not-merge deliberation or act mode | `/skill:fabric-fusion Deliberate this design across models.` |
 | One command that chooses advisor or supervisor | `/skill:fabric-ambient advisor Focus on migration correctness.` |
 | A durable team coordinating through versioned tasks | `/skill:fabric-swarm Coordinate this migration across owned task partitions.` |
@@ -142,7 +148,7 @@ Execution references stay progressive: the model loads the selected kernel's ski
 
 ## Agent conversations
 
-Press **ctrl+shift+a** or run **`/fabric chat <agent-id-or-name>`** to open a live, full-screen child conversation with a multiline editor. Send steering or follow-ups directly, switch between nested agents, and return to Main without stopping its work. Drafts and scroll positions stay with each conversation. Completed one-shot agents are read-only; persistent actors accept further messages. Drag to select transcript text, use `/copy` or `/copy selection`, and type `/help` for the small set of preview-local commands with slash completion. See [focused conversations](docs/interface.md#focused-conversations) for controls and current limitations.
+Press **↓** in an empty editor and **Enter** on an agent in the list at the bottom of the screen, or run **`/fabric chat <agent-id-or-name>`**, to open a live, full-screen child conversation with a multiline editor. Send steering or follow-ups directly, switch between nested agents, and return to Main without stopping its work. Drafts and scroll positions stay with each conversation. Completed one-shot agents are read-only; persistent actors accept further messages. Drag to select transcript text, use `/copy` or `/copy selection`, and type `/help` for the small set of preview-local commands with slash completion. See [focused conversations](docs/interface.md#focused-conversations) for controls and current limitations.
 
 ## The dashboard
 
@@ -163,6 +169,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Native codemode APIs](docs/codemode-parity.md): additive native tool aliases or opt-in Pi-compatible scripts, collision-safe Fabric discovery, native models/images, branch-local state, and sPTC.
 - [Prompt cache](docs/prompt-cache.md): honest cache observations and optional, time-bounded native warming leases.
 - [Thinking control](docs/thinking.md): scoped host-session reasoning effort with configured bounds that children inherit and never widen.
+- [Fabric in a pi-durable host](docs/durable-extension.md): `pi-fabric/durable-extension` gives a host's own pi-durable `Harness` the `fabric_exec` tool: its options and defaults (`tools`, `providers`, limits, `quickJsWasmModule`, `onError`), default-deny security, replay-safe durability on a task-document journal, a codemode-style prompt section, and Cloudflare Worker setup with the `pi-fabric/durable-extension/wasm` helper.
 - [Durable Pi runner](docs/durable-pi.md): the default isolated Pi/Fabric host, checkpoint recovery, replay boundaries, and the explicit legacy `pi` option.
 - [Durable decisions](docs/decisions.md): pending approvals and questions in the project mesh, headless approvals, routed child dialogs, `/fabric decisions`, and the `pi-fabric decisions` CLI.
 - [Saved programs](docs/programs.md): content-addressed programs, nested `programs.run` with the caller's capabilities, `/fabric programs`, and host runs through `/fabric run` or an event.
@@ -176,7 +183,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Components & committed capabilities](docs/components.md): supervised effects, exact requirements, external per-model guidance and execution-profile replacement, rolling provider generations, actor commitments, and both formal calculi.
 - [External providers](docs/providers.md): the versioned provider protocol for extensions.
 - [Architecture & security](docs/architecture.md): the host bridge, sandboxing, tool-call robustness, and limits.
-- [Verified policy kernels](docs/verified-kernels.md): executable Bend proofs, production acceptance gates, regeneration, and the trusted boundary.
+- [Verified policy kernels](docs/verified-kernels.md): gdp-wired laws over the executed rules, production acceptance gates, regeneration, and the trusted boundary.
 - [Provider capabilities](docs/provider-capabilities.md): proved dispatch, authority attenuation, lifecycle transitions, cancellation/cleanup contracts, and trust boundaries.
 - [Catalog repairs](docs/repairs.md): unique extra keys and unknown actions promoted into silent schema maps.
 - [Tool entropy](docs/entropy.md): static capability-preserving normal forms, deterministic invocation-friction metrics, bounded repair witnesses, and offline `certify:entropy` proof checks.

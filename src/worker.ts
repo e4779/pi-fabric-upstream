@@ -5,6 +5,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ChildProcess, SpawnOptions } from "node:child_process";
 import { assertWorkerRuntime, writeWorkerStartupFailure } from "./worker/startup.js";
+import { MODEL_PIN_ENV, MODEL_PIN_EXIT_CODE, modelPinFailure, parseModelPinViolation } from "./agents/model-pin.js";
+import { createDurableSessionFile } from "./durable/worker-role-seed.js";
+import { explainMissingInstall } from "./worker/missing-install.js";
+import { normalizeRunDisplay } from "./run-display.js";
+import { nativeFabricExecExclusions } from "./core/child-tool-allowlist.js";
 
 import { StringDecoder } from "node:string_decoder";
 import type { ImageContent } from "@earendil-works/pi-ai";
@@ -12,6 +17,9 @@ import type {
   AgentRunRecord,
   AgentRunStatus,
 } from "./agents/types.js";
+
+/** A milestone is one row of the parent's agent list. */
+const MAX_MILESTONE_CHARS = 160;
 
 let crossSpawn: typeof import("cross-spawn");
 
@@ -44,6 +52,14 @@ const loadWorkerModelControl = async (): Promise<WorkerModelControlModule> => {
   if (!import.meta.url.endsWith(".ts")) return import("./worker/model-control.js");
   const sourceModulePath = "./worker/model-control.ts";
   return import(sourceModulePath) as Promise<WorkerModelControlModule>;
+};
+
+type WorkerPromptModule = typeof import("./worker/prompt-lifecycle.js");
+
+const loadWorkerPromptLifecycle = async (): Promise<WorkerPromptModule> => {
+  if (!import.meta.url.endsWith(".ts")) return import("./worker/prompt-lifecycle.js");
+  const sourceModulePath = "./worker/prompt-lifecycle.ts";
+  return import(sourceModulePath) as Promise<WorkerPromptModule>;
 };
 
 type WorkerRecoveryModule = typeof import("./worker/recovery-watchdog.js");
@@ -131,6 +147,22 @@ const extractText = (message: Record<string, unknown>): string => {
     .join("");
 };
 
+// Names the tool calls of an assistant message that stopped to run tools.
+// Undefined when the message is a final answer (or an error/abort).
+const toolUseStop = (message: Record<string, unknown>): string | undefined => {
+  if (message.stopReason !== "toolUse") return undefined;
+  const names = Array.isArray(message.content)
+    ? message.content.flatMap((part) => {
+        if (typeof part !== "object" || part === null || Array.isArray(part)) return [];
+        const block = part as Record<string, unknown>;
+        return block.type === "toolCall" && typeof block.name === "string" && block.name.trim()
+          ? [block.name.trim().slice(0, 100)]
+          : [];
+      })
+    : [];
+  return names.length > 0 ? [...new Set(names)].slice(0, 8).join(", ") : "unknown";
+};
+
 const readImages = (filePath: string | undefined): ImageContent[] => {
   if (!filePath) return [];
   const parsed: unknown = JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -197,6 +229,16 @@ const terminateChild = (child: ChildProcess, signal: NodeJS.Signals): void => {
 
 
 
+/**
+ * A pi-durable child's journal restores messages only. Without a session file,
+ * a resumed child loses every entry extensions saved (custom entries, context
+ * edits, compaction). Keep a private file with the run so retention removes it
+ * with the run. The file is created complete (Pi header plus worker-role entry)
+ * and a relaunched attempt reopens it: never truncate.
+ */
+const durableSessionFile = (statusFile: string, cwd: string): string =>
+  createDurableSessionFile(path.dirname(statusFile), cwd);
+
 let crashContext: { statusFile: string; record: AgentRunRecord } | undefined;
 let runRecordHelpers: WorkerRunRecordModule | undefined;
 let terminalWritten = false;
@@ -227,7 +269,7 @@ process.on("unhandledRejection", (error) => {
 const main = async (): Promise<void> => {
   assertWorkerRuntime();
   crossSpawn = (await import("cross-spawn")).default;
-  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog }] = await Promise.all([
+  const [optionHelpers, loadedRunRecordHelpers, sessionExportHelpers, {parseStructuredValue, validateAgentResult}, { PiModelControl }, { PiEventProjection }, { PiRecoveryWatchdog, PiStallWatchdog }, { PiTaskPromptLifecycle, PI_TASK_PROMPT_ID }] = await Promise.all([
     loadWorkerOptions(),
     loadWorkerRunRecord(),
     loadWorkerSessionExport(),
@@ -235,6 +277,7 @@ const main = async (): Promise<void> => {
     loadWorkerModelControl(),
     loadWorkerEventProjection(),
     loadWorkerRecovery(),
+    loadWorkerPromptLifecycle(),
   ]);
   runRecordHelpers = loadedRunRecordHelpers;
   const {
@@ -308,7 +351,17 @@ const main = async (): Promise<void> => {
     ? fs.readFileSync(options.schemaFile, "utf8")
     : undefined;
   const piArguments = ["--mode", "rpc"];
-  if (options.sessionFile) piArguments.push("--session", options.sessionFile);
+  // The worker never edits a session file. With agents.durableWorkerSession
+  // (the manager passes --durable-session), a pi-durable child without a
+  // session file gets a new one that already carries the worker-role entry as
+  // its tree root (src/durable/worker-role-seed.ts); a fork or handoff seed
+  // already carries it (the manager asked the seed writer for it); a
+  // caller-supplied file is used as it is.
+  const piSessionFile = options.sessionFile ??
+    (options.runner === "pi-durable" && options.durableSession
+      ? durableSessionFile(options.statusFile, options.cwd)
+      : undefined);
+  if (piSessionFile) piArguments.push("--session", piSessionFile);
   else piArguments.push("--no-session");
   if (!options.extensions) piArguments.push("--no-extensions");
   // Extension-registered model providers still resolve without the rest of
@@ -325,8 +378,27 @@ const main = async (): Promise<void> => {
     const guard = import.meta.url.endsWith(".ts") ? "./agents/write-guard.ts" : "./agents/write-guard.js";
     piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
   }
+  if (options.modelMatch === "exact") {
+    // Exact pins the run's own model. The guard ends the child when the session's
+    // model changes or a request is about to go out on another model; it loads even
+    // with --no-extensions. Model calls that extension code makes itself are not covered.
+    if (!isPi) throw new Error(`modelMatch "exact" requires the Pi runner, not ${options.runner}`);
+    if (!options.model || options.model.indexOf("/") < 1) throw new Error('modelMatch "exact" requires a provider/id model');
+    const guard = import.meta.url.endsWith(".ts") ? "./agents/model-pin-guard.ts" : "./agents/model-pin-guard.js";
+    piArguments.push("-e", fileURLToPath(new URL(guard, import.meta.url)));
+  }
   if (options.tools.length > 0) piArguments.push("--tools", options.tools.join(","));
   else piArguments.push("--no-tools"); // explicit empty allowlist => no tools, not Pi defaults
+  // A skills option replaces the child's own skill discovery with the files the
+  // parent resolved; an empty list leaves it with none.
+  if (options.skills) {
+    piArguments.push("--no-skills");
+    for (const skill of options.skills) piArguments.push("--skill", skill);
+  }
+  // Native wildcard/modifier expansion must not resurrect the recursive tool.
+  // Persisted worker argv re-applies this boundary on every replay/relaunch.
+  const excludedTools = nativeFabricExecExclusions(options.tools);
+  if (excludedTools.length) piArguments.push("--exclude-tools", excludedTools.join(","));
   if (options.model) piArguments.push("--model", options.model);
   if (thinking) piArguments.push("--thinking", thinking);
   if (options.systemPrompt) piArguments.push("--append-system-prompt", options.systemPrompt);
@@ -409,6 +481,9 @@ const main = async (): Promise<void> => {
       // allowlist, so both Pi and captured-tool providers enforce this
       // child-side allowlist before preparation, discovery, and invocation.
       PI_FABRIC_TOOL_ALLOWLIST: JSON.stringify(options.tools),
+      // The parent chose this child's skills: its Fabric adds no skills of its own.
+      // Cleared otherwise, so a grandchild without the option discovers normally.
+      PI_FABRIC_CHILD_SKILLS: options.skills ? "selected" : undefined,
       ...(options.actorId ? { PI_FABRIC_ACTOR_ID: options.actorId } : {}),
       ...(options.actorName ? { PI_FABRIC_ACTOR_NAME: options.actorName } : {}),
       PI_FABRIC_CAPABILITY_REQUIREMENTS: JSON.stringify(
@@ -430,6 +505,8 @@ const main = async (): Promise<void> => {
         ? { TRACEPARENT: options.traceContext.traceparent, TRACESTATE: options.traceContext.tracestate }
         : {}),
       ...(options.writePolicy ? { PI_FABRIC_WRITE_POLICY: options.writePolicy } : {}),
+      // Undefined drops an inherited pin: only an exact run's own child carries one.
+      [MODEL_PIN_ENV]: options.modelMatch === "exact" ? options.model : undefined,
       // Exactly the manager's derived scope; undefined drops an inherited value.
       PI_FABRIC_SCOPE: options.scope,
       PI_FABRIC_SCOPE_FILE: undefined,
@@ -453,51 +530,75 @@ const main = async (): Promise<void> => {
   let sawAgentError = false;
   let retryPending = false;
   let answerProjected = false;
+  // Set while the run's last assistant message stopped for tool calls; a later
+  // assistant message (the final answer) clears it.
+  let endedOnToolCall: string | undefined;
   let recordedResultPending = false;
   let recordedResultTimer: NodeJS.Timeout | undefined;
   const recordedResultId = `fabric-recorded-result:${options.id}`;
 
   const update = (): void => updateRunRecord(options.statusFile, record);
+  // Bounds a silent turn and a fabric_exec call that outlives its deadline.
+  const stallWatchdog = new PiStallWatchdog((error) => failStalledChild(error, "fabric_stall_error"));
   // agents.childQuestions "route": child dialogs wait for a parent ui_response.
   const questionRelay = options.childQuestionTimeoutMs !== undefined && isPi && options.steerFile
     ? new (await loadWorkerQuestions()).ChildQuestionRelay(options.childQuestionTimeoutMs, {
         emit: (question) => emitLifecycle("question", { ...question }),
         send: (frame) => child.stdin?.write(`${JSON.stringify(frame)}\n`),
-        blocked: (since) => {
+        blocked: (since, decisionId) => {
+          stallWatchdog.blocked(since !== undefined);
           if (since === undefined) delete record.blockedOn;
-          else record.blockedOn = { since };
+          else record.blockedOn = { since, ...(decisionId ? { decisionId } : {}) };
           update();
         },
-      })
+      }, Date.now, { hold: options.childQuestionHold === true })
     : undefined;
   let killTimer: NodeJS.Timeout | undefined;
   let closeTimer: NodeJS.Timeout | undefined;
   const recoveryWatchdog = new PiRecoveryWatchdog((error) => failStalledChild(error));
+  const taskPrompt = new PiTaskPromptLifecycle((error) => failStalledChild(error, "fabric_prompt_error"));
   const killChild = (): void => {
+    taskPrompt.dispose();
     recoveryWatchdog.dispose();
+    stallWatchdog.dispose();
     if (closeTimer) clearTimeout(closeTimer);
     terminateChild(child, "SIGTERM");
     killTimer ??= setTimeout(() => terminateChild(child, "SIGKILL"), KILL_GRACE_MS);
     killTimer.unref();
     child.stdin?.end();
   };
-  const failStalledChild = (error: string): void => {
+  const failStalledChild = (error: string, type = "fabric_recovery_error"): void => {
     if (terminalStatus) return;
     terminalStatus = "failed";
     terminalError = error;
     record.error = error;
     update();
-    appendLog(`${JSON.stringify({ type: "fabric_recovery_error", error })}\n`);
+    appendLog(`${JSON.stringify({ type, error })}\n`);
     killChild();
   };
   const closeChild = (): void => {
     child.stdin?.end();
+    taskPrompt.dispose();
     recoveryWatchdog.clear();
+    stallWatchdog.dispose();
     if (closeTimer || killTimer) return;
     // RPC EOF requests disposal, but a stuck extension can prevent process exit.
-    closeTimer = setTimeout(() => failStalledChild(
-      `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`,
-    ), KILL_GRACE_MS);
+    closeTimer = setTimeout(() => {
+      const answered = isPi && answerProjected && !sawAgentError && !endedOnToolCall && !terminalError;
+      if (!answered || terminalStatus) {
+        failStalledChild(
+          `${terminalError ?? "Child Pi settled"}; child did not exit after stdin closed for ${KILL_GRACE_MS}ms`,
+        );
+        return;
+      }
+      // The answer is already recorded; a slow exit does not undo it.
+      terminalStatus = "completed";
+      appendLog(`${JSON.stringify({
+        type: "fabric_exit_warning",
+        warning: `child did not exit after stdin closed for ${KILL_GRACE_MS}ms; terminated it after its final answer`,
+      })}\n`);
+      killChild();
+    }, KILL_GRACE_MS);
     closeTimer.unref();
   };
 
@@ -520,7 +621,8 @@ const main = async (): Promise<void> => {
         record.thinking = effectiveThinking as NonNullable<AgentRunRecord["thinking"]>;
       }
       update();
-      child.stdin?.write(`${JSON.stringify({ type: "prompt", message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
+      taskPrompt.sent(PI_TASK_PROMPT_ID);
+      child.stdin?.write(`${JSON.stringify({ type: "prompt", id: PI_TASK_PROMPT_ID, message: task, ...(images.length > 0 ? { images } : {}) })}\n`);
     },
     fail(error) {
       if (terminalStatus) return;
@@ -531,7 +633,8 @@ const main = async (): Promise<void> => {
       appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error })}\n`);
       killChild();
     },
-  }, options.modelAdmission);
+  // Exact is always strict, whatever the caller or a stale launch passed.
+  }, options.modelMatch === "exact" ? "strict" : options.modelAdmission);
 
   // Attributed token telemetry. Every usage-bearing child event emits one
   // tokens.usage lifecycle entry identified by this run/actor/runner/depth.
@@ -921,6 +1024,7 @@ const main = async (): Promise<void> => {
       processClaudeEvent(event);
       return;
     }
+    if (isPi && !terminalStatus) stallWatchdog.observe(event);
     if (event.type === "response" && recordedResultPending && event.id === recordedResultId) {
       recordedResultPending = false;
       clearTimeout(recordedResultTimer);
@@ -970,6 +1074,7 @@ const main = async (): Promise<void> => {
         sawAgentError = true;
         terminalError = assistantError(last);
       }
+      endedOnToolCall = toolUseStop(last);
       enforceTokenLimit();
       update();
       if (!terminalStatus) {
@@ -980,6 +1085,7 @@ const main = async (): Promise<void> => {
     }
     compactControl.observe(event);
     if (modelControl.observe(event)) return;
+    taskPrompt.observe(event);
     if (event.type === "message_start" || event.type === "message_update") {
       const message = event.message;
       if (typeof message === "object" && message !== null && !Array.isArray(message)) {
@@ -1037,6 +1143,13 @@ const main = async (): Promise<void> => {
         record.currentTool = event.toolName;
         process.stdout.write(`→ ${event.toolName}\n`);
       }
+      // The declared fabric_exec milestone holds until the next declared one, as
+      // the parent's terminal title does, so the agent list says what it is doing.
+      const args = event.args as { display?: unknown } | undefined;
+      const milestone = event.toolName === "fabric_exec"
+        ? normalizeRunDisplay(args?.display)?.name?.replace(/\s+/g, " ").trim().slice(0, MAX_MILESTONE_CHARS)
+        : undefined;
+      if (milestone) record.milestone = milestone;
       update();
       return;
     }
@@ -1076,6 +1189,7 @@ const main = async (): Promise<void> => {
       const messageRecord = message as Record<string, unknown>;
       if (messageRecord.role !== "assistant") return;
       const text = extractText(messageRecord);
+      endedOnToolCall = toolUseStop(messageRecord);
       if (text || messageRecord.stopReason === "error" || messageRecord.stopReason === "aborted") {
         answerProjected = true;
       }
@@ -1225,10 +1339,22 @@ const main = async (): Promise<void> => {
         steerRemainder = Buffer.from(remainder);
       }
       let processedCommands = 0;
-      for (const raw of combined.subarray(0, newline + 1).toString("utf8").split("\n")) {
-        if (processedCommands >= MAX_STEER_COMMANDS_PER_POLL) break;
-        if (Buffer.byteLength(raw, "utf8") > MAX_STEER_LINE_BYTES) continue;
-        const line = raw.trim();
+      let lineStart = 0;
+      while (lineStart <= newline) {
+        if (processedCommands >= MAX_STEER_COMMANDS_PER_POLL) {
+          // Leave the unapplied lines for the next poll. `combined` holds
+          // contiguous file bytes ending at steerOffset, so rewinding by its
+          // unhandled tail makes the next poll start at the first line left.
+          steerOffset -= combined.length - lineStart;
+          steerRemainder = Buffer.alloc(0);
+          skippingOversizedSteerLine = false;
+          break;
+        }
+        const lineEnd = combined.indexOf(0x0a, lineStart);
+        const rawBytes = combined.subarray(lineStart, lineEnd);
+        lineStart = lineEnd + 1;
+        if (rawBytes.length > MAX_STEER_LINE_BYTES) continue;
+        const line = rawBytes.toString("utf8").trim();
         if (!line) continue;
         processedCommands += 1;
         let command: { type?: string; message?: string; mode?: string; instructions?: string; requestId?: string };
@@ -1277,6 +1403,8 @@ const main = async (): Promise<void> => {
             compactControl.queue(command.instructions);
           } else if (command.type === "ui_response") {
             questionRelay?.respond(command);
+          } else if (command.type === "ui_decision") {
+            questionRelay?.decide(command);
           }
         } catch {
           /* stdin closed (settled/stopped child); a late steer is dropped */
@@ -1384,9 +1512,16 @@ const main = async (): Promise<void> => {
   delete record.blockedOn;
   if (claudeCloseTimer) clearTimeout(claudeCloseTimer);
   clearTimeout(timeout);
-  if (killTimer) clearTimeout(killTimer);
-  if (closeTimer) clearTimeout(closeTimer);
   recoveryWatchdog.dispose();
+  if (options.modelMatch === "exact" && exitCode === MODEL_PIN_EXIT_CODE && !terminalStatus) {
+    const violation = parseModelPinViolation(stderr);
+    if (violation) {
+      terminalStatus = "failed";
+      terminalError = modelPinFailure(violation);
+      appendLog(`${JSON.stringify({ type: "fabric_model_error", requestedModel: options.model, model: record.model, error: terminalError })}\n`);
+    }
+  }
+  stallWatchdog.dispose();
   if (isPi && !modelControl.ready && !terminalStatus) {
     terminalStatus = "failed";
     terminalError = `Child Pi exited before requested model admission completed; task was not sent${stderr.trim() ? `: ${stderr.trim()}` : ""}`;
@@ -1455,6 +1590,11 @@ const main = async (): Promise<void> => {
   } else if (outputBuffer.trim()) {
     processEvent(outputBuffer);
   }
+  // A handled task cannot start its turn once the child is gone.
+  taskPrompt.childExited();
+  // Tail frames can request closure after the child has already exited.
+  if (killTimer) clearTimeout(killTimer);
+  if (closeTimer) clearTimeout(closeTimer);
   record.exitCode = exitCode;
   record.stderr = stderr.slice(-MAX_STDERR_CHARS);
   if (
@@ -1486,6 +1626,12 @@ const main = async (): Promise<void> => {
         claudeSteering.length === 0 &&
         claudeFollowUps.length === 0) ||
       (options.runner === "veda" && vedaParsed !== undefined));
+  // A run that stopped after a tool batch (a tool returned terminate: true) has
+  // no final answer, so it must not read as a success.
+  if (isPi && childCompleted && !terminalStatus && endedOnToolCall) {
+    terminalStatus = "failed";
+    terminalError = `Pi ended the run after a tool call without a final answer (tool: ${endedOnToolCall})`;
+  }
   record.status = terminalStatus ?? (childCompleted ? "completed" : "failed");
   if (terminalError) record.error = terminalError;
   if (record.status === "failed" && !record.error) {
@@ -1520,8 +1666,9 @@ const main = async (): Promise<void> => {
   process.exitCode = record.status === "completed" ? 0 : 1;
 };
 
-main().catch((error) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
+main().catch((caught) => {
+  const error = explainMissingInstall(caught, import.meta.url);
+  console.error(error instanceof Error ? (error === caught ? (error.stack ?? error.message) : error.message) : String(error));
   writeCrashStatus(error);
   process.exit(1);
 });

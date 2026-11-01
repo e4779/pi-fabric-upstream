@@ -1,4 +1,6 @@
 import { stableJsonHash } from "../core/stable-hash.js";
+import { consume } from "../verified/policy.js";
+import { admitSpeculation, checkSpeculation, speculationExpired, SpeculationAccounting } from "../verified/speculation.js";
 import type { FabricFreshnessChecker } from "./freshness.js";
 import type {
   FabricSpeculationConfig,
@@ -13,6 +15,7 @@ interface SpeculationEntry {
   ref: string;
   birthEpoch: number;
   createdAt: number;
+  active: boolean;
   controller: AbortController;
   freshness: FabricFreshnessChecker | undefined;
   replay: FabricSpeculationReplay;
@@ -23,32 +26,18 @@ interface SpeculationEntry {
 /**
  * Turn-scoped store of pre-launched speculation promises.
  *
- * Correctness contract: a stored promise may only be served to a real call
- * when (1) the mutation epoch has not advanced since the speculation launched
- * — the epoch bumps after any real in-program invocation whose effect kind is
- * not "none" — (2) the entry's freshness checker, when present, still holds,
- * and (3) the entry was launched against the same provider binding the real
- * call resolved: the binding token is part of the cache key, so an entry that
- * a reset could not abort (its speculate() was still mid-describe when the
- * binding was replaced) can never match the replacement's serve key. Entries
- * are take-once (identical duplicate calls each need their own speculation)
- * and are aborted + counted wasted when their execution finishes without
- * serving them or when the turn resets.
+ * Compiled kernels decide admission, consume each entry once, classify both
+ * serve checkpoints, and update accounting. The host owns keyed storage and
+ * observes actual promise settlement, epochs, time, freshness and aborts.
+ * Binding identity is part of the key, so an old binding cannot serve a new one.
+ * The concurrency observation counts retained nonfailed entries, not every
+ * unsettled external effect. Reset aborts work and advances the epoch.
  */
 export class FabricSpeculationStore implements FabricSpeculationRuntime {
-  #epoch = 0;
+  readonly #accounting = new SpeculationAccounting();
   readonly #entries = new Map<string, SpeculationEntry>();
   readonly #serving = new Set<SpeculationEntry>();
   readonly #endedInvocations = new Set<string>();
-  readonly #stats: FabricSpeculationStats = {
-    launched: 0,
-    served: 0,
-    epochInvalidated: 0,
-    freshnessInvalidated: 0,
-    failed: 0,
-    wasted: 0,
-    skipped: 0,
-  };
   readonly #maxConcurrent: number;
   readonly #maxEntries: number;
   readonly #entryTtlMs: number;
@@ -59,38 +48,25 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
     this.#entryTtlMs = config.entryTtlMs;
   }
 
-  get epoch(): number {
-    return this.#epoch;
-  }
+  get epoch(): number { return this.#accounting.epoch; }
 
   stats(): FabricSpeculationStats & { pending: number } {
-    return { ...this.#stats, pending: this.#entries.size };
+    return { ...this.#accounting.stats(), pending: this.#entries.size };
   }
 
-  bumpEpoch(): void {
-    this.#epoch += 1;
-  }
+  bumpEpoch(): void { this.#accounting.record("bump"); }
 
   /** Fence descriptor/argument preparation across resets, effects and invocation end. */
   captureLaunch(parentToolCallId: string): () => boolean {
-    const epoch = this.#epoch;
-    return () => epoch === this.#epoch && !this.#endedInvocations.has(parentToolCallId);
+    const epoch = this.epoch;
+    return () => epoch === this.epoch && !this.#endedInvocations.has(parentToolCallId);
   }
 
-  static key(
-    parentToolCallId: string,
-    ref: string,
-    preparedArgs: Record<string, unknown>,
-    bindingToken: string,
-  ): string {
+  static key(parentToolCallId: string, ref: string, preparedArgs: Record<string, unknown>, bindingToken: string): string {
     return `${parentToolCallId}\n${ref}\n${stableJsonHash(preparedArgs)}\n${bindingToken}`;
   }
 
-  /**
-   * Register and start a speculative invocation. Returns false when at
-   * capacity; the candidate is dropped silently (a miss costs nothing, the
-   * real call executes normally later).
-   */
+  /** Register and start work only after the compiled admission decision. */
   launch(
     parentToolCallId: string,
     ref: string,
@@ -100,97 +76,81 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
     replay: FabricSpeculationReplay,
     bindingToken: string,
   ): boolean {
+    // Preserve the host protocol: an ended invocation neither sweeps nor skips.
     if (this.#endedInvocations.has(parentToolCallId)) return false;
     this.#sweepExpired(Date.now());
-    if (this.#entries.size >= this.#maxEntries || this.#inFlightCount() >= this.#maxConcurrent) {
-      this.#stats.skipped += 1;
+    const admission = (duplicate: boolean) => admitSpeculation({
+      ended: this.#endedInvocations.has(parentToolCallId), duplicate,
+      entries: this.#entries.size, inFlight: this.#inFlightCount(),
+      maxEntries: this.#maxEntries, maxConcurrent: this.#maxConcurrent,
+    });
+    const refuse = (plan: ReturnType<typeof admitSpeculation>) => {
+      if (plan === "skip") this.#accounting.record("skipped");
       return false;
-    }
+    };
+    // Do not hash caller arguments if capacity already refuses the request.
+    const room = admission(false);
+    if (room !== "admit") return refuse(room);
     const key = FabricSpeculationStore.key(parentToolCallId, ref, preparedArgs, bindingToken);
-    if (this.#entries.has(key)) {
-      this.#stats.skipped += 1;
-      return false;
-    }
+    const plan = admission(this.#entries.has(key));
+    if (plan !== "admit") return refuse(plan);
     const controller = new AbortController();
     const entry: SpeculationEntry = {
-      parentToolCallId,
-      ref,
-      birthEpoch: this.#epoch,
-      createdAt: Date.now(),
-      controller,
-      freshness,
-      replay,
-      promise: Promise.resolve()
-        .then(() => execute(controller.signal))
-        .catch(() => {
-          entry.failed = true;
-          return undefined;
-        }),
+      parentToolCallId, ref, birthEpoch: this.epoch, createdAt: Date.now(), active: true,
+      controller, freshness, replay,
+      promise: Promise.resolve().then(() => execute(controller.signal)).catch(() => {
+        entry.failed = true;
+        return undefined;
+      }),
       failed: false,
     };
-    // Promise.resolve().then keeps a synchronous executor throw inside the
-    // entry (failed flag) rather than at the launch site.
+    // A synchronous executor throw becomes a settled failed entry, not a launch throw.
     this.#entries.set(key, entry);
-    this.#stats.launched += 1;
+    this.#accounting.record("launched");
     return true;
   }
 
-  async tryServe(
-    parentToolCallId: string,
-    ref: string,
-    preparedArgs: Record<string, unknown>,
-    bindingToken: string,
-  ): Promise<FabricSpeculationServeResult> {
+  async tryServe(parentToolCallId: string, ref: string, preparedArgs: Record<string, unknown>, bindingToken: string): Promise<FabricSpeculationServeResult> {
     const key = FabricSpeculationStore.key(parentToolCallId, ref, preparedArgs, bindingToken);
     const entry = this.#entries.get(key);
-    if (!entry || entry.parentToolCallId !== parentToolCallId) {
-      return { hit: false, reason: "absent" };
-    }
+    if (!entry || entry.parentToolCallId !== parentToolCallId) return { hit: false, reason: "absent" };
     this.#entries.delete(key);
-    if (Date.now() - entry.createdAt > this.#entryTtlMs) {
-      this.#stats.wasted += 1;
-      entry.controller.abort();
-      return { hit: false, reason: "absent" };
-    }
-    if (entry.birthEpoch !== this.#epoch) {
-      this.#stats.epochInvalidated += 1;
-      entry.controller.abort();
-      return { hit: false, reason: "epoch" };
-    }
-    if (entry.freshness && !entry.freshness()) {
-      this.#stats.freshnessInvalidated += 1;
-      entry.controller.abort();
-      return { hit: false, reason: "freshness" };
-    }
+    // Reserve before any await. The shared compiled token law forbids replay.
+    const taken = consume(entry.active);
+    entry.active = taken.active;
+    if (!taken.released) return { hit: false, reason: "absent" };
+    const before = this.#check(entry, false);
+    if (before !== "ready") return this.#refuse(entry, before);
     this.#serving.add(entry);
     let value: unknown;
-    try {
-      value = await entry.promise;
-    } finally {
-      this.#serving.delete(entry);
-    }
-    // A reset or mutation may occur while the provider is still answering.
-    if (entry.controller.signal.aborted || entry.birthEpoch !== this.#epoch) {
-      this.#stats.epochInvalidated += 1;
-      entry.controller.abort();
-      return { hit: false, reason: "epoch" };
-    }
-    if (Date.now() - entry.createdAt > this.#entryTtlMs) {
-      this.#stats.wasted += 1;
-      entry.controller.abort();
-      return { hit: false, reason: "absent" };
-    }
-    if (entry.freshness && !entry.freshness()) {
-      this.#stats.freshnessInvalidated += 1;
-      entry.controller.abort();
-      return { hit: false, reason: "freshness" };
-    }
-    if (entry.failed) {
-      this.#stats.failed += 1;
-      return { hit: false, reason: "failed" };
-    }
-    this.#stats.served += 1;
+    try { value = await entry.promise; }
+    finally { this.#serving.delete(entry); }
+    const after = this.#check(entry, true);
+    if (after !== "ready") return this.#refuse(entry, after);
+    this.#accounting.record("served");
     return { hit: true, value, replay: entry.replay };
+  }
+
+  /** Freshness callbacks remain lazy, after epoch/expiry guards at each checkpoint. */
+  #check(entry: SpeculationEntry, settled: boolean): ReturnType<typeof checkSpeculation> {
+    const observation = {
+      settled, aborted: entry.controller.signal.aborted, now: Date.now(),
+      createdAt: entry.createdAt, ttl: this.#entryTtlMs,
+      birthEpoch: entry.birthEpoch, epoch: this.epoch, fresh: true, failed: entry.failed,
+    };
+    // Provider failure follows freshness, so do not short-circuit its callback.
+    const outcome = checkSpeculation({ ...observation, failed: false });
+    if (outcome !== "ready") return outcome;
+    return checkSpeculation({ ...observation, fresh: entry.freshness ? entry.freshness() : true });
+  }
+
+  #refuse(entry: SpeculationEntry, reason: Exclude<ReturnType<typeof checkSpeculation>, "ready">): FabricSpeculationServeResult {
+    const event = { absent: "wasted", epoch: "epochInvalidated", freshness: "freshnessInvalidated", failed: "failed" } as const;
+    this.#accounting.record(event[reason]);
+    // Staleness invalidates the signal at either checkpoint. A current
+    // provider failure has already settled and historically does not abort.
+    if (reason !== "failed") entry.controller.abort();
+    return { hit: false, reason };
   }
 
   /** Execution for this tool call finished: everything unserved is waste. */
@@ -203,7 +163,7 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
       if (entry.parentToolCallId !== parentToolCallId) continue;
       entry.controller.abort();
       this.#entries.delete(key);
-      this.#stats.wasted += 1;
+      this.#accounting.record("wasted");
     }
   }
 
@@ -218,18 +178,16 @@ export class FabricSpeculationStore implements FabricSpeculationRuntime {
 
   #inFlightCount(): number {
     let count = 0;
-    for (const entry of this.#entries.values()) {
-      if (!entry.failed) count += 1;
-    }
+    for (const entry of this.#entries.values()) if (!entry.failed) count += 1;
     return count;
   }
 
   #sweepExpired(now: number): void {
     for (const [key, entry] of this.#entries) {
-      if (now - entry.createdAt <= this.#entryTtlMs) continue;
+      if (!speculationExpired(now, entry.createdAt, this.#entryTtlMs)) continue;
       entry.controller.abort();
       this.#entries.delete(key);
-      this.#stats.wasted += 1;
+      this.#accounting.record("wasted");
     }
   }
 }

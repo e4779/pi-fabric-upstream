@@ -92,14 +92,84 @@ const childAlive = (owner: RunRootOwner | undefined, pid: number): boolean => {
 const recordAgeReference = (record: RunRecordSummary, fallback: number): number =>
   time(record.finishedAt) ? record.finishedAt : time(record.updatedAt) ? record.updatedAt : fallback;
 const runFiles = new Set(["task.txt", "status.json", "events.jsonl", "lifecycle.jsonl", "steer.jsonl", "schema.json", "images.json"]);
+/** node:crypto randomUUID(): lowercase, version 4, variant 10xx. */
+const UUID_V4 = "[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+/** pi-ai uuidv7(), which Pi's SessionManager uses for session ids: lowercase, version 7, variant 10xx. */
+const UUID_V7 = "[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
+/** process.pid: positive and unpadded. */
+const PID = "[1-9]\\d*";
+/**
+ * Files writeForkSession (src/agents/handoff.ts) and Pi create in `<run>/fork-session/`:
+ * materializeBranch's `handoff-<randomUUID>.jsonl`, appended to in place, and the
+ * `<timestamp>_<uuidv7>.jsonl` SessionManager.createBranchedSession writes beside it when a child
+ * extension forks the session. The timestamp is `new Date().toISOString()` with `:` and `.` turned into `-`
+ * (pi-coding-agent dist/core/session-manager.js: `timestamp.replace(/[:.]/g, "-")`, `${fileTimestamp}_${newSessionId}.jsonl`).
+ */
+const HANDOFF_FILE = new RegExp(`^handoff-${UUID_V4}\\.jsonl$`);
+const PI_BRANCH_FILE = new RegExp(`^(\\d{4}-\\d{2}-\\d{2})T(\\d{2})-(\\d{2})-(\\d{2})-(\\d{3})Z_${UUID_V7}\\.jsonl$`);
+/** The name part must be a real instant: map it back to an ISO string and require Date to reproduce it exactly (rejects 2026-02-30 and month 99). */
+const piBranchFile = (name: string): boolean => {
+  const match = PI_BRANCH_FILE.exec(name);
+  if (!match) return false;
+  const iso = `${match[1]}T${match[2]}:${match[3]}:${match[4]}.${match[5]}Z`;
+  const instant = new Date(iso);
+  return !Number.isNaN(instant.getTime()) && instant.toISOString() === iso;
+};
+const forkSessionFile = (name: string): boolean => HANDOFF_FILE.test(name) || piBranchFile(name);
+/**
+ * A crash between a record's temp write and its rename leaves a temp file beside it, named by the writer:
+ * the worker's writeRunRecord (src/worker/run-record.ts) `status.json.<pid>.tmp`, and writeFileAtomic
+ * (src/core/atomic-write.ts, used for status.json by the manager and HostedRun) `status.json.<pid>.<randomUUID>.tmp`.
+ */
+const STATUS_TEMP_FILE = new RegExp(`^status\\.json\\.${PID}(?:\\.${UUID_V4})?\\.tmp$`);
+/** src/worker.ts failOversizedEvent saves the first characters of an oversized event line here. */
+const OVERSIZED_EVENT_FILE = "oversized-event-prefix.txt";
 const DURABLE_KEY = /^(?:initial|[0-9a-f]{64})$/;
 const DURABLE_LEASE_FILES = new Set(["lease.sqlite", "lease.sqlite-journal"]);
 const DURABLE_STORE_FILE = /^(?:main|(?:doc|task)-(?:0|[1-9]\d*))\.jsonl(?:\.reclaim)?$/;
+/** src/durable/agent.ts fabricJournalPath: the first 32 hex digits of a sha256, as `.jsonl`. */
+const FABRIC_JOURNAL_FILE = /^[0-9a-f]{32}\.jsonl$/;
 const onlyOwnedFiles = (directory: string, allowed: (name: string) => boolean): boolean =>
   fs.readdirSync(directory).every((name) => allowed(name) && ownedStat(path.join(directory, name))?.isFile() === true);
+const DURABLE_SESSION_FILE = "session.jsonl";
+const DURABLE_SESSION_TEMP = /^tmp-[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.jsonl$/;
+/** A file an extension keeps beside the session file, such as `session.jsonl.acp.json`. */
+const DURABLE_SESSION_SIDECAR = /^session\.jsonl\.[A-Za-z0-9][A-Za-z0-9._-]*$/;
+/**
+ * A pi-durable worker's private session folder (src/durable/worker-role-seed.ts):
+ * only `session.jsonl` and the `tmp-<uuid v4>.jsonl` names the worker writes,
+ * each a regular file owned by this user. A file with two names is accepted only
+ * as the crash leftover between the worker's link and unlink: the folder holds
+ * exactly `session.jsonl` and one temp name sharing device and inode. A link that
+ * leaves the folder, an unknown name, a symlink or another owner keeps the run.
+ * A `session.jsonl.<suffix>` sidecar is accepted only as an owned regular file with one name.
+ */
+const safeDurableSessionFolder = (directory: string): boolean => {
+  const uid = process.getuid?.();
+  const stats = new Map<string, fs.Stats>();
+  for (const name of fs.readdirSync(directory)) {
+    if (DURABLE_SESSION_SIDECAR.test(name)) {
+      const sidecar = fs.lstatSync(path.join(directory, name));
+      if (!sidecar.isFile() || (uid !== undefined && sidecar.uid !== uid) || sidecar.nlink !== 1) return false;
+      continue;
+    }
+    if (name !== DURABLE_SESSION_FILE && !DURABLE_SESSION_TEMP.test(name)) return false;
+    const stat = fs.lstatSync(path.join(directory, name));
+    if (!stat.isFile() || (uid !== undefined && stat.uid !== uid) || stat.nlink > 2) return false;
+    stats.set(name, stat);
+  }
+  const linked = [...stats.entries()].filter(([, stat]) => stat.nlink !== 1);
+  if (linked.length === 0) return true;
+  const session = stats.get(DURABLE_SESSION_FILE);
+  const temporaries = [...stats.entries()].filter(([name]) => name !== DURABLE_SESSION_FILE);
+  const [temporary] = temporaries;
+  return stats.size === 2 && session !== undefined && temporaries.length === 1 && temporary !== undefined &&
+    session.nlink === 2 && temporary[1].nlink === 2 && session.dev === temporary[1].dev && session.ino === temporary[1].ino;
+};
 /**
  * The pi-durable runner's journal: `durable/<initial|sha256>/{lease.sqlite,store/*.jsonl}`,
- * exactly as src/durable/storage.ts creates it. The run's status and child liveness
+ * exactly as src/durable/storage.ts creates it, plus the fabric_exec crash journals in
+ * `fabric-journal/` (src/durable/worker-host.ts). The run's status and child liveness
  * still decide removal; this only stops Fabric's own journal from vetoing it.
  */
 const safeDurableTree = (directory: string): boolean => fs.readdirSync(directory).every((key) => {
@@ -108,17 +178,37 @@ const safeDurableTree = (directory: string): boolean => fs.readdirSync(directory
   return fs.readdirSync(conversation).every((name) => {
     const file = path.join(conversation, name);
     if (name === "store") return ownedStat(file)?.isDirectory() === true && onlyOwnedFiles(file, (child) => DURABLE_STORE_FILE.test(child));
+    if (name === "fabric-journal") return ownedStat(file)?.isDirectory() === true && onlyOwnedFiles(file, (child) => FABRIC_JOURNAL_FILE.test(child));
     return DURABLE_LEASE_FILES.has(name) && ownedStat(file)?.isFile() === true;
   });
 });
-/** Unknown transports/contents and live descendants veto removal, even under a dead host. */
-const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwner, depth = 0): boolean => {
+/**
+ * Owned regular files and directories only: no links, no hard-linked files, no hosted-run locator.
+ * Removing such a tree deletes nothing outside it.
+ */
+const ownedTree = (directory: string, depth: number): boolean => {
+  if (depth > 32) return false;
+  return fs.readdirSync(directory).every((name) => {
+    const stat = ownedStat(path.join(directory, name));
+    if (!stat || name.startsWith("hosted.json")) return false;
+    return stat.isFile() || (stat.isDirectory() && ownedTree(path.join(directory, name), depth + 1));
+  });
+};
+/**
+ * Unknown transports and live descendants veto removal, even under a dead host.
+ * `anyContents` is for a root whose owner is dead and past its orphan grace: nothing will
+ * read the run's files again, so files Fabric does not know (written by the durable worker,
+ * its session, or another extension) no longer veto, provided they are owned and unlinked.
+ * The run record, live children and hosted-run locators still decide.
+ */
+const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwner, depth = 0, anyContents = false): boolean => {
   if (depth > 32 || !ownedStat(root)?.isDirectory()) return false;
   const record = readJson<RunRecordSummary>(path.join(root, "status.json"));
   const pid = record?.transport === "process" && typeof record.sessionId === "string" && /^\d+$/.test(record.sessionId)
     ? Number(record.sessionId) : undefined;
   if (pid !== undefined && childAlive(owner, pid)) return false;
-  if (!record?.status || !TERMINAL_STATUSES.has(record.status)) {
+  const terminal = !!record?.status && TERMINAL_STATUSES.has(record.status);
+  if (!terminal) {
     if (!childrenStopped && pid === undefined) return false;
     if (!ownedStat(path.join(root, "task.txt"))?.isFile()) return false;
   }
@@ -127,10 +217,26 @@ const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwne
       const file = path.join(root, name);
       const stat = ownedStat(file);
       if (!stat) return false;
-      if (stat.isFile() && runFiles.has(name)) continue;
+      if (stat.isFile() && (runFiles.has(name) || name === OVERSIZED_EVENT_FILE || STATUS_TEMP_FILE.test(name))) continue;
+      if (anyContents && name !== "nested" && !name.startsWith("hosted.json")) {
+        if (stat.isFile() || (stat.isDirectory() && ownedTree(file, depth + 1))) continue;
+        return false;
+      }
+      // hosted.json and its temp files are deliberately not accepted: no record proves the remote work stopped,
+      // so a run holding a hosted-run locator is always kept.
+      if (stat.isDirectory() && name === "fork-session") {
+        // Exclusively populated by writeForkSession: owned regular files of its one name shape.
+        if (!onlyOwnedFiles(file, (child) => forkSessionFile(child))) return false;
+        continue;
+      }
       if (stat.isDirectory() && name === "handoff-session") {
         // This directory is exclusively populated by Fabric's session fork writer.
         if (fs.readdirSync(file).some((child) => !child.endsWith(".jsonl") || !ownedStat(path.join(file, child))?.isFile())) return false;
+        continue;
+      }
+      if (stat.isDirectory() && name === "durable-session") {
+        // The pi-durable worker's private Pi session file (src/worker.ts).
+        if (!safeDurableSessionFolder(file)) return false;
         continue;
       }
       if (stat.isDirectory() && name === "durable") {
@@ -138,7 +244,7 @@ const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwne
         continue;
       }
       if (stat.isDirectory() && name === "nested") {
-        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, owner, depth + 1)) return false;
+        for (const child of fs.readdirSync(file)) if (!safeRunTree(path.join(file, child), false, owner, depth + 1, anyContents)) return false;
         continue;
       }
       return false;
@@ -146,8 +252,8 @@ const safeRunTree = (root: string, childrenStopped: boolean, owner?: RunRootOwne
     return true;
   } catch { return false; }
 };
-const safeRootContents = (root: string, childrenStopped: boolean, owner?: RunRootOwner): boolean => {
-  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped, owner)); }
+const safeRootContents = (root: string, childrenStopped: boolean, owner?: RunRootOwner, anyContents = false): boolean => {
+  try { return fs.readdirSync(root).every((name) => name === RUN_ROOT_OWNER_FILE || safeRunTree(path.join(root, name), childrenStopped, owner, 0, anyContents)); }
   catch { return false; }
 };
 export const canRemoveManagedRunRoot = (root: string): boolean => {
@@ -208,7 +314,7 @@ export const sweepTempRunRoots = (options: {
       try { writeOwner(root, { ...owner, orphanedAt: now }); } catch {}
       continue;
     }
-    if (now - owner.orphanedAt < options.orphanedTempRunRetentionMs || !safeRootContents(root, false, owner)) continue;
+    if (now - owner.orphanedAt < options.orphanedTempRunRetentionMs || !safeRootContents(root, false, owner, true)) continue;
     try { fs.rmSync(root, { recursive: true, force: true }); result.removedRoots.push(root); } catch {}
   }
   return result;

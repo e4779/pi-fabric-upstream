@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { FabricProgramKernel } from "./store.js";
 
 // Guest source for saved programs. A program reads its input from the
@@ -26,6 +27,22 @@ export const programSourceWithInput = (code: string, kernel: FabricProgramKernel
   kernel === "python"
     ? `input = ${pythonLiteral(input ?? null)}\n${code}`
     : `const input: any = ${JSON.stringify(input ?? null)}; ${code}`;
+
+const CODE_LABEL_HEX_CHARS = 12;
+
+/** Lowercase hex SHA-256 of the text's UTF-8 bytes. */
+export const sha256Hex = (text: string): string => createHash("sha256").update(text, "utf8").digest("hex");
+
+/**
+ * Identity of caller-supplied code in the trace and reply: `caller-code:<full sha256>`.
+ * The colon is outside `PROGRAM_NAME_PATTERN`, so no saved program can have this
+ * ref. Within a run of that code it is also the `ref` that `programs.run`
+ * resolves to the code.
+ */
+export const callerCodeProgram = (sha256: string): string => `caller-code:${sha256}`;
+
+/** Short label for the run's display name and transcript message. */
+export const callerCodeLabel = (sha256: string): string => `caller-code:${sha256.slice(0, CODE_LABEL_HEX_CHARS)}`;
 
 /** A one-call host program that runs a saved program through `programs.run`. */
 export const hostProgramRunSource = (

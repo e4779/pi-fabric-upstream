@@ -2,7 +2,7 @@ import { acceptMemoryChunk, type TextRange } from "./policy.js";
 
 /** Check the actual outgoing page against the selected normalized source, after
  * all envelope trimming. Source observation/hashing and lineage selection remain
- * host responsibilities; ranges are checked by the compiled Bend kernel. */
+ * host responsibilities; ranges are checked by the compiled gdp-wired kernel. */
 export const acceptsExpansionPage = (
   records: readonly Record<string, unknown>[],
   source: readonly { index: number; text: string }[],

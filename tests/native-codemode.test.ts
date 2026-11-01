@@ -40,6 +40,34 @@ function fixture(runtime: "quickjs" | "node-process" | "bun-process" = "quickjs"
 }
 
 describe("native Pi codemode bridge", () => {
+  it.each([false, true])("falls back to MCP when native provider actions are empty (host definitions: %s)", async hostDefinitions => {
+    const f = fixture();
+    f.config.executor.codemodeProfile = "native";
+    const descriptor = { name: "demo.echo", description: "Echo", inputSchema: { type: "object", properties: {} }, risk: "read" as const };
+    const list = vi.fn(async () => [descriptor]);
+    f.actions.register({ name: "mcp", description: "MCP", list, async describe(name) { return name === descriptor.name ? descriptor : undefined; }, async invoke() { return "echoed"; } });
+    for (const name of ["pi", "extensions"]) {
+      f.actions.register({ name, description: name, async list() { return []; }, async describe() { return undefined; }, async invoke() { throw new Error("unavailable"); } });
+    }
+    if (hostDefinitions) Object.assign(f.context, { tools: [{ name: "unavailable", description: "Unavailable", parameters: { type: "object", properties: {} } }] });
+    const result = await f.run('return { all: ALL_TOOLS, value: await nativeTools.mcp__demo__echo({}) };');
+    expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
+    expect(result.value).toMatchObject({ all: [{ name: "mcp__demo__echo" }], value: "echoed" });
+    expect(list).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not initialize MCP discovery when native provider actions exist", async () => {
+    const f = fixture();
+    f.config.executor.codemodeProfile = "native";
+    const descriptor = { name: "echo", description: "Echo", inputSchema: { type: "object", properties: {} }, risk: "read" as const };
+    f.actions.register({ name: "extensions", description: "Extensions", async list() { return [descriptor]; }, async describe() { return descriptor; }, async invoke() { return "echoed"; } });
+    const list = vi.fn(async () => { throw new Error("MCP must remain idle"); });
+    f.actions.register({ name: "mcp", description: "MCP", list, async describe() { return undefined; }, async invoke() { throw new Error("unavailable"); } });
+    const result = await f.run('return { all: ALL_TOOLS, value: await nativeTools.echo({}) };');
+    expect(result.success, result.error ?? JSON.stringify(result.typeErrors)).toBe(true);
+    expect(result.value).toMatchObject({ all: [{ name: "echo" }], value: "echoed" });
+    expect(list).not.toHaveBeenCalled();
+  });
   it("retains callable aliases, strips auth and accounts minimal native usage", async () => {
     const f = fixture();
     const result = await f.run(`const all = await models.getAvailableOfType("classifier"); const result = await tools.models.classify(all[0], ${question}); return { same: models === tools.models, old: await tools.models(), all, result };`);

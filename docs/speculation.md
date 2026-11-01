@@ -38,6 +38,12 @@ preparation and already-claimed promises as well as retained results. Re-enablin
 speculation or returning to an eligible kernel/backend starts with empty state;
 it does not revive earlier streams or results.
 
+Speculation is disabled whenever `approvals.policyHooks` is `true`, even if no
+hooks are registered yet: extensions can register deny/hold hooks dynamically.
+Hooks run only during normal execution's approval stage, never speculatively or
+twice. Enabling hooks on config reload resets stream state and cached results;
+disabling hooks restores eligible speculation with an empty cache.
+
 The pre-launch gate also checks live policy **before provider lookup**: read or network approval must be `allow`, hidden `pi.*` calls cannot pre-launch in orchestration-only mode, and Schema-blocked refs cannot pre-launch under enforcement. MCP allowlisting alone does not override `ask`/`deny` or Schema policy. The normal invocation repeats its full authorization and approval path before consuming a cached result.
 
 ## Pipeline

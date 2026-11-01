@@ -70,12 +70,21 @@ export const parseWorkerOptions = (
   const schemaFile = optional(args, "schema-file");
   const imagesFile = optional(args, "images-file");
   const systemPrompt = optional(args, "system-prompt");
+  const skillsSource = optional(args, "skills");
+  const skills = skillsSource === undefined ? undefined : JSON.parse(skillsSource) as unknown;
+  if (skills !== undefined && (!Array.isArray(skills) || !skills.every((entry) => typeof entry === "string" && entry.length > 0))) {
+    throw new Error("Invalid worker skills list");
+  }
   const sessionFile = optional(args, "session-file");
   const persistSessionSource = optional(args, "persist-session");
   if (persistSessionSource !== undefined && persistSessionSource !== "true" && persistSessionSource !== "false") {
     throw new Error("Invalid worker persist-session flag");
   }
   const persistSession = persistSessionSource === "true";
+  const durableSessionSource = optional(args, "durable-session");
+  if (durableSessionSource !== undefined && durableSessionSource !== "true") {
+    throw new Error("Invalid worker durable-session flag");
+  }
   const modelAdmissionSource = optional(args, "model-admission");
   if (
     modelAdmissionSource !== undefined &&
@@ -87,6 +96,11 @@ export const parseWorkerOptions = (
   const modelAdmission = modelAdmissionSource === "strict" || modelAdmissionSource === "permissive"
     ? modelAdmissionSource
     : undefined;
+  const modelMatchSource = optional(args, "model-match");
+  if (modelMatchSource !== undefined && modelMatchSource !== "exact") {
+    throw new Error("Invalid worker model-match flag");
+  }
+  const modelMatch = modelMatchSource === "exact" ? modelMatchSource : undefined;
   const sessionExportFile = optional(args, "session-export-file");
   const actorId = optional(args, "actor-id");
   const actorName = optional(args, "actor-name");
@@ -113,6 +127,10 @@ export const parseWorkerOptions = (
   const childQuestionTimeoutMs = childQuestions === undefined ? undefined : Number(childQuestions);
   if (childQuestionTimeoutMs !== undefined && !(Number.isInteger(childQuestionTimeoutMs) && childQuestionTimeoutMs >= 1_000)) {
     throw new Error("Invalid worker child-questions timeout");
+  }
+  const childQuestionHold = optional(args, "child-questions-hold");
+  if (childQuestionHold !== undefined && (childQuestionHold !== "1" || childQuestionTimeoutMs === undefined)) {
+    throw new Error("Invalid worker child-questions-hold");
   }
   const branch = optional(args, "branch");
   const worktree = optional(args, "worktree");
@@ -163,6 +181,9 @@ export const parseWorkerOptions = (
   if (persistSession && runner !== "claude") {
     throw new Error("Worker persist-session requires the Claude runner");
   }
+  if (durableSessionSource !== undefined && runner !== "pi-durable") {
+    throw new Error("Worker durable-session requires the pi-durable runner");
+  }
   const extensions = required(args, "extensions") === "true";
   const selectedKernel = args.get("kernel");
   const pythonRuntime = args.get("python-runtime") ?? "monty";
@@ -208,8 +229,11 @@ export const parseWorkerOptions = (
     ...(thinking ? { thinking } : {}),
     ...(thinkingBounds ? { thinkingBounds } : {}),
     ...(systemPrompt ? { systemPrompt } : {}),
+    ...(skills ? { skills: skills as string[] } : {}),
     ...(persistSession ? { persistSession: true } : {}),
+    ...(durableSessionSource === "true" ? { durableSession: true } : {}),
     ...(modelAdmission ? { modelAdmission } : {}),
+    ...(modelMatch ? { modelMatch } : {}),
     ...(sessionFile ? { sessionFile } : {}),
     ...(sessionExportFile ? { sessionExportFile } : {}),
     ...(actorId ? { actorId } : {}),
@@ -226,6 +250,7 @@ export const parseWorkerOptions = (
     ...(runRoot ? { runRoot } : {}),
     ...(steerFile ? { steerFile } : {}),
     ...(childQuestionTimeoutMs !== undefined ? { childQuestionTimeoutMs } : {}),
+    ...(childQuestionHold ? { childQuestionHold: true as const } : {}),
     ...(branch ? { branch } : {}),
     ...(worktree ? { worktree } : {}),
     ...(writePolicy ? { writePolicy } : {}),

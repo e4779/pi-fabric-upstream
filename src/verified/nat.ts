@@ -1,5 +1,3 @@
-// Bend's JavaScript backend (2.0.37, as 2.0.36) rejects arithmetic naturals above
-// this bound; a Nat crosses to and from JS as a plain number since 2.0.37.
-// Comparison-only primitives can compare larger JS-safe integers. Storage uses
-// radix limbs to keep its full safe-integer revision arithmetic in this domain.
-export const BEND_NAT_MAX = 2 ** 48 - 1;
+// The compiled gdp-wired runtime refuses any natural past 2^53 - 1, where the
+// proofs over the naturals stop describing the run. Counters fail closed first.
+export const VERIFIED_NAT_MAX = Number.MAX_SAFE_INTEGER;

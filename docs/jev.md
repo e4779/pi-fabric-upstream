@@ -171,7 +171,7 @@ Use named Fabric payloads when large code strings are awkward to quote. In a Jev
 - `program.emit(value)` records a bounded progress event.
 - With `observe` on spawn, `program.nextEvent()` waits for Main lifecycle events without polling.
 - `program.advise({eventId,message})` supplies the run ID to the policy-checked `jev.advise` action; declare that exact capability and opt into delivery.
-- `tools.call({ ref, args })` and ordinary Fabric provider proxies call only exact `requires` refs. Discovery is not a way to acquire additional authority.
+- `tools.call({ ref, args })` and ordinary Fabric provider proxies call only exact `requires` refs. Discovery is not a way to acquire additional authority. A provider another extension registers is a typed global, such as `app.control(args)`, only when `requires` names one of its actions; see [program globals](providers.md#program-globals-and-types).
 - The same QuickJS context persists for the whole run: local variables and data structures survive every iteration. No host imports, `process`, or direct `fetch` are available.
 
 A reactive controller can use `while (true)` with these primitives. Observe fresh state, construct questions/candidate IDs, evaluate, verify applicability, act, and observe again. Revalidate target IDs/revisions before applying a decision. Define a no-match or escalation path. There is no mandatory model-generated planning step in the loop and no built-in 10 Hz guarantee: end-to-end rate includes observation, inference, and action latency.

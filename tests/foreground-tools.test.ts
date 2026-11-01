@@ -343,6 +343,53 @@ describe("foreground extension wiring", () => {
     await host.shutdown();
   });
 
+  it("warns once per session that keepVisible has no effect in full code mode", async () => {
+    const host = await boot({ fullCodeMode: true, capture: { keepVisible: ["fabric_exec", "todo"] }, foreground: { tools: [] } });
+    expect(await host.declared()).toEqual(["fabric_exec"]);
+    expect(host.hidden()).toContain("todo");
+    await host.run("before_agent_start", agentStart);
+    await host.run("before_agent_start", agentStart);
+    expect(host.notify).toHaveBeenCalledExactlyOnceWith(
+      "Fabric capture.keepVisible has no effect in full code mode; todo stay hidden from the model. Use foreground.tools to declare a tool beside fabric_exec.",
+      "warning");
+    host.setSession("session-2");
+    await host.run("before_agent_start", agentStart);
+    expect(host.notify).toHaveBeenCalledTimes(2);
+    await host.shutdown();
+  });
+
+  it("warns for configured foreground tools refused by the cap", async () => {
+    const host = await boot({ fullCodeMode: true, capture: { keepVisible: ["todo"] }, foreground: { tools: [entry("todo")], maxTools: 0 } });
+    expect(await host.declared()).toEqual(["fabric_exec"]);
+    await host.run("before_agent_start", agentStart);
+    expect(host.notify).toHaveBeenCalledWith(expect.stringContaining("todo stay hidden"), "warning");
+    await host.shutdown();
+  });
+
+  it("warns that keepVisible has no effect under Schema enforce without pointing to foreground", async () => {
+    const host = await boot({ schema: { mode: "enforce" }, capture: { keepVisible: ["todo"] }, foreground: { tools: [] } });
+    await host.run("before_agent_start", agentStart);
+    expect(host.notify).toHaveBeenCalledExactlyOnceWith(
+      "Fabric capture.keepVisible has no effect in Schema enforce mode; todo stay hidden from the model.",
+      "warning");
+    await host.shutdown();
+  });
+
+  it("does not warn about keepVisible when it names only fabric_exec or a declared foreground tool", async () => {
+    const host = await boot({
+      fullCodeMode: true,
+      capture: { keepVisible: ["fabric_exec", "ask_user"] },
+      foreground: { tools: [entry("ask_user")] },
+    });
+    await host.run("before_agent_start", agentStart);
+    expect(host.notify).not.toHaveBeenCalled();
+    await host.shutdown();
+    const orchestration = await boot({ fullCodeMode: false, capture: { keepVisible: ["todo"] }, foreground: { tools: [] } });
+    await orchestration.run("before_agent_start", agentStart);
+    expect(orchestration.notify).not.toHaveBeenCalled();
+    await orchestration.shutdown();
+  });
+
   it("refuses the whole policy under Schema enforce with one notice per session", async () => {
     const host = await boot({ schema: { mode: "enforce" }, foreground: { tools: [entry("ask_user")] } });
     expect(await host.declared()).toEqual(["fabric_exec"]);

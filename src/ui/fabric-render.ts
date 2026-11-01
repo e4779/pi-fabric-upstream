@@ -527,6 +527,8 @@ const providerCallDetail = (
       case "list":
       case "models":
       case "peers":
+      case "departed":
+      case "definitions":
         return countOf(result);
       default:
         return previewName ?? id ?? "";
@@ -931,7 +933,16 @@ export interface FabricMulticallPartialInput {
   showAgentToolPreview?: boolean | undefined;
   spinner?: string | undefined;
   activityLabel?: string | undefined;
+  /** Calls the progress update left out to stay bounded. */
+  omittedCalls?: { count: number; done: number } | undefined;
 }
+
+export const shellBackgroundShortcut = (audit: FabricRenderAudit): boolean => {
+  const preview = audit.preview;
+  return audit.success === undefined && (audit.tool === "bash" || audit.tool === "powershell") &&
+    typeof preview === "object" && preview !== null &&
+    (preview as Record<string, unknown>).shellBackgroundShortcut === true;
+};
 
 export const singleCallProgressLine = (
   progress: string | undefined,
@@ -953,15 +964,20 @@ export const renderFabricMulticallPartial = (
   theme: Theme,
   invalidate?: () => void,
 ): Component => {
-  const done = input.audits.filter((audit) => audit.success !== undefined).length;
+  const omitted = input.omittedCalls?.count ?? 0;
+  const done = input.audits.filter((audit) => audit.success !== undefined).length +
+    (input.omittedCalls?.done ?? 0);
   let header = theme.fg(
     "warning",
-    `◆ ${input.activityLabel ?? "Fabric"} running · ${done}/${input.audits.length} calls`,
+    `◆ ${input.activityLabel ?? "Fabric"} running · ${done}/${input.audits.length + omitted} calls`,
   );
   const progress = input.progress ? compactProgressPreview(input.progress) : "";
   if (progress) header += theme.fg("dim", ` · ${progress}`);
 
   const rows = [header];
+  if (input.audits.some(shellBackgroundShortcut)) {
+    rows.push(theme.fg("dim", "Ctrl+B twice · background waiting shell"));
+  }
   const wrapLineIndexes = input.expanded ? new Set<number>() : undefined;
   if (input.phases.length > 0) {
     rows.push(theme.fg("dim", input.phases.map((phase) => `◆ ${phase}`).join("  ")));
@@ -1011,7 +1027,7 @@ export const renderFabricMulticallPartial = (
     }
   }
 
-  const callsHidden = input.audits.length - callsShown.length;
+  const callsHidden = input.audits.length + omitted - callsShown.length;
   if (callsHidden > 0) {
     const label = `… ${callsHidden} nested ${callsHidden === 1 ? "call" : "calls"} hidden`;
     rows.push(

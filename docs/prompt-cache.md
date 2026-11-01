@@ -4,9 +4,9 @@
 
 ## Availability and cost
 
-Observations work on ordinary Pi sessions now. Warming requires the optional native `ctx.acquireCacheWarming("idle")` capability, returning an idempotent release function. The inspected stock Pi 0.87.0/0.87.1 SDKs do **not** expose that capability. They return `unsupported`; Fabric never simulates warming with prompts, changes global settings, or sends a replacement provider request.
+Observations work on ordinary Pi sessions now. **Scoped warming leases** require the optional native `ctx.acquireCacheWarming("idle")` capability, returning an idempotent release function. The inspected stock Pi 0.87.0/0.87.1 and 1.4.0 SDKs do **not** expose that capability, so lease acquisitions return `unsupported`. This does not disable Pi's own idle cache warmer or Fabric's [spilled-shell decision override](background-tasks.md#prompt-cache-warming-while-yielded). Fabric never simulates warming with prompts, changes global settings, or sends a replacement provider request.
 
-No configuration switch is needed. Fabric acquires no warming interest until an explicit approved `cache.hold` or trusted component `cache.lease` acquisition. Native warming settings, including Pi's ordinary streaming policy, are unchanged. Acquisition has `agent` risk and may authorize paid native refreshes for the duration. Pi retains request snapshots, model eligibility, retention tiers, economic decisions, scheduling, and native safety windows. A lease cannot force a refresh or guarantee a cache hit.
+No configuration switch is needed. Fabric acquires no warming interest until an explicit approved `cache.hold` or trusted component `cache.lease` acquisition. The one exception is a decision, not an interest: when Pi's own idle warming is already enabled and a spilled shell will wake this agent, Fabric re-prices Pi's idle refresh at certain continuation (see [background tasks](background-tasks.md#prompt-cache-warming-while-yielded)). Native warming settings, including Pi's ordinary streaming policy, are unchanged. Acquisition has `agent` risk and may authorize paid native refreshes for the duration. Pi retains request snapshots, model eligibility, retention tiers, economic decisions, scheduling, and native safety windows. A lease cannot force a refresh or guarantee a cache hit.
 
 ## Guest API
 
@@ -87,5 +87,7 @@ A future native bounded-admission protocol would be needed before enabling refre
 | Managed host exclusion and Schema read-only boundary | `tests/managed-host-runtime.test.ts`, `tests/cache-provider.test.ts` |
 | Node, Monty, and CPython proxy parity | Their targeted runtime suites |
 | Registration/idle stays lazy; compiled artifacts include first-use path | Startup suites, `assert:lazy-graph`, fresh build |
+| Spilled-shell idle override, savings threshold, interruption/error/branch/close exclusions | `tests/shell-inbox.test.ts` |
+| Native 270-second refresh, replay and usage receipt, completion wakeup, default/off/UI-only exclusions, 30-minute horizon | `tests/shell-cache-warming-sdk.test.ts` |
 
 No live cache-hit rate, native lease deployment, or strict spend cap is claimed by these checks.

@@ -34,7 +34,7 @@ afterEach(async () => {
   vi.unstubAllEnvs();
 });
 
-const middleware = (): FabricBashMiddlewareV1 => ({
+const middleware = (onOutput?: (text: string) => void, delayMs = 0): FabricBashMiddlewareV1 => ({
   version: 1,
   options: {
     commandPrefix: "export FABRIC_PREFIX=kept",
@@ -48,8 +48,13 @@ const middleware = (): FabricBashMiddlewareV1 => ({
     exec: async (command, cwd, options) => {
       // Line buffering in this fixture tests that Fabric records only filtered bytes.
       let pending = "";
-      const emit = (text: string) => options.onData(Buffer.from(text.split(SECRET).join("[filtered]")));
+      const emit = (text: string) => {
+        const filtered = text.split(SECRET).join("[filtered]");
+        options.onData(Buffer.from(filtered));
+        onOutput?.(filtered);
+      };
       try {
+        if (delayMs) await new Promise(resolve => setTimeout(resolve, delayMs));
         return await inner.exec(command, cwd, { ...options, onData: data => {
           pending += data.toString();
           const last = pending.lastIndexOf("\n");
@@ -170,7 +175,9 @@ describe("cooperative bash middleware", () => {
     const h = harness({ hangMs: immediate ? 120_000 : 30 });
     fs.writeFileSync(path.join(h.cwd, "fixture"), `${SECRET}\n`);
     const result = await h.invoke({ command: "cat fixture; sleep 0.2; cat fixture", ...(immediate ? { run_in_background: true } : {}) });
-    expect(result).toMatchObject({ ok: true, details: { running: true, pid: expect.any(Number), logPath: expect.any(String) } });
+    // The pid is best-effort: a slow shell start (Git Bash on a loaded Windows
+    // runner) can miss the read window, and the handoff goes ahead without it.
+    expect(result).toMatchObject({ ok: true, details: { running: true, logPath: expect.any(String) } });
     expect(result.output).not.toContain(SECRET);
     await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)));
     const log = fs.readFileSync(result.details!.logPath!, "utf8");
@@ -189,9 +196,10 @@ describe("cooperative bash middleware", () => {
 
   it("keeps the explicit hard cap after handoff", async () => {
     const h = harness();
-    const result = await h.invoke({ command: "sleep 8", timeout: 0.1, background: true });
+    // Long enough that the cap cannot fire before a slow runner hands off.
+    const result = await h.invoke({ command: "sleep 8", timeout: 1, background: true });
     expect(result.details?.running).toBe(true);
-    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)));
+    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.finishedAt).toEqual(expect.any(Number)), { timeout: 10_000 });
     expect(fs.readFileSync(result.details!.logPath!, "utf8")).toContain("timed out");
   });
 
@@ -209,19 +217,31 @@ describe("cooperative bash middleware", () => {
     expect(h.provider.shellJobs.list()).toEqual([]);
   });
 
-  it("cancels a waiting child and cleans up detached children on close", async () => {
-    const h = harness();
+  it.each([0, 400])("cancels a ready child and cleans up detached children on close (startup delay=%i)", async delayMs => {
+    let ready!: () => void;
+    const started = new Promise<void>(resolve => { ready = resolve; });
+    const h = harness({ middleware: middleware(text => { if (text.includes("child-ready")) ready(); }, delayMs) });
     const controller = new AbortController();
-    const waiting = h.invoke({ command: "sleep 8" }, controller.signal);
-    const rejected = expect(waiting).rejects.toThrow();
-    await vi.waitFor(() => expect(h.provider.shellJobs.list()[0]?.pid).toEqual(expect.any(Number)));
-    controller.abort(new Error("cancel probe"));
-    await rejected;
-    const result = await h.invoke({ command: "sleep 8", background: true });
+    const waiting = h.invoke({ command: "printf 'child-ready\\n'; sleep 30" }, controller.signal);
+    // Attach a rejection handler immediately, including on the readiness failure path.
+    void waiting.catch(() => {});
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([started, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("child readiness timed out")), 10_000);
+      })]);
+      expect(h.provider.shellJobs.list()[0]?.status).toBe("running");
+      controller.abort(new Error("cancel probe"));
+      await expect(waiting).rejects.toThrow();
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+    }
+    const result = await h.invoke({ command: "sleep 30", background: true });
     expect(result.details?.running).toBe(true);
     await h.registry.close();
     expect(h.provider.shellJobs.list().every(job => job.status !== "running" && job.status !== "spilled")).toBe(true);
-  });
+  }, 20_000);
 
   it.each([{ optIn: false }, { managed: true }])("does not replace unrelated or managed overrides: %j", async options => {
     const h = harness(options);

@@ -51,8 +51,17 @@ const manifestNameCache = new Map<string, string | undefined>();
 const packageNameFromManifest = (startPath: string | undefined): string | undefined => {
   if (!startPath) return undefined;
   let directory = path.dirname(path.resolve(startPath));
+  // Every folder the walk passes through resolves to the same answer, so the
+  // result is cached for all of them. Caching undefined for a folder below the
+  // manifest would make a later lookup that starts there miss the name.
+  const visited: string[] = [];
+  const settle = (name: string | undefined): string | undefined => {
+    for (const folder of visited) manifestNameCache.set(folder, name);
+    return name;
+  };
   while (true) {
-    if (manifestNameCache.has(directory)) return manifestNameCache.get(directory);
+    if (manifestNameCache.has(directory)) return settle(manifestNameCache.get(directory));
+    visited.push(directory);
     const manifestPath = path.join(directory, "package.json");
     let name: string | undefined;
     if (existsSync(manifestPath)) {
@@ -63,10 +72,9 @@ const packageNameFromManifest = (startPath: string | undefined): string | undefi
         // Unreadable or invalid manifest; keep walking upward.
       }
     }
-    manifestNameCache.set(directory, name);
-    if (name) return name;
+    if (name) return settle(name);
     const parent = path.dirname(directory);
-    if (parent === directory) return undefined;
+    if (parent === directory) return settle(undefined);
     directory = parent;
   }
 };

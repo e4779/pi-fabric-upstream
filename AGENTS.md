@@ -94,38 +94,47 @@ gate.
 Publishing runs `prepack`, which is `proof:check && typecheck && build` followed by
 `scripts/bundle-pi-packages.mjs`, never the suite. That script turns each
 `bundledDependencies` symlink (Bun's isolated linker) into a real copy so `bun pm
-pack` does not silently drop it, and prunes Pi host packages from it. `proof:check` requires the pinned Bend 2.0.37 compiler; normal builds verify
-the checked-in artifact hashes without requiring Bend. After a version bump the artifact is verified through
+pack` does not silently drop it, and prunes Pi host packages from it. `proof:check` runs the pinned
+`gdp-wired` devDependency in bounded isolated workers; normal builds verify the
+checked-in artifact hashes without loading the prover. After a version bump the artifact is verified through
 `dist-tags` and `time["<version>"]` in the packument.
 
 ## Verified policy kernels
 
-`LAWS.bend`, `proofs/resource-spec.bend`, `proofs/state-spec.bend`,
-`proofs/provider-spec.bend`, `proofs/authority-spec.bend`, and
-`proofs/lifecycle-spec.bend` and `proofs/storage-spec.bend` require independent specification review; never weaken
-a law to make an implementation pass. `PROOF.bend` proves the actual executable source in
-the registered kernel entry points. After changing these sources, the ABI, or the generation
-bridge, run `bun run proof:generate`, `bun run proof:check`, and the targeted
+The kernels are gdp-wired rules and functions in `proofs/*.ts`: one module each
+for policy, compaction, resources, lifecycle, storage, provider, authority,
+mesh grants, speculation and budget admission,
+registered in `proofs/index.ts`. Each law restates its requirement apart from
+the rule body, and specification changes require independent review; never
+weaken a law, or delete a broken variant, to make an implementation pass. When
+a law is refused, read the verdict first: add a missing helper law beside it, or
+fix the rule.
+
+`bun run proof:generate` proves every law (`proven && checked && !assumes`)
+from every state the laws allow, requires every broken variant to be refused
+with a counterexample (`stuck: 'sat'`), cross-checks the builders against the
+interpreter, and compiles the shipped machines into `src/verified/generated/`
+with a SHA-256 receipt. Independent kernels and mutation batches run in at most
+four isolated workers; every kernel keeps its full invariant context. Use
+`bun run proof:check --jobs 1` for a serial diagnostic run. No verdict cache skips
+proofs. Do not hand-edit `src/verified/generated/`. After
+changing a proof module, a bridge in `src/verified/`, or the gdp-wired pin, run
+`bun run proof:generate`, `bun run proof:check`, and the targeted
 `tests/verified-kernels.test.ts`, `tests/verified-resources.test.ts`,
 `tests/verified-providers.test.ts`, `tests/verified-authority.test.ts`,
-`tests/verified-lifecycle.test.ts`, `tests/verified-storage.test.ts`, and `tests/verified-artifact.test.ts` plus relevant integration tests. Do not hand-edit
-`src/verified/generated/`. See `docs/verified-kernels.md` for the acceptance ledger
-and explicit host/adapter assumptions. Always finish with `bun run build`.
+`tests/verified-lifecycle.test.ts`, `tests/verified-storage.test.ts`,
+`tests/verified-grants.test.ts`, `tests/verified-speculation.test.ts`,
+`tests/verified-budget.test.ts`, `tests/verified-kernel-pool.test.ts`, and
+`tests/verified-artifact.test.ts` plus relevant integration tests. The prover
+is a devDependency: never import `gdp-wired` from `src/`. See
+`docs/verified-kernels.md` for the acceptance ledger and explicit host/adapter
+assumptions. Always finish with `bun run build`.
 
 ## Package manager
 
 This repo is bun-managed (`bun.lock`; scripts invoke `bun run` internally).
 Do not use pnpm/npm — pnpm's pre-run dependency check fails against the bun
 lockfile.
-
-## Bundled Pi packages
-
-`pi-coralbricks-provider` ships inside the tarball (`dependencies` plus
-`bundledDependencies`, exact version) and loads through its
-`./node_modules/pi-coralbricks-provider/index.ts` entry in `pi.extensions`. It is
-not part of Fabric's compiled startup graph; `assert:build-artifacts` checks the
-entry, the exact pin and that the package keeps Pi hosts as peers. To bump it,
-change the pin, run `bun install`, and check `tests/bundled-provider-package.test.ts`.
 
 ## Commits
 

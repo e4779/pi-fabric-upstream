@@ -151,6 +151,17 @@ switch (behavior) {
   case "reject":
     emit({ type: "response", command: "prompt", success: false, error: "provider rejected the prompt" });
     process.exit(1);
+  case "answer-then-linger":
+  case "tool-use-then-linger":
+    // Settle the turn, then stay alive after stdin closes, like an extension
+    // that leaves a referenced timer running. Only SIGTERM/SIGKILL ends it.
+    emit({ type: "fake_child_pid", pid: process.pid });
+    emit({ type: "message_end", message: behavior === "answer-then-linger"
+      ? { role: "assistant", content: "final answer", stopReason: "stop" }
+      : { role: "assistant", content: [{ type: "toolCall", name: "read" }], stopReason: "toolUse" } });
+    emit({ type: "agent_settled" });
+    setInterval(() => {}, 60_000);
+    break;
   case "hang":
     // Never exit and never settle; the worker timeout should fire.
     setInterval(() => {}, 60_000);
@@ -277,6 +288,19 @@ switch (behavior) {
     emit({ type: "agent_settled" });
     process.exit(0);
   }
+  case "milestone":
+    // A declared fabric_exec display name, then calls that declare none: the name holds.
+    emit({ type: "agent_start" });
+    emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "m1", args: { display: { name: "Trace  token\nrefresh" } } });
+    emit({ type: "tool_execution_end", toolName: "fabric_exec", toolCallId: "m1", isError: false });
+    emit({ type: "tool_execution_start", toolName: "read", toolCallId: "r1", args: { path: "a.ts" } });
+    emit({ type: "tool_execution_end", toolName: "read", toolCallId: "r1", isError: false });
+    emit({ type: "tool_execution_start", toolName: "fabric_exec", toolCallId: "m2", args: { code: "return 1" } });
+    emit({ type: "tool_execution_end", toolName: "fabric_exec", toolCallId: "m2", isError: false });
+    emit({ type: "message_end", message: { role: "assistant", content: "done" } });
+    emit({ type: "agent_settled" });
+    process.exit(0);
+    break;
   case "success":
   default:
     emit({ type: "message_end", message: { role: "assistant", content: "hi" } });

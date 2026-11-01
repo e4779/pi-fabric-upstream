@@ -13,10 +13,6 @@ describe("prewalk prompt isolation", () => {
       path.join(process.cwd(), "src", "extension.ts"),
       "utf8",
     );
-    const toolSource = fs.readFileSync(
-      path.join(process.cwd(), "src", "fabric-exec-tool.ts"),
-      "utf8",
-    );
     const source = ts.createSourceFile("extension.ts", extensionSource, ts.ScriptTarget.Latest, true);
     const handlers: string[] = [];
     const visit = (node: ts.Node): void => {
@@ -32,13 +28,18 @@ describe("prewalk prompt isolation", () => {
     expect(handlers.length).toBeGreaterThan(0);
     for (const handler of handlers) expect(handler.toLowerCase()).not.toContain("prewalk");
 
-    const guidelinesStart = toolSource.indexOf("promptGuidelines: [");
-    const guidelinesEnd = toolSource.indexOf("parameters:", guidelinesStart);
-    expect(guidelinesStart).toBeGreaterThanOrEqual(0);
-    expect(guidelinesEnd).toBeGreaterThan(guidelinesStart);
-    const guidelines = toolSource.slice(guidelinesStart, guidelinesEnd).toLowerCase();
-    expect(guidelines).not.toContain("prewalk");
-    expect(guidelines).not.toContain("handoff");
+    // Assert actual model-facing guidance in both branches, not the source
+    // spelling of the conditional promptGuidelines initializer.
+    for (const managedHostOptions of [undefined, { providers: ["mcp"] }]) {
+      const state = { bootstrapped: true, config: normalizeFabricConfig({}), managedHostOptions } as FabricState;
+      const guidelines = createFabricExecTool(
+        state, defaultCodePreviewSettings(), new Map(), (tool) => tool,
+      ).promptGuidelines ?? [];
+      expect(guidelines.length).toBeGreaterThan(0);
+      const text = guidelines.join("\n").toLowerCase();
+      expect(text).not.toContain("prewalk");
+      expect(text).not.toContain("handoff");
+    }
   });
 
   it("keeps coding guidance outcome-oriented and context-bounded", () => {

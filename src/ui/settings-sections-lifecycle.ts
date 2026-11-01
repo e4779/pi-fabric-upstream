@@ -18,6 +18,7 @@ import {
   formatRetention,
   BOOLEANS,
   ACTOR_SCOPES,
+  MESH_DURABILITIES,
   formatMs,
 } from "./settings-values.js";
 
@@ -177,6 +178,11 @@ export const buildMeshSection = (
           description:
             "Tell this session's model when another root Pi session joins or leaves the project. Appended to the transcript at a turn boundary, never to the system prompt.",
           values: BOOLEANS,
+        }),
+        setting("mesh.durability", "Durability", config.mesh.durability, {
+          description:
+            "fsync flushes every committed mesh write (events, state, schedules, grants) to stable storage before the call returns, at a cost per write. Applies to sessions started after the change.",
+          values: MESH_DURABILITIES,
         }),
         setting("mesh.maxReadEvents", "Max read events", String(config.mesh.maxReadEvents), {
           description: "Maximum events returned by a single mesh read.",

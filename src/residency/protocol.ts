@@ -114,6 +114,8 @@ interface ResidentSpawnCommand {
   operation: "spawn";
   requestId: string;
   rootId: string;
+  /** Carries the host-only recursiveToolAuthority deny cap. Absence is not a grant;
+   * the receiving manager also applies its own inherited authority. Format stays 1. */
   request: AgentRunRequest;
   /** A registered runner's residentModule, imported by the host before launch. */
   runnerModule?: string;

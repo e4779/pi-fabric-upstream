@@ -53,6 +53,8 @@ const createDirectory = (
   rootId: string,
   source: () => FabricParticipantRecord[],
   enabled = true,
+  recordedLabel?: () => string | undefined,
+  labelWanted?: () => boolean,
 ): ParticipantDirectory => {
   const directory = new ParticipantDirectory(new MeshStore(meshRoot, 64 * 1024, 1_000), {
     enabled,
@@ -61,6 +63,8 @@ const createDirectory = (
     identity,
     heartbeatMs: 100,
     leaseMs: 300,
+    ...(recordedLabel ? { recordedLabel } : {}),
+    ...(labelWanted ? { labelWanted } : {}),
   });
   directory.registerSource(source);
   directories.push(directory);
@@ -153,6 +157,111 @@ describe("peer labels", () => {
     await Promise.all([alpha.start(), beta.start()]);
     const labels = [alpha.self().label, beta.self().label].sort();
     expect(labels).toEqual(["PRO-1", "PRO-2"]);
+  });
+
+  it("keeps a resumed session's recorded label without taking a new number", async () => {
+    const meshRoot = tmpRoot();
+    const record = () => [rootRecord("session:alpha", "alpha", "/repo/project")];
+    const alpha = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", record);
+    await alpha.start();
+    expect(alpha.self().label).toBe("PRO-1");
+    await alpha.close();
+
+    // Reopening the same session: shutdown deleted its record, the session file kept the label.
+    const resumed = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", record, true, () => "PRO-1");
+    await resumed.start();
+    expect(resumed.self().label).toBe("PRO-1");
+    const gamma = createDirectory(meshRoot, mainIdentity("gamma"), "session:gamma", () => [
+      rootRecord("session:gamma", "gamma", "/repo/project"),
+    ]);
+    await gamma.start();
+    expect(gamma.self().label).toBe("PRO-2");
+  });
+
+  it("takes a new number when another participant holds the recorded label or it is another project's", async () => {
+    const meshRoot = tmpRoot();
+    const alpha = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", () => [
+      rootRecord("session:alpha", "alpha", "/repo/project"),
+    ]);
+    await alpha.start();
+    expect(alpha.self().label).toBe("PRO-1");
+    const beta = createDirectory(meshRoot, mainIdentity("beta"), "session:beta", () => [
+      rootRecord("session:beta", "beta", "/repo/project"),
+    ], true, () => "PRO-1");
+    await beta.start();
+    expect(beta.self().label).toBe("PRO-2");
+    const gamma = createDirectory(meshRoot, mainIdentity("gamma"), "session:gamma", () => [
+      rootRecord("session:gamma", "gamma", "/repo/project"),
+    ], true, () => "FAB-7");
+    await gamma.start();
+    expect(gamma.self().label).toBe("PRO-3");
+  });
+
+  it("takes no number until the session first uses Fabric, but reuses a recorded label at once", async () => {
+    const meshRoot = tmpRoot();
+    let used = false;
+    const alpha = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", () => [
+      rootRecord("session:alpha", "alpha", "/repo/project"),
+    ], true, undefined, () => used);
+    await alpha.start();
+    await alpha.refresh();
+    expect(alpha.self().label).toBeUndefined();
+    used = true;
+    await alpha.refresh();
+    expect(alpha.self().label).toBe("PRO-1");
+    const resumed = createDirectory(meshRoot, mainIdentity("beta"), "session:beta", () => [
+      rootRecord("session:beta", "beta", "/repo/project"),
+    ], true, () => "PRO-9", () => false);
+    await resumed.start();
+    expect(resumed.self().label).toBe("PRO-9");
+  });
+
+  it("starts the new counter generation at 1 and skips numbers live sessions still hold", async () => {
+    const meshRoot = tmpRoot();
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    // Retired generations' counters are left alone and ignored.
+    await store.put({ key: "topology/peer-seq", value: { format: 1, next: 347 }, identity: mainIdentity("old") });
+    await store.put({ key: "topology/peer-seq/2", value: { format: 1, next: 4 }, identity: mainIdentity("old") });
+    // A session from the old generation still runs as PRO-2.
+    const old = createDirectory(meshRoot, mainIdentity("old"), "session:old", () => [
+      rootRecord("session:old", "old", "/repo/project"),
+    ], true, () => "PRO-2");
+    await old.start();
+    expect(old.self().label).toBe("PRO-2");
+    const alpha = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", () => [
+      rootRecord("session:alpha", "alpha", "/repo/project"),
+    ]);
+    const beta = createDirectory(meshRoot, mainIdentity("beta"), "session:beta", () => [
+      rootRecord("session:beta", "beta", "/repo/project"),
+    ]);
+    await alpha.start();
+    await beta.start();
+    expect([alpha.self().label, beta.self().label]).toEqual(["PRO-1", "PRO-3"]);
+  });
+
+  it("does not let a crashed session's leftover record hold a number", async () => {
+    const meshRoot = tmpRoot();
+    const store = new MeshStore(meshRoot, 64 * 1024, 1_000);
+    const ghost = createDirectory(meshRoot, mainIdentity("ghost"), "session:ghost", () => [
+      rootRecord("session:ghost", "ghost", "/repo/project"),
+    ]);
+    await ghost.start();
+    expect(ghost.self().label).toBe("PRO-1");
+    // A crash leaves the participant record behind without a live host lease.
+    const leftover = store.listAll("topology/participants/").find((entry) => (entry.value as { id?: string }).id === "session:ghost")!;
+    await ghost.close();
+    await store.put({ key: leftover.key, value: leftover.value, identity: mainIdentity("ghost") });
+    // The counter moves on, and the dead record holds nothing.
+    const alpha = createDirectory(meshRoot, mainIdentity("alpha"), "session:alpha", () => [
+      rootRecord("session:alpha", "alpha", "/repo/project"),
+    ], true, () => "PRO-1");
+    await alpha.start();
+    expect(alpha.self().label).toBe("PRO-1");
+    const beta = createDirectory(meshRoot, mainIdentity("beta"), "session:beta", () => [
+      rootRecord("session:beta", "beta", "/repo/project"),
+    ]);
+    await beta.start();
+    expect(beta.self().label).toBe("PRO-2");
   });
 
   it("skips minting when the mesh is disabled", async () => {

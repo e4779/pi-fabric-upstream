@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -19,6 +20,7 @@ const fake = fileURLToPath(new URL("./fixtures/fake-jev-fabric.mjs", import.meta
 const stores: FabricShellJobStore[] = [];
 const roots: string[] = [];
 afterEach(async () => {
+  vi.unstubAllEnvs();
   await Promise.all(stores.splice(0).map(store => store.close()));
   for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
 });
@@ -139,6 +141,56 @@ describe.skipIf(process.platform === "win32")("durable shell tasks through jev-f
     const settings = { binary: env.binary, home: "", timeoutMs: 60_000 };
     expect(resolveJevFabricHome(settings, link)).toBe(path.join(env.root, "real", ".jev-fabric-native"));
     expect(resolveJevFabricHome({ ...settings, home: path.join(link, "missing", "store") }, env.root)).toBe(path.join(env.root, "real", "missing", "store"));
+  });
+
+  it("keeps the default store out of git status in the working tree", async () => {
+    const env = environment();
+    const repo = path.join(env.root, "repo");
+    fs.mkdirSync(repo);
+    execFileSync("git", ["init", "-q", repo]);
+    vi.stubEnv("JEV_FABRIC_HOME", undefined);
+    const store = new FabricShellJobStore();
+    stores.push(store);
+    store.durable = new DurableShellBridge(store, {
+      cwd: repo, agentDir: env.agentDir, ownerId: "default-home",
+      settings: () => ({ binary: env.binary, home: "", timeoutMs: 60_000 }),
+      middleware: () => undefined,
+    });
+    expect(store.durable.home).toBe(path.join(repo, ".jev-fabric-native"));
+    const provider = new PiToolsProvider(repo, undefined, undefined, { powerShellToolDefinitionFactory: undefined, shellJobs: store });
+    const registry = new ActionRegistry();
+    registry.register(provider);
+    const context = {
+      cwd: repo, signal: new AbortController().signal, parentToolCallId: "parent", nestedToolCallId: "fabric_durable",
+      extensionContext: { cwd: repo, sessionManager: { getSessionId: () => "default-home", getSessionFile: () => undefined } } as unknown as ExtensionContext,
+      update: () => undefined, approve: async () => {}, audits: [], maxResultChars: 100_000,
+    };
+    const result = await registry.invoke("pi.bash", { command: "true", durable: true }, context) as { details: { taskId: string } };
+    await new TasksProvider(store).invoke("wait", { id: result.details.taskId, timeoutMs: 10_000 }, invocation);
+    expect(fs.readdirSync(store.durable.home).length).toBeGreaterThan(0);
+    expect(execFileSync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: repo, encoding: "utf8" })).toBe("");
+    await registry.close();
+  });
+
+  it("creates no default store for a Jev resolution", async () => {
+    const env = environment();
+    vi.stubEnv("JEV_FABRIC_HOME", undefined);
+    const bridge = new DurableShellBridge(new FabricShellJobStore(), {
+      cwd: env.root, agentDir: env.agentDir, ownerId: "jev-only",
+      settings: () => ({ binary: env.binary, home: "", timeoutMs: 60_000 }),
+      middleware: () => undefined,
+    });
+    await bridge.resolve("jev").catch(() => undefined);
+    expect(fs.existsSync(path.join(env.root, ".jev-fabric-native"))).toBe(false);
+  });
+
+  it("leaves an explicitly configured store untouched", async () => {
+    const env = environment();
+    const { store, tasks, bash } = session(env);
+    const result = await bash({ command: "true", durable: true });
+    await tasks.invoke("wait", { id: result.details!.taskId!, timeoutMs: 10_000 }, invocation);
+    expect(store.durable!.home).toBe(env.home);
+    expect(fs.existsSync(path.join(env.home, ".gitignore"))).toBe(false);
   });
 
   it("rejects durable use without a backend, on PowerShell, or with background:false", async () => {

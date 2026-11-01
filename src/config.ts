@@ -8,7 +8,7 @@ import { renameAtomic } from "./core/atomic-write.js";
 import { approvalActionOverridesValue, type FabricActionApprovalMode } from "./core/approval-overrides.js";
 import { foregroundConfigValue, type FabricForegroundConfig } from "./core/foreground-tools.js";
 import { quarantineDamagedFile } from "./core/damaged-file.js";
-import { normalizeModelAliases, type FabricModelAliases } from "./core/model-resolution.js";
+import { normalizeModelAliases, type FabricModelAliases } from "./core/model-aliases.js";
 import { PI_CORE_TOOL_NAME_SET } from "./core/pi-tools.js";
 import { DEFAULT_SHELL_HANG_MS, SHELL_HANG_MAX_MS } from "./core/shell-limits.js";
 import {
@@ -16,6 +16,7 @@ import {
   migrateFabricConfigDocument,
 } from "./config-migrations.js";
 import type { FabricComponentEntry } from "./components/types.js";
+import type { MeshDurability } from "./mesh/store.js";
 import type { FabricRisk } from "./protocol.js";
 import type { FabricKernel } from "./runtime/kernel.js";
 import {
@@ -79,10 +80,13 @@ interface FabricExecutorConfig {
   /** Policy maximum for any executor deadline, including per-invocation
    * requests and per-ref floors. Values above this are visibly normalized. */
   maxTimeoutMs: number;
+  /** Maximum uninterrupted guest CPU slice in ms; 0 disables the limit (Infinity). */
+  maxCpuSliceMs: number;
   /** Exact-ref deadline floors (ms) for known long-running host calls, e.g.
    * "extensions.subagent". Keys are exact refs; no wildcard matching. */
   hostCallTimeouts: Record<string, number>;
-  /** Exact host-call refs that wait for a person, e.g. "extensions.ask".
+  /** Exact host-call refs that wait for a person, e.g. "extensions.ask" or
+   * "decisions.wait".
    * While such a call is in flight the program deadline is paused, so a
    * foreground question can wait indefinitely. Cancellation still applies. */
   humanWaitRefs: string[];
@@ -110,6 +114,8 @@ export interface FabricApprovalConfig {
   headless?: "deny" | "decision";
   /** Headless approval decision deadline; absent means 5 minutes. */
   headlessTimeoutMs?: number;
+  /** Consult extension action policy hooks at the approve stage; absent means off. */
+  policyHooks?: boolean;
 }
 
 /** Session-start background revalidation scope for the MCP descriptor cache:
@@ -214,6 +220,16 @@ export interface FabricAgentConfig {
   extensions: boolean;
   defaultTools: string[];
   retainRuns: boolean;
+  /**
+   * Opt-in: a resident host re-attaches its unfinished built-in pi-durable
+   * worker runs after a restart, or relaunches them on their journal.
+   */
+  durableWorkerRecovery?: boolean;
+  /**
+   * Opt-in: a pi-durable worker keeps a private Pi session file in its run
+   * directory, with a worker-role entry, so a relaunch keeps extension state.
+   */
+  durableWorkerSession?: boolean;
   notifyOnComplete: boolean;
   budgetUsd: number;
   maxTokensPerChild: number;
@@ -229,6 +245,8 @@ export interface FabricAgentConfig {
   childQuestions?: "cancel" | "route";
   /** Routed child question deadline; absent means 10 minutes. */
   childQuestionTimeoutMs?: number;
+  /** Tools a routed Pi child gets for asking questions; absent means ["ask"], [] grants none. */
+  childQuestionTools?: string[];
 }
 
 export interface FabricToolCaptureConfig {
@@ -263,9 +281,21 @@ interface FabricUiConfig {
   refreshMs: number;
   eventHistory: number;
   haltOnEscape: boolean;
+  /** Tell Herdr about running agents in an interactive root session. */
+  herdrStatus: boolean;
   showAgentToolPreview: boolean;
   toolDisplay: FabricToolDisplayMode;
+  /** Lend the window title to the latest nested call while fabric_exec runs. */
+  terminalTitle: boolean;
   updateDebounceMs: number;
+  /** Offer decisions shown at this terminal to registered question renderers; absent means off. */
+  questionRenderers?: boolean;
+  /**
+   * Raw `ui.sessionLabel`, passed through unchecked: sessionLabelSettings() in
+   * topology/session-label-settings.ts checks it at first use, which keeps the
+   * check out of the startup graph.
+   */
+  sessionLabel?: unknown;
 }
 
 export interface FabricCompactionPressureBands {
@@ -321,6 +351,13 @@ export interface FabricMeshConfig {
   actorContextEntries: number;
   /** Tell a root session's model when other root sessions join or leave the project. */
   peerNotices: boolean;
+  /** Most stopped-session tombstones kept for agents.departed(); 0 writes none but still reads others'. */
+  departedLimit: number;
+  /** Age after which stopped and lost sessions leave agents.departed(). */
+  departedRetentionMs: number;
+
+  /** `"fsync"` flushes every committed mesh write to stable storage before the call returns. */
+  durability: MeshDurability;
 }
 
 interface FabricRepairsConfig {
@@ -482,8 +519,9 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     codemodeProfile: "additive",
     timeoutMs: 120_000,
     maxTimeoutMs: 900_000,
+    maxCpuSliceMs: 0,
     hostCallTimeouts: {},
-    humanWaitRefs: ["extensions.ask"],
+    humanWaitRefs: ["extensions.ask", "decisions.wait"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
@@ -536,6 +574,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     extensions: true,
     defaultTools: ["read", "bash", "edit", "write", "grep", "find", "ls"],
     retainRuns: false,
+    durableWorkerRecovery: false,
+    durableWorkerSession: false,
     notifyOnComplete: true,
     budgetUsd: 0,
     maxTokensPerChild: 0,
@@ -571,8 +611,10 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     refreshMs: 500,
     eventHistory: 80,
     haltOnEscape: true,
+    herdrStatus: true,
     showAgentToolPreview: true,
     toolDisplay: "compact",
+    terminalTitle: true,
     updateDebounceMs: 100,
   },
   compaction: {
@@ -599,6 +641,10 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     eventContextChars: 40_000,
     actorContextEntries: 14,
     peerNotices: true,
+    departedLimit: 32,
+    departedRetentionMs: 7 * 24 * 60 * 60 * 1_000,
+
+    durability: "default",
   },
   models: {
     aliases: {},
@@ -836,6 +882,9 @@ const compactionPressureBandsValue = (
 const actorScopeValue = (value: unknown, fallback: FabricActorScope): FabricActorScope =>
   value === "project" || value === "session" ? value : fallback;
 
+const meshDurabilityValue = (value: unknown, fallback: MeshDurability): MeshDurability =>
+  value === "default" || value === "fsync" ? value : fallback;
+
 const schemaModeValue = (value: unknown, fallback: FabricSchemaMode): FabricSchemaMode =>
   value === "off" || value === "audit" || value === "enforce" ? value : fallback;
 
@@ -1063,6 +1112,12 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           .map(([ref, value]) => [ref, boundedInteger(value, 1_000, 1_000, executorMaxTimeoutMs)]),
       ),
       humanWaitRefs: humanWaitRefsValue(executor.humanWaitRefs),
+      maxCpuSliceMs: boundedInteger(
+        executor.maxCpuSliceMs,
+        DEFAULT_FABRIC_CONFIG.executor.maxCpuSliceMs,
+        0,
+        Number.MAX_SAFE_INTEGER,
+      ),
       timeoutMs: boundedInteger(
         executor.timeoutMs,
         DEFAULT_FABRIC_CONFIG.executor.timeoutMs,
@@ -1110,6 +1165,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(approvals.headlessTimeoutMs === undefined ? {} : {
         headlessTimeoutMs: boundedInteger(approvals.headlessTimeoutMs, 300_000, 1_000, 86_400_000),
       }),
+      ...(approvals.policyHooks === true ? { policyHooks: true } : {}),
     },
     mcp: {
       enabled: booleanValue(mcp.enabled, DEFAULT_FABRIC_CONFIG.mcp.enabled),
@@ -1233,6 +1289,14 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       extensions: booleanValue(agents.extensions, DEFAULT_FABRIC_CONFIG.agents.extensions),
       defaultTools: configuredTools,
       retainRuns: booleanValue(agents.retainRuns, DEFAULT_FABRIC_CONFIG.agents.retainRuns),
+      durableWorkerRecovery: booleanValue(
+        agents.durableWorkerRecovery,
+        DEFAULT_FABRIC_CONFIG.agents.durableWorkerRecovery ?? false,
+      ),
+      durableWorkerSession: booleanValue(
+        agents.durableWorkerSession,
+        DEFAULT_FABRIC_CONFIG.agents.durableWorkerSession ?? false,
+      ),
       notifyOnComplete: booleanValue(
         agents.notifyOnComplete,
         DEFAULT_FABRIC_CONFIG.agents.notifyOnComplete,
@@ -1268,6 +1332,14 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       ...(agents.childQuestionTimeoutMs === undefined ? {} : {
         childQuestionTimeoutMs: boundedInteger(agents.childQuestionTimeoutMs, 600_000, 1_000, 86_400_000),
       }),
+      // Exact tool names only: a +name/-name modifier would make the child's
+      // Pi tool list invalid, and a * pattern would grant more than one tool.
+      ...(Array.isArray(agents.childQuestionTools) ? {
+        childQuestionTools: [...new Set(agents.childQuestionTools.flatMap((tool) => {
+          const name = typeof tool === "string" ? tool.trim() : "";
+          return name && name !== "fabric_exec" && !/^[+-]/.test(name) && !name.includes("*") ? [name] : [];
+        }))],
+      } : {}),
     },
     jev: normalizeJevConfig(input.jev),
     components: configuredComponents.map((entry) => structuredClone(entry)),
@@ -1293,6 +1365,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         500,
       ),
       haltOnEscape: booleanValue(ui.haltOnEscape, DEFAULT_FABRIC_CONFIG.ui.haltOnEscape),
+      herdrStatus: booleanValue(ui.herdrStatus, DEFAULT_FABRIC_CONFIG.ui.herdrStatus),
       // Renamed from ui.showNestedToolCalls; the v2 migration rewrites persisted
       // files, and this fallback covers configs normalized without migration.
       showAgentToolPreview: booleanValue(
@@ -1303,6 +1376,8 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         ui.toolDisplay,
         DEFAULT_FABRIC_CONFIG.ui.toolDisplay,
       ),
+      terminalTitle: booleanValue(ui.terminalTitle, DEFAULT_FABRIC_CONFIG.ui.terminalTitle),
+      ...(ui.questionRenderers === true ? { questionRenderers: true } : {}),
       // Renamed from ui.nestedToolDebounceMs (v3): the window coalesces every
       // live fabric_exec card update — nested calls, progress, agent previews.
       updateDebounceMs: boundedInteger(
@@ -1311,6 +1386,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         2_000,
       ),
+      sessionLabel: ui.sessionLabel,
     },
     compaction: {
       engine: compactionEngineValue(compaction.engine, DEFAULT_FABRIC_CONFIG.compaction.engine),
@@ -1398,6 +1474,20 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         100,
       ),
       peerNotices: booleanValue(mesh.peerNotices, DEFAULT_FABRIC_CONFIG.mesh.peerNotices),
+      departedLimit: boundedInteger(
+        mesh.departedLimit,
+        DEFAULT_FABRIC_CONFIG.mesh.departedLimit,
+        0,
+        1_000,
+      ),
+      departedRetentionMs: boundedInteger(
+        mesh.departedRetentionMs,
+        DEFAULT_FABRIC_CONFIG.mesh.departedRetentionMs,
+        60_000,
+        90 * 24 * 60 * 60 * 1_000,
+      ),
+
+      durability: meshDurabilityValue(mesh.durability, DEFAULT_FABRIC_CONFIG.mesh.durability),
     },
     models: {
       aliases: normalizeModelAliases(modelsSection.aliases),
@@ -1610,6 +1700,20 @@ export const effectiveToolCaptureConfig = (
           keepVisible: [...config.capture.keepVisible],
           risks: { ...config.capture.risks },
         };
+
+// Exclusive modes declare only fabric_exec (plus foreground tools in full code
+// mode), so any other keepVisible name has no effect there. Returns those names.
+export const ineffectiveKeepVisible = (
+  config: Pick<FabricConfig, "fullCodeMode" | "capture"> & Partial<Pick<FabricConfig, "schema">>,
+  resolvedForeground: readonly string[],
+): string[] => {
+  const enforce = config.schema?.mode === "enforce";
+  if (!enforce && !config.fullCodeMode) return [];
+  const foreground = enforce ? [] : resolvedForeground;
+  return config.capture.keepVisible.filter(
+    (name) => name !== "fabric_exec" && !foreground.includes(name),
+  );
+};
 
 interface FabricConfigFilePlan {
   path: string;

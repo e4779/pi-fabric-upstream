@@ -1,3 +1,4 @@
+import { stripVTControlCharacters } from "node:util";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 
 export const safeText = (value: unknown): string =>
@@ -106,4 +107,69 @@ export const wrapPlainText = (value: string, width: number, maxLines = 100): str
   }
   if (current && lines.length < maxLines) lines.push(truncateToWidth(current, width));
   return lines;
+};
+
+type Rgb = readonly [number, number, number];
+
+/** xterm's default 16-colour palette, for borders drawn with basic SGR colours. */
+const BASIC: readonly Rgb[] = [
+  [0, 0, 0], [205, 0, 0], [0, 205, 0], [205, 205, 0], [0, 0, 238], [205, 0, 205], [0, 205, 205], [229, 229, 229],
+  [127, 127, 127], [255, 0, 0], [0, 255, 0], [255, 255, 0], [92, 92, 255], [255, 0, 255], [0, 255, 255], [255, 255, 255],
+];
+
+const xterm256 = (index: number): Rgb => {
+  if (index < 16) return BASIC[index]!;
+  if (index >= 232) {
+    const level = 8 + (index - 232) * 10;
+    return [level, level, level];
+  }
+  const cube = index - 16;
+  const step = (value: number): number => (value === 0 ? 0 : 55 + value * 40);
+  return [step(Math.floor(cube / 36)), step(Math.floor(cube / 6) % 6), step(cube % 6)];
+};
+
+/** The foreground colour a styled sample is drawn in: its SGR background twin and its RGB. */
+const foreground = (sample: string): { background: string; rgb: Rgb } | undefined => {
+  for (const match of sample.matchAll(/\x1b\[([0-9;]*)m/g)) {
+    const params = (match[1] ?? "").split(";").map(Number);
+    for (let index = 0; index < params.length; index++) {
+      const code = params[index]!;
+      if (code === 38 && params[index + 1] === 2 && params.length >= index + 5) {
+        const rgb: Rgb = [params[index + 2]!, params[index + 3]!, params[index + 4]!];
+        return { background: `48;2;${rgb.join(";")}`, rgb };
+      }
+      if (code === 38 && params[index + 1] === 5 && params[index + 2] !== undefined) {
+        return { background: `48;5;${params[index + 2]}`, rgb: xterm256(params[index + 2]!) };
+      }
+      if (code >= 30 && code <= 37) return { background: String(code + 10), rgb: BASIC[code - 30]! };
+      if (code >= 90 && code <= 97) return { background: String(code + 10), rgb: BASIC[code - 90 + 8]! };
+    }
+  }
+  return undefined;
+};
+
+const luminance = ([red, green, blue]: Rgb): number => {
+  const channel = (value: number): number => {
+    const scaled = value / 255;
+    return scaled <= 0.03928 ? scaled / 12.92 : ((scaled + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue);
+};
+
+/**
+ * A Claude Code-style badge on the editor border: a block in the border's own
+ * colour, which Pi sets from the thinking level, with black or white text,
+ * whichever has the higher WCAG contrast. `sample` is any text styled in the
+ * border colour; a border drawn without colour gets a plain label, unstyled like it.
+ */
+export const borderBadge = (sample: string, text: string): string => {
+  const label = ` ${stripVTControlCharacters(text)} `;
+  const colour = foreground(sample);
+  if (!colour) return label;
+  const light = luminance(colour.rgb);
+  // Contrast ratio (L1 + 0.05) / (L2 + 0.05) against black (L = 0) and white (L = 1).
+  const black = (light + 0.05) / 0.05;
+  const white = 1.05 / (light + 0.05);
+  const ink = black >= white ? "38;2;0;0;0" : "38;2;255;255;255";
+  return `\x1b[${colour.background};${ink}m${label}\x1b[0m`;
 };

@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 import type { FabricMainAgentInfo } from "../main-agent.js";
 import { MeshStore, type MeshIdentity, type MeshStateEntry } from "../mesh/store.js";
 import type {
+  FabricDepartedListOptions,
+  FabricDepartedParticipant,
   FabricHostRecord,
   FabricParticipantInfo,
   FabricParticipantKind,
@@ -12,15 +14,25 @@ import type {
 } from "./types.js";
 
 import { peerLabelPrefix } from "./peer-settle.js";
+import { FABRIC_PEER_LABEL_SEQUENCE } from "../protocol.js";
 
 const PARTICIPANT_PREFIX = "topology/participants/";
 /** Project-scoped monotonic counter backing Linear-style peer labels. Never shrinks. */
-const PEER_SEQ_KEY = "topology/peer-seq";
+const PEER_SEQ_KEY = `topology/peer-seq/${FABRIC_PEER_LABEL_SEQUENCE}`;
+/** Fresh numbers tried before a pass gives up, when live sessions hold the first ones. */
+const MAX_HELD_LABEL_SKIPS = 64;
 const HOST_PREFIX = "topology/hosts/";
 const LEGACY_SESSION_PREFIX = "sessions/";
 const LEGACY_ACTOR_PREFIX = "actors/";
 const PARTICIPANT_HEARTBEAT_MS = 5_000;
 const PARTICIPANT_LEASE_MS = 15_000;
+/**
+ * Stopped-root tombstones live under their own prefix, so live discovery
+ * (list, get, sessions, peers, label checks) never scans them.
+ */
+const TOMBSTONE_PREFIX = "topology/tombstones/";
+const DEPARTED_LIMIT = 32;
+const DEPARTED_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 const keyFor = (prefix: string, id: string): string =>
   prefix + createHash("sha256").update(id).digest("hex");
 
@@ -116,6 +128,55 @@ const hostFromEntry = (entry: MeshStateEntry): FabricHostRecord | undefined => {
   }
   return value as FabricHostRecord;
 };
+
+const optionalString = (value: unknown): boolean => value === undefined || typeof value === "string";
+
+const tombstoneFromEntry = (entry: MeshStateEntry): FabricDepartedParticipant | undefined => {
+  if (!isObject(entry.value) || entry.value.format !== 1) return undefined;
+  const value = entry.value as Partial<FabricDepartedParticipant>;
+  if (
+    value.kind !== "root" ||
+    value.status !== "stopped" ||
+    typeof value.id !== "string" ||
+    entry.key !== keyFor(TOMBSTONE_PREFIX, value.id) ||
+    typeof value.rootId !== "string" ||
+    typeof value.ownerHostId !== "string" ||
+    typeof value.ownerIdentityId !== "string" ||
+    entry.updatedBy.id !== value.ownerIdentityId ||
+    typeof value.name !== "string" ||
+    !optionalString(value.ownerIncarnation) ||
+    !optionalString(value.label) ||
+    !optionalString(value.cwd) ||
+    !optionalString(value.sessionId) ||
+    typeof value.startedAt !== "number" ||
+    typeof value.lastSeenAt !== "number"
+  ) {
+    return undefined;
+  }
+  return value as FabricDepartedParticipant;
+};
+
+/** Copy only the identifying fields of a root record; operational state stays behind. */
+const departedFromRoot = (
+  participant: FabricParticipantRecord,
+  status: FabricDepartedParticipant["status"],
+  lastSeenAt: number,
+): FabricDepartedParticipant => ({
+  format: 1,
+  id: participant.id,
+  kind: "root",
+  rootId: participant.rootId,
+  ownerHostId: participant.ownerHostId,
+  ownerIdentityId: participant.ownerIdentityId,
+  ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+  name: participant.name,
+  ...(participant.label ? { label: participant.label } : {}),
+  ...(participant.cwd ? { cwd: participant.cwd } : {}),
+  ...(participant.sessionId ? { sessionId: participant.sessionId } : {}),
+  status,
+  startedAt: participant.startedAt,
+  lastSeenAt,
+});
 
 const peerFromParticipant = (participant: FabricParticipantInfo): FabricPeerInfo | undefined => {
   if (
@@ -246,15 +307,46 @@ export interface ParticipantDirectoryOptions {
   ownerIncarnation?: string;
   heartbeatMs?: number;
   leaseMs?: number;
+  /**
+   * The label this root recorded in its own session for its id, if any. A
+   * resumed session keeps it, so reopening Pi does not take a new number.
+   */
+  recordedLabel?: () => string | undefined;
+  /**
+   * False until the session first uses Fabric: only then does it take a new
+   * number, so idle sessions leave the counter alone. A recorded label is
+   * reused at once, since that takes no number. Defaults to true.
+   */
+  labelWanted?: () => boolean;
+  /**
+   * Most stopped-root tombstones kept in the project, newest first. Close
+   * prunes the rest; 0 writes none. Defaults to 32.
+   */
+  departedLimit?: number;
+  /** Tombstones and lost roots older than this are not reported. Defaults to 7 days. */
+  departedRetentionMs?: number;
 }
 
 export type ParticipantSnapshotSource = () => FabricParticipantRecord[];
+
+/** A participant is live while its owner host holds an unexpired lease for the same identity and root. */
+const liveOwner = (
+  participant: FabricParticipantRecord,
+  hosts: Map<string, FabricHostRecord>,
+  now: number,
+): boolean => {
+  const owner = hosts.get(participant.ownerHostId);
+  return !!owner && owner.expiresAt >= now && owner.identity.id === participant.ownerIdentityId &&
+    owner.rootId === participant.rootId;
+};
 
 export class ParticipantDirectory implements FabricParticipantSource {
   readonly #sources = new Set<ParticipantSnapshotSource>();
   readonly #startedAt = Date.now();
   readonly #heartbeatMs: number;
   readonly #leaseMs: number;
+  readonly #departedLimit: number;
+  readonly #departedRetentionMs: number;
   readonly #localRecords = new Map<string, FabricParticipantRecord>();
   #timer: NodeJS.Timeout | undefined;
   #closed = false;
@@ -269,6 +361,8 @@ export class ParticipantDirectory implements FabricParticipantSource {
   ) {
     this.#heartbeatMs = Math.max(100, options.heartbeatMs ?? PARTICIPANT_HEARTBEAT_MS);
     this.#leaseMs = Math.max(this.#heartbeatMs * 2, options.leaseMs ?? PARTICIPANT_LEASE_MS);
+    this.#departedLimit = Math.max(0, Math.floor(options.departedLimit ?? DEPARTED_LIMIT));
+    this.#departedRetentionMs = Math.max(0, options.departedRetentionMs ?? DEPARTED_RETENTION_MS);
   }
 
   registerSource(source: ParticipantSnapshotSource): () => void {
@@ -345,24 +439,12 @@ export class ParticipantDirectory implements FabricParticipantSource {
       if (!options.kinds || options.kinds.includes(self.kind)) byId.set(self.id, self);
       return [...byId.values()];
     }
-    const hosts = new Map(
-      this.mesh
-        .listAll(HOST_PREFIX)
-        .flatMap((entry) => {
-          const host = hostFromEntry(entry);
-          return host ? [[host.id, host] as const] : [];
-        }),
-    );
+    const hosts = this.#hosts();
     const byId = new Map<string, FabricParticipantInfo>();
     for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX)) {
       const participant = participantFromEntry(entry);
       if (!participant) continue;
-      const owner = hosts.get(participant.ownerHostId);
-      const stale =
-        !owner ||
-        owner.expiresAt < now ||
-        owner.identity.id !== participant.ownerIdentityId ||
-        owner.rootId !== participant.rootId;
+      const stale = !liveOwner(participant, hosts, now);
       if (stale && !options.includeStale) continue;
       if (options.scope === "local" && participant.ownerHostId !== this.options.hostId) continue;
       if (options.scope === "lineage" && participant.rootId !== this.options.rootId) continue;
@@ -410,16 +492,33 @@ export class ParticipantDirectory implements FabricParticipantSource {
 
   get(id: string, now = Date.now()): FabricParticipantInfo | undefined {
     const target = id === "main" ? this.options.rootId : id;
+    if (this.options.enabled) {
+      const participant = this.#participant(target);
+      if (participant) {
+        const entry = this.mesh.get(keyFor(HOST_PREFIX, participant.ownerHostId));
+        const owner = entry && hostFromEntry(entry);
+        if (owner && liveOwner(participant, new Map([[owner.id, owner]]), now)) {
+          return { ...participant, local: participant.ownerHostId === this.options.hostId, stale: false };
+        }
+      }
+    }
+    // Preserve local-only behavior and legacy fallback when no live canonical
+    // record exists. Normal polling needs only the participant and its owner.
     return this.list({ scope: "project" }, now).find((participant) => participant.id === target);
+  }
+
+  #participant(id: string): FabricParticipantRecord | undefined {
+    const entry = this.mesh.get(keyFor(PARTICIPANT_PREFIX, id));
+    const participant = entry && participantFromEntry(entry);
+    // Unpaired UTF-16 surrogates share their UTF-8 bytes with U+FFFD. A
+    // matching storage key alone does not establish exact string identity.
+    return participant?.id === id ? participant : undefined;
   }
 
   self(now = Date.now()): FabricParticipantInfo {
     const existing =
       this.#localRecords.get(this.options.identity.id) ??
-      this.mesh
-        .listAll(PARTICIPANT_PREFIX)
-        .map(participantFromEntry)
-        .find((participant) => participant?.id === this.options.identity.id);
+      this.#participant(this.options.identity.id);
     if (existing) {
       return {
         ...existing,
@@ -467,6 +566,49 @@ export class ParticipantDirectory implements FabricParticipantSource {
       });
   }
 
+  /**
+   * Root sessions that are no longer live, newest first: `stopped` from the
+   * tombstone a clean close wrote, `lost` from a root record whose owner
+   * lease expired without one. Explicit opt-in only; live queries never read
+   * tombstones. Pure read: never writes or prunes.
+   */
+  departed(options: FabricDepartedListOptions = {}, now = Date.now()): FabricDepartedParticipant[] {
+    if (!this.options.enabled) return [];
+    const hosts = this.#hosts();
+    const live = new Set<string>([this.options.rootId]);
+    const byId = new Map<string, FabricDepartedParticipant>();
+    for (const entry of this.mesh.listAll(PARTICIPANT_PREFIX)) {
+      const participant = participantFromEntry(entry);
+      if (participant?.kind !== "root") continue;
+      if (liveOwner(participant, hosts, now)) {
+        live.add(participant.id);
+        continue;
+      }
+      // The owner's last heartbeat is the best last-seen time; an unchanged
+      // record keeps its older updatedAt while the lease keeps renewing.
+      const owner = hosts.get(participant.ownerHostId);
+      const heartbeat = owner?.identity.id === participant.ownerIdentityId ? owner.updatedAt : 0;
+      byId.set(participant.id, departedFromRoot(participant, "lost", Math.max(participant.updatedAt, heartbeat)));
+    }
+    // A tombstone records a clean stop, so it wins over a leftover record that
+    // is no newer. A newer record means the root ran again after that stop and
+    // was then lost, so the stale tombstone must not hide the crash.
+    for (const entry of this.mesh.listAll(TOMBSTONE_PREFIX)) {
+      const tombstone = tombstoneFromEntry(entry);
+      if (!tombstone) continue;
+      const lost = byId.get(tombstone.id);
+      if (!lost || tombstone.lastSeenAt >= lost.lastSeenAt) byId.set(tombstone.id, tombstone);
+    }
+    const cutoff = now - this.#departedRetentionMs;
+    // A write limit of 0 only stops this session writing tombstones; reads
+    // still default to the standard limit so other sessions' departures show.
+    const limit = Math.max(0, Math.floor(options.limit ?? (this.#departedLimit || DEPARTED_LIMIT)));
+    return [...byId.values()]
+      .filter((participant) => !live.has(participant.id) && participant.lastSeenAt >= cutoff)
+      .sort((left, right) => right.lastSeenAt - left.lastSeenAt || left.id.localeCompare(right.id))
+      .slice(0, limit);
+  }
+
   root(main: FabricMainAgentInfo): FabricParticipantRecord {
     return {
       format: 1,
@@ -507,10 +649,13 @@ export class ParticipantDirectory implements FabricParticipantSource {
     this.#timer = undefined;
     await this.#refreshing?.catch(() => undefined);
     if (!this.options.enabled) return;
-    const owned = this.mesh
-      .listAll(PARTICIPANT_PREFIX)
-      .filter((entry) => participantFromEntry(entry)?.ownerHostId === this.options.hostId);
-    await Promise.allSettled(owned.map((entry) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
+    const owned = this.mesh.listAll(PARTICIPANT_PREFIX).flatMap((entry) => {
+      const participant = participantFromEntry(entry);
+      return participant?.ownerHostId === this.options.hostId ? [{ entry, participant }] : [];
+    });
+    // Tombstones go first, so a reader never finds neither a live record nor a tombstone.
+    await this.#writeTombstones(owned.map((item) => item.participant)).catch(() => undefined);
+    await Promise.allSettled(owned.map(({ entry }) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
     const legacySessionKey = this.#legacySessionKey();
     if (legacySessionKey) {
       const legacy = this.mesh.get(legacySessionKey);
@@ -520,6 +665,29 @@ export class ParticipantDirectory implements FabricParticipantSource {
     }
     const hostEntry = this.mesh.get(keyFor(HOST_PREFIX, this.options.hostId));
     if (hostEntry) await this.mesh.delete({ key: hostEntry.key, ifVersion: hostEntry.version }).catch(() => undefined);
+  }
+
+  /** Replace this host's root records with stopped tombstones, then prune by age and count. */
+  async #writeTombstones(owned: FabricParticipantRecord[]): Promise<void> {
+    // A limit of 0 turns tombstones off for this session only; it must not prune other sessions' tombstones.
+    if (this.#departedLimit === 0) return;
+    const now = Date.now();
+    for (const participant of owned) {
+      if (participant.kind !== "root") continue;
+      await this.mesh.put({
+        key: keyFor(TOMBSTONE_PREFIX, participant.id),
+        value: departedFromRoot(participant, "stopped", now),
+        identity: this.options.identity,
+      }).catch(() => undefined);
+    }
+    const cutoff = now - this.#departedRetentionMs;
+    const kept = this.mesh
+      .listAll(TOMBSTONE_PREFIX)
+      .map((entry) => ({ entry, tombstone: tombstoneFromEntry(entry) }))
+      .sort((left, right) => (right.tombstone?.lastSeenAt ?? 0) - (left.tombstone?.lastSeenAt ?? 0));
+    const prune = kept.filter(({ tombstone }, index) =>
+      !tombstone || tombstone.lastSeenAt < cutoff || index >= this.#departedLimit);
+    await Promise.allSettled(prune.map(({ entry }) => this.mesh.delete({ key: entry.key, ifVersion: entry.version })));
   }
 
   async #refresh(): Promise<void> {
@@ -687,9 +855,49 @@ export class ParticipantDirectory implements FabricParticipantSource {
         record.label = existing.label;
         continue;
       }
-      const seq = await this.#claimPeerSeq();
-      if (seq !== undefined) record.label = `${peerLabelPrefix(record.cwd)}-${seq}`;
+      // Shutdown deletes the record, so a resumed session finds its label in its
+      // own session file. Numbers are never minted twice, so only a live
+      // participant of another id could hold it; then the session takes a new one.
+      const recorded = this.options.recordedLabel?.();
+      if (recorded && this.#reusableLabel(recorded, record)) {
+        record.label = recorded;
+        continue;
+      }
+      if (this.options.labelWanted?.() === false) continue;
+      // A new counter generation restarts at 1 while sessions labelled by an
+      // older one may still run: skip numbers a live participant holds.
+      for (let attempt = 0; attempt < MAX_HELD_LABEL_SKIPS; attempt += 1) {
+        const seq = await this.#claimPeerSeq();
+        if (seq === undefined) break;
+        const label = `${peerLabelPrefix(record.cwd)}-${seq}`;
+        if (this.#heldByOther(label, record.id)) continue;
+        record.label = label;
+        break;
+      }
     }
+  }
+
+  /** A recorded label fits this project and no other participant holds it. */
+  #reusableLabel(label: string, record: FabricParticipantRecord): boolean {
+    return new RegExp(`^${peerLabelPrefix(record.cwd)}-[1-9][0-9]*$`).test(label) && !this.#heldByOther(label, record.id);
+  }
+
+  /** A live participant of another id holds the label; a dead session's leftover record does not. */
+  #heldByOther(label: string, id: string): boolean {
+    const hosts = this.#hosts();
+    const now = Date.now();
+    return this.mesh.listAll(PARTICIPANT_PREFIX).some((entry) => {
+      const participant = participantFromEntry(entry);
+      return participant !== undefined && participant.id !== id && participant.label === label &&
+        liveOwner(participant, hosts, now);
+    });
+  }
+
+  #hosts(): Map<string, FabricHostRecord> {
+    return new Map(this.mesh.listAll(HOST_PREFIX).flatMap((entry) => {
+      const host = hostFromEntry(entry);
+      return host ? [[host.id, host] as const] : [];
+    }));
   }
 
   /** CAS-claim the next project-wide peer sequence number. ifVersion 0 creates. */

@@ -15,7 +15,16 @@ const posixRel = (value: string): string => value.replaceAll("\\", "/");
 const isCowUnavailable = (error: unknown): boolean => {
   if (typeof error !== "object" || error === null || !("code" in error)) return false;
   const code = (error as { code?: unknown }).code;
-  return code === "ENOTSUP" || code === "EOPNOTSUPP" || code === "EXDEV" || code === "ENOTSUPP";
+  // Windows libuv rejects COPYFILE_FICLONE_FORCE with ENOSYS; some Linux
+  // filesystems without the clone ioctl report ENOTTY.
+  return (
+    code === "ENOTSUP" ||
+    code === "EOPNOTSUPP" ||
+    code === "EXDEV" ||
+    code === "ENOTSUPP" ||
+    code === "ENOSYS" ||
+    code === "ENOTTY"
+  );
 };
 
 const cloneEntry = async (from: string, to: string): Promise<void> => {
@@ -73,5 +82,12 @@ export const cloneTree = async (
   dest: string,
   prefixes: readonly string[] = CLONE_SKIP_PREFIXES,
 ): Promise<void> => {
-  await cloneLevel(source, dest, "", prefixes);
+  await fs.promises.mkdir(dest, { recursive: true });
+  // Resolve both existing directories before calculating the exclusion: Git and
+  // the caller can spell the same Windows path using long and 8.3 names.
+  const [realSource, realDest] = await Promise.all([fs.promises.realpath(source), fs.promises.realpath(dest)]);
+  const relativeDest = path.relative(realSource, realDest);
+  if (!relativeDest) throw new Error("Cannot clone a tree into itself");
+  const inside = relativeDest !== ".." && !relativeDest.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeDest);
+  await cloneLevel(realSource, realDest, "", inside ? [...prefixes, posixRel(relativeDest)] : prefixes);
 };

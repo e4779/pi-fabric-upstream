@@ -223,4 +223,26 @@ describe("extractive extension integration", () => {
     await f.before();
     expect((await f.request(messages)).some((m) => m.customType === "fabric-extractive-history")).toBe(false);
   });
+
+  it("prepares no view for a run started by a custom message and drops an earlier one", async () => {
+    const f = await fixture(true);
+    await f.emit("session_start");
+    // Pi 1.2 shape for an idle pi.sendMessage(..., { triggerTurn: true }): no prompt.
+    const message = { role: "custom", customType: "pi-callbacks", content: "Background job finished.", display: true, details: {}, timestamp: 2 };
+    const custom = () => f.emit("before_agent_start", { messageType: "custom", message, systemPrompt: "system", systemPromptOptions: { skills: [] } });
+    const request = [{ role: "user", content: "earlier", timestamp: 1 }, message];
+    const advised = async () => (await f.request(request)).some((m) => m.customType === "fabric-extractive-history");
+    await custom();
+    expect(await f.request(request)).toEqual(request);
+    expect(f.classify).not.toHaveBeenCalled();
+    // A view prepared for an earlier user run is not carried into a custom run.
+    await f.before("user query");
+    expect(f.classify).toHaveBeenCalledTimes(1);
+    await custom();
+    expect(await advised()).toBe(false);
+    // The next user run still prepares and injects, without a second classifier call.
+    await f.before("next query");
+    expect(await advised()).toBe(true);
+    expect(f.classify).toHaveBeenCalledTimes(1);
+  });
 });

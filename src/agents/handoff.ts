@@ -19,6 +19,7 @@ import type {
   AgentToolResultMessage,
   HandoffCompactionRequest,
 } from "./types.js";
+import { freshEntryId, workerRoleEntry } from "../durable/worker-role-seed.js";
 import {
   buildThinkingDigest,
   THINKING_DIGEST_CUSTOM_TYPE,
@@ -172,10 +173,38 @@ export const snapshotHandoffSession = (
   };
 };
 
+/**
+ * Options shared by the seed writers. `workerRole` is set only for a pi-durable
+ * child: the same write that creates the file then puts the worker-role entry
+ * first (the tree root) and hangs the seed's former root under it. Every other
+ * byte matches the output without the option; plain `pi` and other runners
+ * never pass it.
+ */
+export interface SessionSeedWriteOptions {
+  workerRole?: boolean;
+}
+
+/** The seed's entries with the worker-role entry as the new root; the old root (parentId null) is re-parented under it. */
+const withWorkerRoot = (entries: readonly SessionEntry[]): SessionEntry[] => {
+  const policy = workerRoleEntry(
+    freshEntryId(new Set(entries.map((entry) => entry.id))),
+    null,
+    new Date().toISOString(),
+  ) as unknown as SessionEntry;
+  // Each entry is kept as it is, except a root, whose copy gets the policy as its parent (no object spread).
+  return [policy, ...entries.map((entry) => {
+    if (entry.parentId !== null) return entry;
+    const root = structuredClone(entry);
+    root.parentId = policy.id;
+    return root;
+  })];
+};
+
 const materializeBranch = (
   seed: Pick<AgentSessionSeed, "sourceBranch" | "sourceSessionFile">,
   cwd: string,
   directory: string,
+  options: SessionSeedWriteOptions = {},
 ): SessionManager => {
   if (!seed.sourceBranch) {
     throw new Error("In-memory trajectory handoff is missing its source branch");
@@ -190,20 +219,43 @@ const materializeBranch = (
     cwd,
     ...(seed.sourceSessionFile ? { parentSession: seed.sourceSessionFile } : {}),
   };
+  const entries = options.workerRole ? withWorkerRoot(seed.sourceBranch) : seed.sourceBranch;
   fs.writeFileSync(
     sessionFile,
-    `${[header, ...seed.sourceBranch].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+    `${[header, ...entries].map((entry) => JSON.stringify(entry)).join("\n")}\n`,
     { encoding: "utf8", mode: 0o600, flag: "wx" },
   );
   return PiCodingAgent.SessionManager.open(sessionFile, directory, cwd);
+};
+
+/**
+ * Pi's createBranchedSession writes the file itself, so it cannot take the
+ * worker-role root in the same write. When the seed came through it, the writer
+ * rewrites its own just-created file once, after its last append and before it
+ * returns the path (no worker has seen the file yet): header, policy, then every
+ * entry with the old root re-parented.
+ */
+const insertWorkerRoot = (sessionFile: string): void => {
+  if (!fs.existsSync(sessionFile)) {
+    throw new Error("Trajectory handoff session file was not written, so the worker role cannot be placed at its root");
+  }
+  const [headerLine, ...entryLines] = fs.readFileSync(sessionFile, "utf8").split("\n").filter((line) => line.length > 0);
+  const entries = entryLines.map((line) => JSON.parse(line) as SessionEntry);
+  const placed = withWorkerRoot(entries);
+  fs.writeFileSync(
+    sessionFile,
+    `${[headerLine, ...placed.map((entry) => JSON.stringify(entry))].join("\n")}\n`,
+    { encoding: "utf8", mode: 0o600 },
+  );
 };
 
 const forkBranch = (
   seed: AgentSessionSeed,
   cwd: string,
   directory: string,
+  options: SessionSeedWriteOptions = {},
 ): SessionManager => {
-  if (!seed.sourceSessionFile) return materializeBranch(seed, cwd, directory);
+  if (!seed.sourceSessionFile) return materializeBranch(seed, cwd, directory, options);
   const fork = PiCodingAgent.SessionManager.open(seed.sourceSessionFile, directory, cwd);
   if (!fork.getEntry(seed.sourceBranchLeafId)) {
     throw new Error(
@@ -262,14 +314,17 @@ export const writeHandoffSession = (
   transfer?: ThinkingTransferInput,
   compaction?: HandoffCompactionRequest,
   compactionBudget?: FabricCompactionBudget,
+  options: SessionSeedWriteOptions = {},
 ): string => {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const policy = transfer ? thinkingTransferPolicy(transfer) : "preserved";
   let session: SessionManager;
+  // Pi wrote this file itself (createBranchedSession), so the root is placed afterwards.
+  const viaPiBranch = Boolean(seed.sourceSessionFile) && (!transfer || policy === "preserved");
   let report: ThinkingTransferReport | undefined;
   let digest: { content: string; citedBlocks: number } | undefined;
   if (!transfer || policy === "preserved") {
-    session = forkBranch(seed, cwd, directory);
+    session = forkBranch(seed, cwd, directory, options);
   } else {
     const rawBranch = seed.sourceSessionFile
       ? persistedBranch(seed, cwd, directory)
@@ -279,7 +334,7 @@ export const writeHandoffSession = (
     if (policy === "stripped") digest = buildThinkingDigest(rawBranch, transfer);
     const translated = translateThinkingForExecutor(rawBranch, policy);
     report = translated.report;
-    session = materializeBranch({ ...seed, sourceBranch: translated.entries }, cwd, directory);
+    session = materializeBranch({ ...seed, sourceBranch: translated.entries }, cwd, directory, options);
   }
   synchronizeSourceSettings(session, seed);
   session.appendMessage(seed.outerToolResult);
@@ -346,6 +401,7 @@ export const writeHandoffSession = (
   });
   const sessionFile = session.getSessionFile();
   if (!sessionFile) throw new Error("Trajectory handoff did not produce a Pi session file");
+  if (options.workerRole && viaPiBranch) insertWorkerRoot(sessionFile);
   fs.chmodSync(sessionFile, 0o600);
   return sessionFile;
 };
@@ -360,6 +416,7 @@ export const writeForkSession = (
   cwd: string,
   directory: string,
   transfer?: ThinkingTransferInput,
+  options: SessionSeedWriteOptions = {},
 ): string => {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const policy = transfer ? thinkingTransferPolicy(transfer) : "preserved";
@@ -370,6 +427,7 @@ export const writeForkSession = (
     { sourceBranch: entries, ...(seed.sourceSessionFile ? { sourceSessionFile: seed.sourceSessionFile } : {}) },
     cwd,
     directory,
+    options,
   );
   if (digest) {
     session.appendCustomMessageEntry(THINKING_DIGEST_CUSTOM_TYPE, digest.content, false, {

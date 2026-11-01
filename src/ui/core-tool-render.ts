@@ -1,11 +1,11 @@
 // Adapted from pi-code-previews for audited nested calls; see THIRD_PARTY_NOTICES.md.
 import { readFileSync, statSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, extname, isAbsolute, relative, resolve } from "node:path";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { CodePreviewSettings } from "./code-preview.js";
 import { formatToolCallDuration } from "./tool-call-timing.js";
-import { diffLines } from "diff";
 import { shikiLanguages } from "./shiki-catalog.js";
 import type { FabricRenderAudit } from "./fabric-render.js";
 import {
@@ -23,7 +23,6 @@ import {
   shouldSkipWriteDiffBytes,
   shouldSkipWriteDiffComplexity,
 } from "../providers/write-diff-limits.js";
-import { changedLineEmphasis } from "./word-diff/line-emphasis.js";
 import {
   diffLineNumberWidth,
   formatDiffLineNumber,
@@ -490,14 +489,46 @@ const injectVisibleRanges = (
   return out;
 };
 
+// Word emphasis refines a diff that already renders. Load the matcher at the
+// first diff, not while loading the extension, and repaint once it is ready.
+let lineEmphasis: typeof import("./word-diff/line-emphasis.js") | undefined;
+let lineEmphasisLoad: Promise<void> | undefined;
+const lineEmphasisReadyCallbacks = new Set<() => void>();
+
+export const loadWordEmphasis = (invalidate?: () => void): Promise<void> => {
+  if (invalidate && !lineEmphasis) lineEmphasisReadyCallbacks.add(invalidate);
+  return lineEmphasisLoad ??= import("./word-diff/line-emphasis.js").then((module) => {
+    lineEmphasis = module;
+    const callbacks = [...lineEmphasisReadyCallbacks];
+    lineEmphasisReadyCallbacks.clear();
+    for (const callback of callbacks) {
+      try {
+        callback();
+      } catch {
+        // A stale invalidate callback is harmless.
+      }
+    }
+  }, () => {
+    // Without the matcher, diffs keep their line-level colors.
+    lineEmphasisReadyCallbacks.clear();
+  });
+};
+
 const wordEmphasisFor = (
   parsed: Array<ParsedDiffLine | null>,
   mode: CodePreviewSettings["wordEmphasis"],
+  invalidate?: () => void,
 ): Map<number, { ranges: Array<[number, number]>; kind: "add" | "remove" }> => {
   const emphasis = new Map<
     number,
     { ranges: Array<[number, number]>; kind: "add" | "remove" }
   >();
+  if (mode === "off") return emphasis;
+  if (!lineEmphasis) {
+    void loadWordEmphasis(invalidate);
+    return emphasis;
+  }
+  const { changedLineEmphasis } = lineEmphasis;
   let start = 0;
   while (start < parsed.length) {
     if (!parsed[start] || parsed[start]!.kind === " ") {
@@ -560,8 +591,13 @@ const describeDiffShape = (summary: DiffSummary): string => {
   return parts.length > 0 ? parts.join(", ") : "changes";
 };
 
+// Render callbacks are synchronous. Resolve jsdiff at the first write diff,
+// not while loading the extension.
+const require = createRequire(import.meta.url);
+let jsdiff: typeof import("diff") | undefined;
+
 const createSimpleDiff = (before: string, after: string): string => {
-  const changes = diffLines(before, after);
+  const changes = (jsdiff ??= require("diff") as typeof import("diff")).diffLines(before, after);
   const hasChangeAfter = changes.map(() => false);
   let futureChange = false;
   for (let index = changes.length - 1; index >= 0; index--) {
@@ -874,7 +910,7 @@ const renderDiff = (
       start = end;
     }
   }
-  const emphasis = wordEmphasisFor(parsed, options.settings.wordEmphasis);
+  const emphasis = wordEmphasisFor(parsed, options.settings.wordEmphasis, options.invalidate);
   const emphasisColors = effectiveShikiThemeIsLight()
     ? { add: "\x1b[48;2;194;209;194m", remove: "\x1b[48;2;216;182;182m" }
     : { add: "\x1b[48;2;64;132;82m", remove: "\x1b[48;2;148;62;70m" };

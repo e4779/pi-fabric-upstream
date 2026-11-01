@@ -95,6 +95,35 @@ Fabric retires the current binding and drops its owner hold, the same path a com
 
 Optional `generation` pins the withdrawal to one binding: a number matches the binding generation, a string matches the provider binding id (`providerBindingId` in a committed view). Unknown names, generation mismatches, component-owned providers, and managed-host providers are ignored; set `PI_FABRIC_DEBUG=1` to log ignored withdrawals. Component-owned providers withdraw through their component lifecycle.
 
+## Program globals and types
+
+A Fabric capability provider (the actions a program calls, not a model provider) that another extension registers, directly, through discovery, or through a component's `context.provide()`, becomes a program global named after the provider. This applies in every kernel: QuickJS, Node, Bun, Monty and CPython. For the provider `context` with the action `task_add`:
+
+```ts
+await context.task_add({ title: "Write tests" });
+// is exactly
+await tools.call({ ref: "context.task_add", args: { title: "Write tests" } });
+```
+
+Python calls it as `await context.task_add(title="Write tests")`. The global is a `tools.call`: the same host call, argument validation, authorization, approvals, audit, trace, deadlines, cancellation, and committed capability view. It adds no authority. Policy that denies the `tools.call` denies the global call too.
+
+**Types.** Each action's `inputSchema` is its declaration. Before a TypeScript program that uses the global (`context.` or `context[` in its source) runs, Fabric calls the provider's `list()` and renders the schemas into a typed declaration for the global, so an unknown property on a closed schema (`additionalProperties: false`) or a missing required argument fails type checking. Wrong value types follow the policy for `pi.*` and `mcp.*` calls: the type gate lets them through, and the registry validates them against the schema at dispatch. Jev programs type-check strictly and reject them before the program runs. Results are `any`, so moving a call from `tools.call` to the global never adds a type error. Python programs are not type-checked.
+
+**Where types apply.** Schema enforce types the global like any TypeScript program. The native codemode profile gets the global but no type check, because native scripts are plain JavaScript. The catalog read keys on the program text. A program that reaches the global by destructuring (`const { task_add } = context`) or by aliasing it skips the read and sees the loose type below. A local binding named `context` shadows the global, as in any TypeScript program.
+
+**A provider without declarations** still gets its global, typed loosely: any action, one argument object, validated at dispatch. This applies when the program does not use the global, when `list()` throws, takes longer than 500 ms, or returns no actions, and to actions beyond 128 per provider or beyond the 60,000-character declaration budget. The global must exist whenever the provider does, so a slow or cold catalog never changes whether a program compiles.
+
+**Names.** A global name is a lowercase identifier (`a-z`, `0-9`, `_`) of at most 64 characters. A provider never takes a name that is already used. Reserved names are:
+
+- every Fabric global in any kernel, such as `tools`, `pi`, `agents`, `mcp`, `memory`, `workflow`, and `print`
+- every built-in provider, including `tasks`, `sessions`, and `native`
+- the prelude names `input` (saved programs) and `program` (Jev)
+- TypeScript keywords, common JavaScript globals, and Python keywords and builtins
+
+`src/provider-globals.ts` holds the list, and a test derives it from the kernels. A provider with a hyphenated or reserved name gets no global. With `PI_FABRIC_DEBUG=1`, Fabric logs one warning per name when it mounts such a provider from a direct or discovery registration, for example `[pi-fabric] Fabric provider "workflow" gets no program global: the name clashes with the Fabric program global "workflow"`. `tools.call` still reaches the provider. A program gets at most 64 provider globals, in name order. A later Fabric release can add a global that an existing provider already uses. That provider then loses its global and keeps `tools.call`. New Fabric globals are added to the list in `src/provider-globals.ts`, and the test fails until they are, so the list does not drift from Fabric itself.
+
+**Lifetime.** Fabric takes the list of globals when a program starts. A registration or withdrawal applies from the next program. A provider mounted while a program runs is reachable only through `tools.call` in that program. Under a committed capability view, such as a Jev program's `requires`, only the providers that the view binds get globals, typed from the bound actions without a `list()` call. Speculative pre-launch does not cover provider globals.
+
 ## Tool placement query
 
 Extensions that need to know where a tool is reachable this turn can ask synchronously with `FABRIC_TOOL_PLACEMENT_EVENT` (`pi-fabric:tool-placement:v1`), so they need not guess from Fabric's mode:
@@ -122,6 +151,10 @@ The reply is `{ version: 1, mode, tools }`. `mode` is `"full-code"`, `"enforce"`
 - `unavailable`: neither.
 
 `model` wins when both apply; optional `programCallable` lists the reported `model` tools that a program can also call, such as foreground tools, and is omitted when empty. Omitting `tools` reports every tool registered with Pi; at most 1,024 names of up to 256 characters each are accepted. An invalid query gets no reply. Placement describes state at the time of the query. A later mode change, reload, or tool refresh can change it, so query when you need the answer and do not cache it.
+
+## Compaction owner claim
+
+An extension that writes its own compaction summaries claims compaction from Fabric with `FABRIC_COMPACTION_OWNER_EVENT` (`pi-fabric:compaction-owner:v1`). Fabric's compactor and thresholds stand down, `compact.*` program calls route to the owner, and the reply carries a handle with `withdraw()` and Fabric's deterministic `fallback()`, plus Fabric's carry list at cut-over. Fabric loads its claim code on the first message, so the reply may arrive after `emit` returns: wait with a timeout, abort the claim's `signal` when giving up, and withdraw a grant that arrives late. Owner handlers receive `{ context, signal }` and are bounded at 30 seconds. One claim is held at a time; withdrawal, the claim's abort signal, or Fabric's `session_shutdown` ends it. See [compaction owner claim](programmatic-compaction.md#compaction-owner-claim).
 
 ## Invocation costs and guarantees
 
@@ -174,7 +207,13 @@ pi.events.emit(FABRIC_PROGRAM_RUN_EVENT, {
 });
 ```
 
+To run program text the caller built, pass `code` with no `ref`. The run goes through `programs.run` like a saved program, so the same approval and trace apply; see [Running caller-supplied code](programs.md#running-caller-supplied-code).
+
 The run has the same semantics as `/fabric run`: the session's root capability view, the configured approval policy, a `pi-fabric-program-run` transcript message, and `invokedBy: "host"` in the trace. `reply` is called exactly once with `{ ok: true, program, value, logs }` or `{ ok: false, error, program? }`.
+
+## Decision request events
+
+An extension with no screen to ask on, such as a question tool in a headless session, can hand a question to a person. `pi-fabric:decisions:capability:v1` (`FABRIC_DECISIONS_CAPABILITY_EVENT`) reports whether user-held decisions are available and their limits. `pi-fabric:decisions:request:v1` (`FABRIC_DECISION_REQUEST_EVENT`) raises a `kind: "question"` decision held by `"user"` and responds once a person answers or cancels it, or it expires. Both use the claim/respond shape and are exported from `pi-fabric/protocol`. See [Extension questions](decisions.md#extension-questions) for the fields and guarantees. An extension with a richer question interface can also show Fabric's own decisions: register it with `pi-fabric:question-renderer:register:v1` (`FABRIC_QUESTION_RENDERER_REGISTER_EVENT`); see [Question renderers](decisions.md#question-renderers).
 
 ## Managed embedded hosts
 
@@ -183,7 +222,7 @@ Trusted embedding code can opt into a closed-world provider authority:
 ```ts
 import piFabric, { FABRIC_MANAGED_HOST_VERSION } from "pi-fabric";
 
-if (FABRIC_MANAGED_HOST_VERSION !== 1) throw new Error("Unsupported managed host");
+if (FABRIC_MANAGED_HOST_VERSION !== 2) throw new Error("Unsupported managed host");
 await piFabric(pi, { managedHost: { providers: ["agents", "memory", "compact"] } });
 // Register all three host-owned implementations using the v1 registration event before activation.
 ```
@@ -196,8 +235,29 @@ idempotent; changing an implementation after activation requires a new host. Pro
 one host lifetime, and `close()` is awaited once after final publication withdrawal.
 
 Managed mode ignores ambient configuration and fixes execution to full-code TypeScript QuickJS.
+The v2 factory adds optional controls; `{ providers }` alone remains valid:
+
+```ts
+await piFabric(pi, { managedHost: {
+  providers: ["mcp"],
+  foreground: ["ask_user_questions", "ai_todo_write", "run_delegated_task"],
+  guidance: "Apply the host's workflow and receipt-reconciliation policy.",
+  skillReader: "mcp.files.read",
+  executor: { maxCpuSliceMs: 1000 },
+  compaction: "pi",
+} });
+```
+
+- `foreground` defaults to `[]`. Up to eight exact registered names can remain declared beside `fabric_exec`; Pi exposure, active-set and inherited allowlist checks still apply. Direct calls keep the same `tool_call` hooks and approval ref, prompt-cache fence and [placement reporting](#tool-placement-query). `model-only` tools do not gain a program-callable path.
+- Stable execution guidance names only the host-authorized provider namespaces and is emitted once through the execution-guidance slot. Tool and `code` descriptions stay short and refer to it. `guidance` appends trusted host instructions once to the system prompt; the existing execution guidance slot can still replace the default. Provider registration remains v1: its event and payload do not change.
+- `skillReader` names the host's dotted callable reader, for example `mcp.files.read`. Without it, Fabric omits its skill-loading instruction and delegated-skill hint. Managed hosts supply their own skill resources; Fabric does not contribute bundled coding workflows.
+- `executor.maxCpuSliceMs` defaults to `1000`, must be a positive safe integer, and limits uninterrupted guest CPU, not host-provider execution. Whole-program timeouts remain separate.
+- `compaction` is `"fabric"` by default, preserving existing behavior; `"pi"` leaves compaction to the embedding host and its saved formats.
+
+Options are copied when the host is created. Later mutation of the caller's arrays or executor object cannot widen the host policy. See the [migration and changelog](managed-host-migration.md).
+
 Native MCP, agent spawning, mesh, filesystem memory discovery, schema effects, speculative work,
-prewalk, repairs, entropy compilation, and model-visible component control are unavailable.
+prewalk, repairs, entropy compilation, Jev, and model-visible component control are unavailable.
 A supplied memory implementation remains discoverable without enabling native memory scanning.
 Every pinned component activation/reload uses the same host replacement; it cannot resurrect a
 native provider. Non-core providers omitted from the host list expose no actions. Pi core calls
@@ -208,6 +268,36 @@ Missing or withdrawn overrides fail closed.
 The host remains responsible for OS isolation, resource loading, broker authorization and
 cancellation, and for exposing only trusted extension code. This option does not sandbox arbitrary
 host-side extensions. In particular, do not auto-load plugins from the agent's computer snapshot.
+
+## Host policy
+
+An extension that embeds Fabric for a restricted agent, such as a worker runner, can narrow that Fabric instance with `FABRIC_HOST_POLICY_EVENT` (`pi-fabric:host-policy:v1`). Unlike `managedHost`, it works for a Fabric that Pi's resource loader loaded, because no factory call is needed. Send it from the host's extension factory, before the instance runs anything. Fabric replies before `emit` returns:
+
+```ts
+import { FABRIC_HOST_POLICY_EVENT, type FabricHostPolicyReplyV1 } from "pi-fabric";
+
+let reply: FabricHostPolicyReplyV1 | undefined;
+pi.events.emit(FABRIC_HOST_POLICY_EVENT, {
+  policy: { owner: "my-host", reason: "read-only worker", deniedTools: ["write", "edit"], allowedRefs: ["agents.status"] },
+  reply: (value: FabricHostPolicyReplyV1) => { reply = value; },
+});
+if (!reply?.accepted) {
+  // Fabric is absent, too old, already sealed, or refused the policy: do not expose fabric_exec.
+}
+```
+
+An accepted reply is `{ version: 1, accepted: true, digest, enforced }`. `enforced` lists every policy field this build enforces. `digest` is a SHA-256 over the accepted policy. A refusal is `{ version: 1, accepted: false, reason }`. Fabric refuses a policy that is malformed, names a field it does not enforce, follows an earlier accepted policy, or arrives after the instance ran a program or a provider call. A request without a `reply` function gets no answer.
+
+The policy is sealed on the first program or provider call. It cannot be replaced, widened or added to after that, so no call admitted before the policy can run under it. It lasts as long as the extension instance: a new session on the same instance keeps it, and `/reload` creates a new instance that starts without one.
+
+Fabric decides from the `provider.action` ref as the program wrote it, before any provider code runs, including `describe`, `list` and `prepareArguments`. When Fabric repairs a misspelled name, such as `pi.Write` or `pi.save` for `pi.write`, it calls the provider's `describe` and `list` to find the canonical action, then decides again on that action before `prepareArguments` or the provider runs. A repaired name never reaches an action the policy refuses:
+
+- `deniedTools` refuses those names through `pi.*` and `extensions.*`. Each entry is a tool name of letters, digits, `_` and `-`. Other `pi.*` and `extensions.*` calls replay Pi `tool_call` hooks, so the host's own guards see them. While a policy is active, a non-read `pi.*` tool fails closed when no hook runner exists.
+- `deniedProviders` refuses whole providers. Each entry must be a valid provider name: lowercase letters, digits, `_` and `-`, starting with a letter. A policy with an entry that breaks either rule, such as `"MCP"` or `"mcp "`, is refused whole.
+- Every other action is refused unless it matches a host `allowedRefs` entry or is one of Fabric's fixed built-in read-only actions. An entry is an exact ref, or a prefix ending in `.*`, such as `mcp.docs.*`. The fixed set is `cache.status`, `compact.pressure`, `compact.status`, `components.describe`, `components.graph`, `components.list`, `components.status`, `memory.expand`, `memory.recall`, `memory.sessions`, `programs.get`, `programs.list`, `schema.status`, `state.get`, `state.history` and `thinking.status`. Third parties cannot register those provider names. Fabric never uses a provider's own `risk` label to allow an action.
+- Native executors (CPython, `node-process`, `bun-process`) are refused, because they run outside every tool hook.
+
+Refused actions and providers are left out of listings, search, catalogs and program type declarations.
 
 ## Principal and scope
 
@@ -317,7 +407,13 @@ export default function resultGuard(pi: ExtensionAPI) {
 }
 ```
 
-If you change only `content`, the nested sandbox value becomes the patched text. To keep a structured replacement, return the proxy envelope in `details` with a changed `result`, as in the example above. When both fields are patched, a valid changed `details.result` takes precedence. Returning `isError: true` fails the nested provider invocation.
+If you change only `content`, a string result becomes the patched text. For a structured result (an array, object, number, boolean, or null), the patch applies as follows:
+
+- Patched text that still parses as JSON, as it does after a redactor replaces a secret inside the serialized value, gives the program the parsed value.
+- A cut-off projection keeps the original value. A cut-off projection keeps the start of the JSON text, at least half of the patched text, and drops the rest, as a generic output cap does when it appends a marker. Applying that text would give the program a truncated string where it expects the value. `maxNestedResultChars` still bounds the value.
+- Any other patch replaces the value, as for a string result. A placeholder such as `[REDACTED]` reaches the program as that text, so middleware that hides a result never fails open.
+
+To replace a structured result with another value, return the proxy envelope in `details` with a changed `result`, as in the example above. When both fields are patched, a valid changed `details.result` takes precedence. Returning `isError: true` fails the nested provider invocation for any result.
 
 Pi core tools and captured extension tools skip this generic proxy, because they already replay their native `tool_call`, `tool_result`, and `tool_execution_*` lifecycle. Nested shell calls still emit their native identity: `pi.bash()` uses `toolName: "bash"`/`isBashToolResult()`, while `pi.powershell()` uses `toolName: "powershell"`/`isPowerShellToolResult()`. Proxied events act as middleware only. They create no separate persisted tool-result messages.
 

@@ -18,7 +18,8 @@ import {
   populateClaudeModelSource,
 } from "../src/ui/settings.js";
 import { buildMcpSection } from "../src/ui/settings-sections-execution.js";
-import { coerceValue } from "../src/ui/settings-values.js";
+import { buildUiSection } from "../src/ui/settings-sections-presentation.js";
+import { buildPartial, coerceValue } from "../src/ui/settings-values.js";
 import { SectionSubmenu } from "../src/ui/settings-submenus.js";
 
 const theme = {
@@ -63,6 +64,24 @@ describe("FabricSettingsComponent", () => {
     expect(source.models).toEqual([
       { provider: "claude", id: "haiku", name: "Haiku" },
     ]);
+  });
+
+  it("offers the session label settings under UI and saves them under ui.sessionLabel", () => {
+    const item = buildUiSection({
+      config: DEFAULT_FABRIC_CONFIG,
+      theme,
+      persist: () => {},
+    });
+    const submenu = item.submenu!("", () => {}) as SectionSubmenu;
+    const row = (id: string) => submenu.items.find((candidate) => candidate.id === id);
+    expect(row("ui.sessionLabel.footer")?.currentValue).toBe("true");
+    expect(row("ui.sessionLabel.footer")?.values).toEqual(["true", "false"]);
+    expect(row("ui.sessionLabel.herdr")?.currentValue).toBe("off");
+    expect(row("ui.sessionLabel.herdr")?.values).toEqual(["off", "tab", "pane", "both"]);
+    expect(buildPartial("ui.sessionLabel.footer", coerceValue("ui.sessionLabel.footer", "false", DEFAULT_FABRIC_CONFIG)))
+      .toEqual({ ui: { sessionLabel: { footer: false } } });
+    expect(buildPartial("ui.sessionLabel.herdr", coerceValue("ui.sessionLabel.herdr", "pane", DEFAULT_FABRIC_CONFIG)))
+      .toEqual({ ui: { sessionLabel: { herdr: "pane" } } });
   });
 
   it("nests Jev semantic search and a cached MCP block list under MCP", () => {

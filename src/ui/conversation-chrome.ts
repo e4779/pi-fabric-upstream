@@ -4,7 +4,8 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { ScrollViewScrollbar } from "@earendil-works/pi-tui";
 import { getConversationHost } from "./conversation-host.js";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { formatTokens, safeText } from "./format.js";
+import { formatDuration, formatTokens, safeText } from "./format.js";
+import { isActiveStatus } from "./types.js";
 import type { FabricConversationTarget } from "./conversation.js";
 
 export interface FabricConversationAppearance {
@@ -48,20 +49,35 @@ export function conversationFooter(target: FabricConversationTarget | undefined,
   const pathLine = locationWidth > 0
     ? theme.fg("dim", truncateToWidth(pwd, locationWidth, "…")) + (access ? separator + access : "")
     : truncateToWidth(access, width, "…");
-  const stats = [safeText(target.status)];
+  // Groups like Pi's own footer: tokens and cost, then the run's work and time,
+  // then context. A running target says so on its border (Working), so only a
+  // settled status (completed, failed, stopped) leads the line.
+  const groups: string[] = [];
+  if (!isActiveStatus(target.status)) groups.push(safeText(target.status));
   if (target.usage) {
     const usage = target.usage;
     // Agent usage is run-scoped; actor values describe the current/last activation.
-    stats.push("run", `↑${formatTokens(usage.input)}`, `↓${formatTokens(usage.output)}`);
-    if (usage.cacheRead > 0) stats.push(`R${formatTokens(usage.cacheRead)}`);
-    if (usage.cacheWrite > 0) stats.push(`W${formatTokens(usage.cacheWrite)}`);
-    if (Number.isFinite(usage.cost)) stats.push(`$${usage.cost.toFixed(3)}`);
+    const tokens = [`↑${formatTokens(usage.input)}`, `↓${formatTokens(usage.output)}`];
+    if (usage.cacheRead > 0) tokens.push(`R${formatTokens(usage.cacheRead)}`);
+    if (usage.cacheWrite > 0) tokens.push(`W${formatTokens(usage.cacheWrite)}`);
+    if (Number.isFinite(usage.cost)) tokens.push(`$${usage.cost.toFixed(3)}`);
+    groups.push(tokens.join(" "));
   } else {
-    stats.push("usage unavailable");
+    groups.push("usage unavailable");
   }
+  if (target.toolCalls !== undefined) groups.push(`${target.toolCalls} call${target.toolCalls === 1 ? "" : "s"}`);
+  const elapsed = target.startedAt !== undefined
+    ? formatDuration((target.finishedAt ?? Date.now()) - target.startedAt)
+    : "";
+  if (elapsed) groups.push(elapsed);
   // Cumulative run tokens are not current context occupancy. Do not invent a percentage.
-  stats.push(target.contextWindow ? `?/${formatTokens(target.contextWindow)} ctx` : "ctx ?");
-  const model = safeText(target.model ?? `${target.runner ?? ""} model unavailable`).trim();
+  groups.push(target.contextWindow ? `?/${formatTokens(target.contextWindow)} ctx` : "ctx ?");
+  const stats = [groups.join(" · ")];
+  const modelKey = safeText(target.model ?? `${target.runner ?? ""} model unavailable`).trim();
+  const separatorIndex = modelKey.indexOf("/");
+  const model = separatorIndex > 0 && separatorIndex < modelKey.length - 1
+    ? `(${modelKey.slice(0, separatorIndex)}) ${modelKey.slice(separatorIndex + 1)}`
+    : modelKey;
   const thinking = target.thinking ? ` • ${safeText(target.thinking === "off" ? "thinking off" : target.thinking)}` : "";
   const left = truncateToWidth(stats.join(" "), width, "…");
   const right = truncateToWidth(`${model}${thinking}`, Math.max(0, width - visibleWidth(left) - 2), "");

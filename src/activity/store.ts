@@ -110,6 +110,10 @@ const labelForCall = (ref: string, args: Record<string, unknown>): string => {
   return target ? `${ref} · ${target}` : ref;
 };
 
+// Providers report metrics; NaN or Infinity must not reach the totals.
+const finiteCount = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : undefined;
+
 const metricsFrom = (value: unknown): FabricActivityMetrics | undefined => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
@@ -117,11 +121,11 @@ const metricsFrom = (value: unknown): FabricActivityMetrics | undefined => {
     typeof record.usage === "object" && record.usage !== null && !Array.isArray(record.usage)
       ? (record.usage as Record<string, unknown>)
       : undefined;
-  const input = typeof usage?.input === "number" ? usage.input : 0;
-  const output = typeof usage?.output === "number" ? usage.output : 0;
+  const input = finiteCount(usage?.input) ?? 0;
+  const output = finiteCount(usage?.output) ?? 0;
   const tokens = input + output;
-  const toolCalls = typeof record.toolCalls === "number" ? record.toolCalls : undefined;
-  const cost = typeof usage?.cost === "number" ? usage.cost : undefined;
+  const toolCalls = finiteCount(record.toolCalls);
+  const cost = finiteCount(usage?.cost);
   if (tokens <= 0 && toolCalls === undefined && cost === undefined) return undefined;
   return {
     ...(tokens > 0 ? { tokens } : {}),
@@ -130,10 +134,11 @@ const metricsFrom = (value: unknown): FabricActivityMetrics | undefined => {
   };
 };
 
-const isFailedResult = (value: unknown): boolean => {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+const resultStatus = (value: unknown): "failed" | "stopped" | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const status = (value as Record<string, unknown>).status;
-  return status === "failed" || status === "stopped" || status === "timed_out";
+  if (status === "stopped") return "stopped";
+  return status === "failed" || status === "timed_out" ? "failed" : undefined;
 };
 
 // Store payloads are bounded JSON values. Freeze copies, never provider objects.
@@ -319,8 +324,9 @@ export class FabricActivityStore {
     const label = cleanText(input.label, MAX_NAME_CHARS);
     if (!label) throw new Error("Workflow activity item label must not be empty");
     const now = Date.now();
-    const status = input.status ?? "running";
     let item = run.items.find((candidate) => candidate.id === id);
+    // An update that names no status keeps the item's current one.
+    const status = input.status ?? item?.status ?? "running";
     const phaseId =
       input.phase !== undefined
         ? this.#resolvePhaseId(run, input.phase)
@@ -468,18 +474,19 @@ export class FabricActivityStore {
       const message = cleanText(update.message, MAX_DETAIL_CHARS);
       if (message) call.progress = message;
     } else if (update.type === "entity") {
-      call.entityId = cleanId(update.id, update.id);
+      call.entityId = cleanId(update.id, update.id.slice(0, 160));
       call.entityKind = update.kind;
       const name = cleanText(update.name, MAX_NAME_CHARS);
       if (name) call.label = name;
     } else if (update.type === "metrics") {
+      const tokens = finiteCount(update.tokens);
+      const toolCalls = finiteCount(update.toolCalls);
+      const cost = finiteCount(update.cost);
       call.metrics = {
         ...(call.metrics ?? {}),
-        ...(typeof update.tokens === "number" ? { tokens: Math.max(0, update.tokens) } : {}),
-        ...(typeof update.toolCalls === "number"
-          ? { toolCalls: Math.max(0, update.toolCalls) }
-          : {}),
-        ...(typeof update.cost === "number" ? { cost: Math.max(0, update.cost) } : {}),
+        ...(tokens !== undefined ? { tokens } : {}),
+        ...(toolCalls !== undefined ? { toolCalls } : {}),
+        ...(cost !== undefined ? { cost } : {}),
       };
     }
     if (before.progress === call.progress && before.entityId === call.entityId &&
@@ -506,8 +513,8 @@ export class FabricActivityStore {
     const call = this.#callIndex.get(runId)?.get(callId);
     if (!call) return;
     const now = Date.now();
-    const resultFailed = isFailedResult(input.result);
-    call.status = input.success && !resultFailed ? "completed" : "failed";
+    const reported = resultStatus(input.result);
+    call.status = !input.success ? "failed" : reported ?? "completed";
     call.updatedAt = now;
     call.finishedAt = now;
     const error = cleanText(input.error, MAX_DETAIL_CHARS);
@@ -526,7 +533,7 @@ export class FabricActivityStore {
     }
     if (typeof input.result === "object" && input.result !== null && !Array.isArray(input.result)) {
       const record = input.result as Record<string, unknown>;
-      if (typeof record.id === "string") call.entityId = cleanId(record.id, record.id);
+      if (typeof record.id === "string") call.entityId = cleanId(record.id, record.id.slice(0, 160));
       if (call.kind === "agent") call.entityKind = "agent";
       if (call.kind === "actor") call.entityKind = "actor";
       if (!error && typeof record.error === "string") {
@@ -538,11 +545,11 @@ export class FabricActivityStore {
     this.#emit(run, call);
   }
 
-  finish(runId: string, success: boolean, error?: string): void {
+  /** `cancelled` comes from the caller's abort signal, never from error text. */
+  finish(runId: string, success: boolean, error?: string, cancelled = false): void {
     const run = this.#runs.get(runId);
     if (!run || run.status !== "running") return;
     const now = Date.now();
-    const cancelled = Boolean(error && /cancel(?:led|ed)/i.test(error));
     run.status = success ? "completed" : cancelled ? "cancelled" : "failed";
     run.updatedAt = now;
     run.finishedAt = now;

@@ -1,4 +1,5 @@
 import type { FabricTraceJsonValue } from "./trace.js";
+import { ACTION_POLICY_HOOK_NAME_PATTERN } from "../core/action-policy-hooks.js";
 
 export interface FabricAuditProjection {
   value: { [key: string]: FabricTraceJsonValue };
@@ -133,6 +134,8 @@ const idOnlyAgentActions = new Set([
   "agents.join",
   "agents.status",
   "agents.stop",
+  "agents.sleep",
+  "agents.wake",
   "agents.cleanup",
   "agents.ask",
   "agents.tell",
@@ -306,6 +309,10 @@ export const projectFabricAuditResult = (
       copyIdentifier(output, record, "decision");
       copyIdentifier(output, record, "model");
       copyNumber(output, record, "at");
+      // Hook names are validated at registration; "@scope/name" is allowed there.
+      if (typeof record.policyHook === "string" && ACTION_POLICY_HOOK_NAME_PATTERN.test(record.policyHook)) {
+        output.policyHook = record.policyHook;
+      }
     });
   }
   if (ref === "fabric.participant.stop") {

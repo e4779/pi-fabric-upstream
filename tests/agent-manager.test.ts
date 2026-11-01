@@ -4,6 +4,9 @@ import path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
+import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
+import { EXACT_MODEL_FORM_ERROR, EXACT_MODEL_RUNNER_ERROR } from "../src/core/model-resolution.js";
+import { modelPinFailure } from "../src/agents/model-pin.js";
 import type { FabricLifecyclePublishRequest } from "../src/lifecycle/types.js";
 import { snapshotHandoffSession } from "../src/agents/handoff.js";
 import {
@@ -131,6 +134,28 @@ describe("AgentManager", () => {
     const beforeCleanup = listener.mock.calls.length;
     await manager.cleanup(result.id);
     expect(listener).toHaveBeenCalledTimes(beforeCleanup);
+  });
+
+  it("lists unsettled runs as activity and notifies when one settles", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+    });
+    managers.push(manager);
+    expect(manager.activity()).toEqual([]);
+    const done = await manager.run({ task: "Finish at once", transport: "process" });
+    expect(done.status).toBe("completed");
+    expect(manager.activity()).toEqual([]);
+    const listener = vi.fn();
+    manager.subscribeUi(listener);
+    const handle = await manager.spawn({ name: "scout", task: "HANG", transport: "process" });
+    expect(manager.activity()).toEqual([{ id: handle.id, name: "scout" }]);
+    listener.mockClear();
+    await manager.stop(handle.id);
+    expect(listener).toHaveBeenCalled();
+    expect(manager.activity()).toEqual([]);
   });
 
   it("runs a worker through the direct process transport", async () => {
@@ -368,6 +393,146 @@ describe("AgentManager", () => {
     ]);
   });
 
+  it("prepares an exact-match model under the same mode and keeps it apart from a default preparation", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined, options?: { modelMatch?: "exact" }) => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      return options?.modelMatch === "exact" ? model : "provider/alias-target";
+    });
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+      preparePiModel,
+    });
+    managers.push(manager);
+
+    // Concurrent launches of one selector under different modes must not share a preparation.
+    const [exact, loose] = await Promise.all([
+      manager.run({ task: "Exact child", model: "provider/model-a", modelMatch: "exact", transport: "process" }),
+      manager.run({ task: "Default child", model: "provider/model-a", transport: "process" }),
+    ]);
+
+    expect(exact).toMatchObject({ status: "completed", model: "provider/model-a" });
+    expect(loose).toMatchObject({ status: "completed", model: "provider/alias-target" });
+    expect(preparePiModel).toHaveBeenCalledTimes(2);
+    expect(preparePiModel.mock.calls.map(([, options]) => options?.modelMatch).sort())
+      .toEqual(["exact", undefined]);
+  });
+
+  it("refuses modelMatch exact before preparation or any run directory when the request cannot be exact", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined) => model);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker.mjs"),
+      runRoot: root,
+      preparePiModel,
+    });
+    managers.push(manager);
+
+    await expect(manager.spawn({ task: "t", modelMatch: "exact" })).rejects.toThrow(EXACT_MODEL_FORM_ERROR);
+    await expect(manager.spawn({ task: "t", modelMatch: "exact", model: "fast" })).rejects.toThrow(EXACT_MODEL_FORM_ERROR);
+    await expect(manager.spawn({ task: "t", modelMatch: "exact", runner: "claude", model: "claude/sonnet" }))
+      .rejects.toThrow(EXACT_MODEL_RUNNER_ERROR);
+    await expect(manager.spawn({ task: "t", model: "provider/model-a", modelMatch: "fuzzy" } as never))
+      .rejects.toThrow(/Invalid Fabric agent modelMatch/);
+    expect(preparePiModel).not.toHaveBeenCalled();
+    expect(fs.readdirSync(root)).toEqual([]);
+  });
+
+  it("re-prepares an exact-match model under the same mode when a startup retry relaunches it", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const preparePiModel = vi.fn(async (model: string | undefined, _options?: { modelMatch?: "exact" }) => model);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"),
+      runRoot: root,
+      preparePiModel,
+    });
+    managers.push(manager);
+
+    const result = await manager.run({
+      task: "Recover startup", model: "provider/model-a", modelMatch: "exact", transport: "process",
+    });
+
+    expect(result.status).toBe("completed");
+    expect(preparePiModel.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(preparePiModel.mock.calls.map(([, options]) => options?.modelMatch)).toEqual(
+      preparePiModel.mock.calls.map(() => "exact"),
+    );
+  });
+
+  const workerAttempts = (root: string): string[][] => {
+    const files = fs.readdirSync(root).map((entry) => path.join(root, entry, "worker-args.jsonl")).filter((file) => fs.existsSync(file));
+    expect(files).toHaveLength(1);
+    return fs.readFileSync(files[0]!, "utf8").trim().split("\n").map((line) => JSON.parse(line) as string[]);
+  };
+  const flag = (args: string[], name: string): string | undefined => args[args.indexOf(name) + 1];
+
+  it("forces strict model admission and the pin flag for an exact request, on the first launch and on every retry, whatever agents.modelAdmission says", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, modelAdmission: "permissive" }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"),
+      runRoot: root,
+      preparePiModel: async (model) => model,
+    });
+    managers.push(manager);
+
+    const result = await manager.run({
+      task: "Recover startup", model: "provider/model-a", modelMatch: "exact", transport: "process",
+    });
+
+    expect(result.status).toBe("completed");
+    const attempts = workerAttempts(root);
+    expect(attempts.length).toBeGreaterThanOrEqual(2);
+    for (const args of attempts) {
+      expect(flag(args, "--model-admission")).toBe("strict");
+      expect(flag(args, "--model-match")).toBe("exact");
+      expect(flag(args, "--model")).toBe("provider/model-a");
+    }
+  });
+
+  it("keeps the configured admission and sends no pin flag for a default request", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, modelAdmission: "permissive" }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"),
+      runRoot: root,
+      preparePiModel: async (model) => model,
+    });
+    managers.push(manager);
+
+    await manager.run({ task: "Recover startup", model: "provider/model-a", transport: "process" });
+
+    for (const args of workerAttempts(root)) {
+      expect(flag(args, "--model-admission")).toBe("permissive");
+      expect(args).not.toContain("--model-match");
+    }
+  });
+
+  it("describes systemPrompt in the order the worker uses: the caller's text ahead of component guidance", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"),
+      runRoot: root,
+      resolveParticipantGuidance: () => "COMPONENT GUIDANCE",
+    });
+    managers.push(manager);
+
+    await manager.run({ task: "Recover startup", model: "provider/model-a", systemPrompt: "CALLER PROMPT", transport: "process" });
+
+    const prompt = flag(workerAttempts(root)[0]!, "--system-prompt")!;
+    expect(prompt.indexOf("CALLER PROMPT")).toBeGreaterThanOrEqual(0);
+    expect(prompt.indexOf("CALLER PROMPT")).toBeLessThan(prompt.indexOf("COMPONENT GUIDANCE"));
+    const run = AGENTS_ACTION_DESCRIPTORS.find((entry) => entry.name === "run")!;
+    const help = (run.inputSchema as { properties: { systemPrompt: { description: string } } }).properties.systemPrompt.description;
+    expect(help).toMatch(/ahead of any component guidance/);
+    expect(help).not.toMatch(/below component guidance/);
+  });
+
   it("validates the configured Pi model default before launching", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
     roots.push(root);
@@ -425,6 +590,40 @@ describe("AgentManager", () => {
       fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"),
     ).toBe("1");
   });
+
+  it("launches an exact run once when its pin error spells a credential error", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"),
+      runRoot: root,
+      preparePiModel: async (model) => model,
+    });
+    managers.push(manager);
+
+    const result = await manager.run({ task: "Pin violation", model: "lab/pinned", modelMatch: "exact", transport: "process" });
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe(modelPinFailure({ pinned: "lab/pinned", actual: "lab/missing credentials" }));
+    expect(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8")).toBe("1");
+  });
+
+  it("still retries that credential-looking error when the run is not an exact one", async () => {
+    // Control: the pin rule is what stops the retry, not the error text.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-startup-retry.mjs"),
+      runRoot: root,
+      preparePiModel: async (model) => model,
+    });
+    managers.push(manager);
+
+    const result = await manager.run({ task: "Pin violation", model: "lab/pinned", transport: "process" });
+
+    expect(result.status).toBe("failed");
+    expect(Number(fs.readFileSync(path.join(manager.runDirectory(result.id)!, "startup-attempts"), "utf8"))).toBeGreaterThan(1);
+  }, 30_000);
 
   it("retries a child whose transport exits before producing a result", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-manager-"));
@@ -827,7 +1026,8 @@ describe("AgentManager", () => {
       capabilityRequirements: ["pi.read"],
     });
     expect(result.status).toBe("completed");
-    const tools = allowlist === 'invalid' ? ["fabric_exec"] : ["read", "fabric_exec"];
+    // Malformed inherited authority fails closed: no optional tools and no fabric_exec.
+    const tools = allowlist === 'invalid' ? [] : ["read", "fabric_exec"];
     expect(JSON.parse(result.text)).toMatchObject({
       cwd: fs.realpathSync(target), trustFlags: [], tools, toolAllowlistEnv: tools,
       grantedRisksEnv: ["agent"], fullCodeModeEnv: "true", extensions: true,
@@ -1174,6 +1374,42 @@ describe("AgentManager", () => {
     );
   });
 
+  it("rechecks the recursion budget after a queued run gets a slot", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-budget-queue-"));
+    roots.push(root);
+    const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, maxConcurrent: 1, budgetUsd: 0.1 }, {
+      workerPath: path.resolve("tests/fixtures/fake-worker-budget.mjs"), runRoot: root,
+    });
+    managers.push(manager);
+    const first = await manager.spawn({ task: "COST 0.1 DELAY 300", transport: "process" });
+    const queued = await manager.spawn({ task: "COST 0.01", transport: "process", queue: true });
+    expect(queued.status).toBe("queued");
+    const next = await manager.spawn({ task: "COST 0.01", transport: "process", queue: true });
+    expect((await manager.wait(first.id)).status).toBe("completed");
+    const result = await manager.wait(queued.id);
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/budget exceeded/);
+    expect(fs.existsSync(path.join(root, queued.id))).toBe(false);
+    const nextResult = await manager.wait(next.id);
+    expect(nextResult.status).toBe("failed");
+    expect(nextResult.error).toMatch(/budget exceeded/);
+    expect(fs.existsSync(path.join(root, next.id))).toBe(false);
+  });
+
+  it("refuses a nonfinite accumulated budget observation before spawning a child", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-budget-invalid-"));
+    roots.push(root);
+    process.env.PI_FABRIC_BUDGET = "0.05";
+    process.env.PI_FABRIC_BUDGET_FILE = path.join(root, "tree-cost.jsonl");
+    process.env.PI_FABRIC_BUDGET_ID = "invalid-observation";
+    fs.writeFileSync(process.env.PI_FABRIC_BUDGET_FILE, '{"cost":"Infinity"}\n{"cost":"-Infinity"}\n');
+    try {
+      const manager = new AgentManager(process.cwd(), DEFAULT_FABRIC_CONFIG.agents, { workerPath: path.resolve("tests/fixtures/fake-worker-budget.mjs"), runRoot: root });
+      managers.push(manager);
+      await expect(manager.spawn({ task: "must not run", transport: "process" })).rejects.toThrow(/budget exceeded/);
+    } finally { clearOwnedBudgetEnv(); }
+  });
+
   it("inherits a budget ledger from the environment for recursive children", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-budget-"));
     roots.push(root);
@@ -1308,6 +1544,7 @@ describe("AgentManager multimodal prompts", () => {
       const frame = JSON.parse(fs.readFileSync(promptLog, "utf8")) as Record<string, unknown>;
       expect(frame).toEqual({
         type: "prompt",
+        id: "fabric-task",
         message: "Inspect the attached image",
         images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
       });
@@ -1650,6 +1887,51 @@ describe("AgentManager steering", () => {
       delete process.env.FAKE_PI_STEER_LOG;
     }
   });
+
+  it("forwards every steer command when one poll reads more than the per-poll limit", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-steer-"));
+    roots.push(root);
+    fs.chmodSync(fakePiSteer, 0o755);
+    const received = path.join(root, "received.jsonl");
+    process.env.FAKE_PI_STEER_LOG = received;
+    const readSteers = (): string[] =>
+      fs.existsSync(received)
+        ? fs
+            .readFileSync(received, "utf8")
+            .split("\n")
+            .filter((line) => line.trim())
+            .map((line) => JSON.parse(line) as Record<string, unknown>)
+            .filter((entry) => entry.type === "steer")
+            .map((entry) => String(entry.message))
+        : [];
+    try {
+      const manager = new AgentManager(process.cwd(), { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" }, {
+        workerPath: path.resolve("src/worker.ts"),
+        piBinary: fakePiSteer,
+        runRoot: root,
+        fullCodeMode: false,
+      });
+      managers.push(manager);
+      const handle = await manager.spawn({ task: "STEER_ME", transport: "process" });
+      await waitFor(
+        () => fs.existsSync(received) && fs.readFileSync(received, "utf8").includes('"type":"prompt"'),
+        10_000,
+      );
+      // 300 small commands fit in one 256 KiB read but exceed the 256-command
+      // per-poll bound, so the worker must carry the rest to a later poll.
+      const expected = Array.from({ length: 300 }, (_, index) => `step-${index}`);
+      const steerFile = path.join(manager.runDirectory(handle.id)!, "steer.jsonl");
+      fs.appendFileSync(
+        steerFile,
+        expected.map((message) => JSON.stringify({ type: "steer", message }) + "\n").join(""),
+      );
+      await waitFor(() => readSteers().length >= expected.length, 5_000).catch(() => undefined);
+      expect(readSteers()).toEqual(expected);
+      await manager.stop(handle.id);
+    } finally {
+      delete process.env.FAKE_PI_STEER_LOG;
+    }
+  }, 20_000);
 
   it("forwards a follow_up and a queue mode to the child pi over RPC", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-steer-"));

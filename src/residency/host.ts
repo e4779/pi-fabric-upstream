@@ -12,8 +12,9 @@ import {
 } from "../core/atomic-write.js";
 import {
   normalizeModelAliases,
-  resolveAvailablePiModel,
+  resolvePiModelSelector,
   type FabricModelCandidate,
+  type FabricModelMatch,
 } from "../core/model-resolution.js";
 import { loadModelUsage } from "../core/model-usage.js";
 import {
@@ -23,6 +24,8 @@ import {
 import { ActorDirectory } from "../actors/directory.js";
 import type { FabricActorInfo } from "../actors/types.js";
 import { AgentManager } from "../agents/manager.js";
+import { cancelOrphanedChildQuestions, routeChildQuestion } from "../decisions/host.js";
+import { DecisionStore } from "../decisions/store.js";
 import { launchScope } from "../scope.js";
 import { useBudgetLedger } from "../agents/budget-ledger.js";
 import { LifecycleBroker } from "../lifecycle/broker.js";
@@ -180,6 +183,7 @@ class ResidentHost {
   readonly agents: AgentManager;
   readonly actors: ActorDirectory;
   readonly lifecycle: LifecycleBroker;
+  readonly #decisions: DecisionStore;
   readonly #ownerPath: string;
   readonly #lockPath: string;
   readonly #errorPath: string;
@@ -212,7 +216,9 @@ class ResidentHost {
     this.#responsesPath = path.join(config.residencyRoot, "responses");
     this.#agentsPath = path.join(config.residencyRoot, "agents");
     this.#deliveryPrefix = residentDeliveryPrefix(config.rootId);
-    this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents);
+    this.mesh = new MeshStore(config.meshRoot, config.mesh.maxEventBytes, config.mesh.maxReadEvents, {
+      durability: config.mesh.durability,
+    });
     this.control = new FabricControlPlane(this.mesh, this.identity, {
       enabled: true,
       hostId: this.hostId,
@@ -240,7 +246,7 @@ class ResidentHost {
       readJson<Partial<ResidentHostConfig>>(guidanceConfigPath) ?? config;
     const currentModelGuidance = () =>
       parseFabricOwnedModelGuidance(currentConfig().modelGuidance ?? config.modelGuidance);
-    const resolveResidentPiModel = (selector?: string): string => {
+    const resolveResidentPiModel = (selector?: string, modelMatch?: FabricModelMatch): string => {
       const state = currentConfig().piModels ?? config.piModels;
       const available: FabricModelCandidate[] = Array.isArray(state?.available)
         ? state.available.flatMap((candidate) =>
@@ -254,13 +260,24 @@ class ResidentHost {
           )
         : [];
       const query = selector?.trim() || state?.defaultModel?.trim() || "";
-      const resolved = resolveAvailablePiModel(query, {
+      const resolved = resolvePiModelSelector(query, {
         aliases: normalizeModelAliases(state?.aliases),
         available,
         lastUsed: loadModelUsage(),
-      });
+      }, modelMatch);
       return `${resolved.provider}/${resolved.id}`;
     };
+    // agents.childQuestions "route": this host has no UI, so a durable child's
+    // dialog always becomes a root-held decision in the project mesh, answered
+    // by a root session or the decisions CLI. The run's settlement cancels it, and
+    // so does detaching a durable hosted run at shutdown (see #startOwned for a
+    // host that died instead).
+    this.#decisions = new DecisionStore(this.mesh, {
+      id: this.identity.id,
+      name: this.identity.name,
+      kind: this.identity.kind,
+      sessionId: config.sessionId,
+    });
     this.agents = new AgentManager(config.cwd, config.agents, {
       workerPath: config.workerPath,
       fabricExtensionPath: config.fabricExtensionPath,
@@ -278,7 +295,7 @@ class ResidentHost {
       hostId: this.hostId,
       identityId: this.identity.id,
       retention: config.retention,
-      preparePiModel: async (model) => resolveResidentPiModel(model),
+      preparePiModel: async (model, options) => resolveResidentPiModel(model, options?.modelMatch),
       resolveParticipantGuidance: ({ model }) => {
         if (!model) return undefined;
         return resolveFabricModelGuidance(currentModelGuidance(), {
@@ -288,6 +305,7 @@ class ResidentHost {
         }).appendText || undefined;
       },
       onLifecycle: (event) => void this.lifecycle?.publish(event).catch(() => undefined),
+      onChildQuestion: (request) => routeChildQuestion(request, { store: this.#decisions }),
       onBackgroundComplete: (result) => {
         if (!config.agents.notifyOnComplete) return;
         const durationMs = Math.max(0, (result.finishedAt ?? Date.now()) - result.startedAt);
@@ -375,6 +393,16 @@ class ResidentHost {
     fs.mkdirSync(this.#responsesPath, { recursive: true, mode: 0o700 });
     fs.mkdirSync(this.#agentsPath, { recursive: true, mode: 0o700 });
     this.#recoverInterruptedRequests();
+    // An earlier host that died left its routed questions open, and their answers
+    // would reach nothing. Cancel them before re-attaching runs, whose runners ask
+    // again through this host. A failure must not stop startup, but it leaves those
+    // decisions open, so report it on stderr; the launcher keeps it in child-stderr.log.
+    await cancelOrphanedChildQuestions(this.#decisions).catch((error: unknown) => {
+      process.stderr.write(
+        `[pi-fabric] resident host ${this.hostId} could not cancel orphaned child questions at startup: ${errorMessage(error)}\n`,
+      );
+      return [];
+    });
     await this.#recoverHostedRuns();
     const firstSeenAgents = new Map<string, number>();
     this.participants.registerSource(() =>
@@ -825,6 +853,8 @@ class ResidentHost {
     }
     for (const module of modules) await loadRunnerModule(module).catch(() => undefined);
     await this.agents.recoverHostedRuns().catch(() => []);
+    // Opted-in pi-durable worker runs (agents.durableWorkerRecovery at launch).
+    await this.agents.recoverWorkerRuns().catch(() => []);
   }
 
   #recoverInterruptedRequests(): void {

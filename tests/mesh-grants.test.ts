@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createMeshGrant,
   listMeshGrants,
@@ -48,6 +48,32 @@ afterEach(() => {
 });
 
 describe("scoped external mesh grants", () => {
+  it("flushes grants.json before returning when the store is durable", async () => {
+    const durable = new MeshStore(path.join(tempRoot(), "mesh"), 64 * 1024, 100, { durability: "fsync" });
+    const realOpen = fs.openSync;
+    const names = new Map<number, string>();
+    vi.spyOn(fs, "openSync").mockImplementation(((target: fs.PathLike, ...rest: unknown[]) => {
+      const descriptor = (realOpen as (...args: unknown[]) => number)(target, ...rest);
+      names.set(descriptor, path.basename(String(target)));
+      return descriptor;
+    }) as typeof fs.openSync);
+    const flushed: string[] = [];
+    const realFsync = fs.fsyncSync;
+    vi.spyOn(fs, "fsyncSync").mockImplementation((descriptor: number) => {
+      flushed.push(names.get(descriptor) ?? "?");
+      realFsync(descriptor);
+    });
+    try {
+      const { grant } = await createMeshGrant(durable, { topic: "ci.hooks", ttlMs: 60_000, uses: 1, createdBy: identity });
+      expect(flushed.some((name) => name.startsWith("grants.json."))).toBe(true);
+      flushed.length = 0;
+      await revokeMeshGrant(durable, grant.grantId);
+      expect(flushed.some((name) => name.startsWith("grants.json."))).toBe(true);
+    } finally {
+      vi.restoreAllMocks();
+    }
+  });
+
   it("stores only a hash in a private file and never lists tokens", async () => {
     const mesh = store();
     const { grant, token } = await createMeshGrant(mesh, { topic: "ci.hooks", ttlMs: 60_000, uses: 3, createdBy: identity });

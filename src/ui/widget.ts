@@ -2,17 +2,9 @@ import type { Component, Focusable, TuiMouseEvent, TuiMouseEventResult } from "@
 import { matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { FabricUiWidgetMode } from "../config.js";
-import { spinnerFrame } from "./spinner.js";
 import { FabricWidgetRetention, isRecentWidgetCompletion } from "./retention.js";
-import { FABRIC_CONVERSATION_HINT } from "./conversation-shortcut.js";
-import type { FabricAgentTranscript } from "./transcript.js";
-import {
-  FABRIC_WIDGET_FOCUS_HINT,
-  FABRIC_WIDGET_FOCUS_SHORTCUT,
-  WIDGET_ACTIVITY_ROWS,
-  widgetActivityLines,
-  widgetDivider,
-} from "./widget-activity.js";
+import { FABRIC_WIDGET_FOCUS_HINT, FABRIC_WIDGET_FOCUS_SHORTCUT } from "./widget-keys.js";
+import type { FabricShellJobInfo } from "../core/shell-jobs.js";
 import type {
   FabricActivityRun,
   FabricActivityStatus,
@@ -25,15 +17,11 @@ import {
   type FabricUiAgent,
 } from "./types.js";
 
-const statusGlyph = (status: string): string => {
-  if (status === "completed" || status === "done" || status === "exited") return "✓";
-  if (status === "failed" || status === "timed_out") return "✗";
-  if (status === "blocked") return "!";
-  if (status === "stopped" || status === "cancelled" || status === "killed") return "■";
-  if (status === "queued" || status === "pending" || status === "ready") return "○";
-  if (status === "idle" || status === "state") return "·";
-  return spinnerFrame();
-};
+/**
+ * Claude Code's list marker: a hollow circle per row, filled for the row in
+ * view. Status is the circle's colour, so the shape never jumps.
+ */
+const circle = (selected: boolean): string => (selected ? "●" : "○");
 
 const colorStatus = (theme: Theme, status: string, value: string): string => {
   if (status === "completed" || status === "done" || status === "exited") return theme.fg("success", value);
@@ -75,57 +63,138 @@ const totalCost = (
     .filter((agent) => (run ? agent.runId === run.id : isActiveStatus(agent.status)))
     .reduce((sum, agent) => sum + (agent.usage?.cost ?? 0), 0);
 
-/** A widget row that can be selected and expanded to show its live activity. */
+/** A widget row that can be selected and opened. */
 export interface FabricWidgetRow {
-  /** Agent id, or actor id for an actor's worker row. */
+  /**
+   * Agent id, actor id for an actor's worker row, the main session's id, a
+   * or the exact shell task id.
+   */
   id: string;
-  kind: "agent" | "actor";
+  kind: "main" | "agent" | "actor" | "shell";
   name: string;
+  model?: string;
 }
 
 /** Optional interaction wiring; without it the widget stays a passive status box. */
 export interface FabricWidgetInteraction {
-  /** Live activity for an expanded row, read from the participant's event log. */
-  activity: (row: FabricWidgetRow) => FabricAgentTranscript | undefined;
+  /** Open the participant's full conversation, where it can be read and steered. */
+  open?: (row: FabricWidgetRow) => void;
   /**
    * Return focus to the editor. `forward` is a key the widget does not use; the
    * editor receives it, because Pi handles Ctrl+C and extension shortcuts there.
    */
   release: (forward?: string) => void;
-  /** Pi's hideThinkingBlock: the pane keeps the thinking marker and drops its text. */
-  hideThinking?: () => boolean;
-  /** Ask the host to redraw (selection and expansion change without a snapshot change). */
+  /** Ask the host to redraw (selection changes without a snapshot change). */
   requestRender: () => void;
+  /** Called after each render, so the host can check where the widget sits. */
+  rendered?: () => void;
+  /** Space left after native UI and other extensions; zero temporarily hides the list. */
+  availableRows?: (width: number) => number | undefined;
+  /** The participant on screen; its row keeps the filled circle. Undefined means the main session. */
+  viewing?: () => string | undefined;
+  /** The main session's id, which makes the header a row to select, for windows Main is a place to return to. */
+  mainId?: string;
+  /** False drops the key hints, where the list is the window's only navigation. */
+  hints?: boolean;
+  /**
+   * With no row to select (no agent, actor worker, or shell task), the widget
+   * draws no lines while this is true: the host shows any session label
+   * elsewhere, on the editor border.
+   */
+  collapseIdle?: () => boolean;
 }
 
-const agentLines = (
+/** Model id without its provider prefix: `anthropic/claude-opus-5-5` → `claude-opus-5-5`. */
+const modelName = (model: string | undefined): string | undefined =>
+  model ? safeText(model.slice(model.lastIndexOf("/") + 1)).trim() || undefined : undefined;
+
+/**
+ * Progressive disclosure for one line: `lead` (circle and name) always shows.
+ * When the line is too wide, `detail` statistics drop from their end first,
+ * then `flexible` (a title or the current activity) is shortened, and key
+ * `hints` drop last, so a narrow terminal keeps the keys before the numbers.
+ */
+const fitLine = (
+  theme: Theme,
+  width: number,
+  lead: string,
+  flexible: { text: string; gap: string; color: "muted" | "dim" } | undefined,
+  detail: string[],
+  hints: string[],
+): string => {
+  const separator = theme.fg("dim", " · ");
+  const compose = (flex: string | undefined, details: number, hintCount: number): string => {
+    const tail = [...detail.slice(0, details), ...hints.slice(0, hintCount)];
+    return `${lead}${flex ? `${flexible!.gap}${theme.fg(flexible!.color, flex)}` : ""}${
+      tail.length > 0 ? `${separator}${tail.map((part) => theme.fg("dim", part)).join(separator)}` : ""
+    }`;
+  };
+  let details = detail.length;
+  let hintCount = hints.length;
+  let flex = flexible?.text;
+  while (details > 0 && visibleWidth(compose(flex, details, hintCount)) > width) details--;
+  if (flex && visibleWidth(compose(flex, details, hintCount)) > width) {
+    const room = width - visibleWidth(compose(undefined, details, hintCount)) - visibleWidth(flexible!.gap);
+    flex = room >= 6 ? truncateToWidth(flex, room, "…") : undefined;
+  }
+  while (hintCount > 0 && visibleWidth(compose(flex, details, hintCount)) > width) hintCount--;
+  return truncateToWidth(compose(flex, details, hintCount), width, "…");
+};
+
+/** Parents before their children, so nesting reads as a tree; `depth` is the indent within the listed set. */
+const treeOrder = (agents: FabricUiAgent[]): Array<{ agent: FabricUiAgent; depth: number }> => {
+  const ids = new Set(agents.map((agent) => agent.id));
+  const children = new Map<string, FabricUiAgent[]>();
+  const roots: FabricUiAgent[] = [];
+  for (const agent of agents) {
+    const parentId = agent.parentId;
+    if (parentId && parentId !== agent.id && ids.has(parentId)) {
+      children.set(parentId, [...(children.get(parentId) ?? []), agent]);
+    } else roots.push(agent);
+  }
+  const ordered: Array<{ agent: FabricUiAgent; depth: number }> = [];
+  const seen = new Set<string>();
+  const visit = (agent: FabricUiAgent, depth: number): void => {
+    if (seen.has(agent.id)) return;
+    seen.add(agent.id);
+    ordered.push({ agent, depth });
+    for (const child of children.get(agent.id) ?? []) visit(child, depth + 1);
+  };
+  for (const root of roots) visit(root, 0);
+  // Parents that point at each other leave a cycle with no root: list each such
+  // agent as a root instead of hiding it.
+  for (const agent of agents) visit(agent, 0);
+  return ordered;
+};
+
+const agentLine = (
   theme: Theme,
   agent: FabricUiAgent,
   now: number,
-): string[] => {
-  const status = colorStatus(theme, agent.status, statusGlyph(agent.status));
-  const activity =
-    agent.currentTool ??
-    (agent.error
-      ? `error: ${truncateToWidth(safeText(agent.error), 48)}`
-      : agent.text && !isActiveStatus(agent.status)
-        ? `result: ${truncateToWidth(safeText(agent.text), 48)}`
-        : agent.status === "running"
-          ? "thinking"
-          : agent.status);
+  depth: number,
+  selected: boolean,
+  width: number,
+): string => {
+  const status = colorStatus(theme, agent.status, circle(selected));
+  const live = isActiveStatus(agent.status);
+  const activity = live
+    ? agent.milestone ?? agent.currentTool ?? (agent.status === "running" ? "thinking" : agent.status)
+    : agent.error
+      ? `error: ${safeText(agent.error)}`
+      : agent.text
+        ? `result: ${safeText(agent.text)}`
+        : agent.status;
   const metrics = [
-    agent.toolCalls !== undefined ? `${agent.toolCalls} calls` : undefined,
+    modelName(agent.model),
+    agent.toolCalls !== undefined ? `${agent.toolCalls} call${agent.toolCalls === 1 ? "" : "s"}` : undefined,
     agent.usage ? `${formatTokens(agent.usage.input + agent.usage.output)} tok` : undefined,
     agent.startedAt
       ? formatDuration((agent.finishedAt ?? now) - agent.startedAt)
       : undefined,
   ].filter((value): value is string => Boolean(value));
-  const indent = "  ".repeat(1 + Math.max(0, agent.nestingDepth ?? 0));
-  return [
-    `${indent}${status} ${theme.fg("muted", safeText(agent.name))}  ${theme.fg("muted", safeText(activity))}${
-      metrics.length > 0 ? theme.fg("dim", ` · ${metrics.join(" · ")}`) : ""
-    }`,
-  ];
+  const name = safeText(agent.name);
+  const lead = `${"  ".repeat(depth)}${status} ${selected ? theme.bold(name) : theme.fg("muted", name)}`;
+  return fitLine(theme, width, lead, { text: safeText(activity).replace(/\s+/g, " ").trim(), gap: "  ", color: "muted" }, metrics, []);
 };
 
 export const shouldShowFabricWidget = (
@@ -136,6 +205,8 @@ export const shouldShowFabricWidget = (
   if (mode === "hidden") return false;
   if (mode === "always") return true;
   retention.sync(snapshot);
+  // A labelled root keeps its header row, so the label always has a home.
+  if (snapshot.sessionLabel) return true;
   if (snapshot.shells?.some(job => job.finishedAt === undefined || isRecentWidgetCompletion(job.finishedAt, snapshot.now))) return true;
   if (snapshot.agents.some((agent) => retention.visible(agent, snapshot))) return true;
   if (snapshot.actors.some((actor) => actor.status !== "stopped")) return true;
@@ -166,17 +237,17 @@ export const widgetRowLimit = (maxRows: number, terminalRows?: number): number =
 };
 
 /**
- * Row budget while an activity pane is open. Expanding is an explicit request
- * for more room, so the widget may use its whole terminal share instead of
- * `maxRows`, but never more than that share.
+ * Row budget while the widget has focus. Focus is a request to see the list,
+ * so it may use its whole terminal share instead of `maxRows`, but never more.
  */
-export const widgetExpandedRowLimit = (maxRows: number, terminalRows?: number): number => {
+export const widgetFocusedRowLimit = (maxRows: number, terminalRows?: number): number => {
   const limit = widgetRowLimit(maxRows, terminalRows);
-  if (terminalRows === undefined || !Number.isFinite(terminalRows) || terminalRows <= 0) {
-    return limit + 2 + WIDGET_ACTIVITY_ROWS;
-  }
+  if (terminalRows === undefined || !Number.isFinite(terminalRows) || terminalRows <= 0) return limit;
   return Math.max(limit, Math.floor(terminalRows * WIDGET_TERMINAL_ROW_SHARE));
 };
+
+/** Pointer-only Main row id; distinct from no hover in the render-cache key. */
+const HEADER_ROW = "\0main";
 
 export class FabricWidget implements Component, Focusable {
   constructor(
@@ -193,55 +264,56 @@ export class FabricWidget implements Component, Focusable {
   /** Set by the TUI when the widget gains or loses keyboard focus. */
   focused = false;
   #selectedId: string | undefined;
-  #expandedId: string | undefined;
-  #activityScroll = 0;
-  #activityMaxScroll = 0;
-  #paneRows = WIDGET_ACTIVITY_ROWS;
-  /** Participant rows of the last render, with their line index in the output. */
+  /** Row under the pointer; it draws like the selection, as Claude Code's hover does. */
+  #hoveredId: string | undefined;
+  /** Selectable rows of the last render, with their line index below the spacer. */
   #rows: Array<FabricWidgetRow & { line: number }> = [];
-  #renderedFocus = false;
-  #renderedSelection: string | undefined;
-  #renderedExpansion: string | undefined;
+  /** Rows above the header in the last render: the spacer, or none on a one-row budget. */
+  #spacerRows = 1;
+  #renderedInteraction: string | undefined;
 
-  /** Id of the row whose activity pane is open, if any. */
-  get expandedId(): string | undefined {
-    return this.#expandedId;
-  }
-
-  /** Select the first participant row; used when focus arrives from the keyboard. */
+  /** Select the row on screen, or the first row; used when focus arrives from the keyboard. */
   selectDefault(): void {
     const rows = this.#selectableRows();
-    if (!rows.some((row) => row.id === this.#selectedId)) this.#selectedId = this.#expandedId ?? rows[0]?.id;
+    if (rows.some((row) => row.id === this.#selectedId)) return;
+    const viewing = this.interaction?.viewing?.();
+    this.#selectedId = rows.find((row) => row.id === viewing)?.id ?? rows[0]?.id;
+  }
+
+  /** Select the top row; ↓ from the editor lands on the row next to it. */
+  selectFirst(): void {
+    this.#selectedId = this.#selectableRows()[0]?.id;
+  }
+
+  /** True while at least one row can take focus. */
+  hasRows(): boolean {
+    return this.#selectableRows().length > 0;
   }
 
   #interactionKey(): string {
-    return `${this.focused}|${this.#selectedId ?? ""}|${this.#expandedId ?? ""}|${this.#activityScroll}`;
+    return `${this.focused}|${this.#selectedId ?? ""}|${this.#hoveredId ?? ""}|${this.interaction?.viewing?.() ?? ""}|${this.interaction?.collapseIdle?.() ?? ""}`;
   }
 
   handleInput(data: string): void {
+    // The keyboard takes over from the pointer.
+    this.#hoveredId = undefined;
     const rows = this.#selectableRows();
     const index = Math.max(0, rows.findIndex((row) => row.id === this.#selectedId));
     const select = (next: number): void => {
       const row = rows[Math.max(0, Math.min(rows.length - 1, next))];
-      if (!row) return;
-      this.#selectedId = row.id;
-      if (this.#expandedId && this.#expandedId !== row.id) this.#expand(row.id);
+      if (row) this.#selectedId = row.id;
     };
     if (matchesKey(data, "escape") || matchesKey(data, FABRIC_WIDGET_FOCUS_SHORTCUT)) {
-      if (this.#expandedId && matchesKey(data, "escape")) this.#expandedId = undefined;
-      else this.interaction?.release();
+      this.interaction?.release();
     } else if (matchesKey(data, "up") || data === "k") {
-      select(index - 1);
+      // The editor sits above the list, so ↑ past the top row returns to it.
+      if (index === 0 && matchesKey(data, "up")) this.interaction?.release();
+      else select(index - 1);
     } else if (matchesKey(data, "down") || data === "j") {
       select(index + 1);
-    } else if (matchesKey(data, "enter") || data === " ") {
-      if (this.#selectedId) this.#toggle(this.#selectedId);
-    } else if (this.#expandedId && (matchesKey(data, "pageUp") || data === "K")) {
-      this.#activityScroll = Math.min(this.#activityMaxScroll, this.#activityScroll + Math.max(1, this.#paneRows - 1));
-    } else if (this.#expandedId && (matchesKey(data, "pageDown") || data === "J")) {
-      this.#activityScroll = Math.max(0, this.#activityScroll - Math.max(1, this.#paneRows - 1));
-    } else if (this.#expandedId && (matchesKey(data, "end") || data === "G")) {
-      this.#activityScroll = 0;
+    } else if (matchesKey(data, "enter")) {
+      const row = rows[index];
+      if (row) this.interaction?.open?.(row);
     } else {
       // Not a widget key: give focus and the key back to the editor, so typing,
       // Ctrl+C, and extension shortcuts still work after a stray click.
@@ -253,50 +325,49 @@ export class FabricWidget implements Component, Focusable {
 
   handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
     if (!this.interaction) return undefined;
-    if (event.type === "wheel" && this.#expandedId) {
-      const delta = Math.sign(event.wheelDelta ?? 0);
-      this.#activityScroll = Math.max(0, Math.min(this.#activityMaxScroll, this.#activityScroll - delta * 3));
+    // The spacer row, when drawn, sits above the header.
+    const row = this.#rows.find((candidate) => candidate.line === event.y - this.#spacerRows);
+    if (event.type === "move") {
+      // Native Main is not a keyboard row, but hovering its header must still
+      // override the retained agent selection after a conversation closes.
+      // The spacer and outside rows clear hover; pi-tui has no leave event.
+      const header = event.y === this.#spacerRows && (this.#lastLines?.length ?? 0) > this.#spacerRows;
+      const hoveredId = row?.id ?? (header ? HEADER_ROW : undefined);
+      if (hoveredId === this.#hoveredId) return { handled: true };
+      this.#hoveredId = hoveredId;
       return { handled: true, render: true };
     }
     if (event.type === "press") return { handled: true };
     if (event.type !== "click" || event.button !== "left") return undefined;
-    const row = this.#rows.find((candidate) => candidate.line === event.y);
-    // Only a participant row takes focus; a click elsewhere leaves the editor focused.
+    this.#hoveredId = undefined;
+    // Only a row takes focus; a click elsewhere leaves the editor focused.
     if (!row) return undefined;
     this.#selectedId = row.id;
-    this.#toggle(row.id);
+    // A click opens the row like Enter.
+    if (this.interaction.open) {
+      this.interaction.open(row);
+      return { handled: true, render: true };
+    }
     return { focus: true, render: true };
   }
 
-  #toggle(id: string): void {
-    if (this.#expandedId === id) this.#expandedId = undefined;
-    else this.#expand(id);
-  }
-
-  #expand(id: string): void {
-    this.#expandedId = id;
-    this.#activityScroll = 0;
-  }
-
-  /** Rows a user can select: the participant rows the widget shows, in drawing order. */
+  /** Focused keyboard traversal can scroll; pointer targets remain viewport-only. */
   #selectableRows(): FabricWidgetRow[] {
-    const { lines, rows } = this.#content(this.snapshot());
-    const { listLimit } = this.#layout(lines.length, this.#expandedId !== undefined, this.#rowLimit());
-    return rows.filter((row) => row.line < listLimit);
+    const budget = this.#rowLimit();
+    if (budget === 0) return [];
+    const { lines, rows } = this.#content(this.snapshot(), Number.MAX_SAFE_INTEGER);
+    const body = Math.max(1, budget - (budget >= 2 ? 1 : 0));
+    const visible = body >= 3 && lines.length > body ? body - 1 : body;
+    return this.focused && body > 1 ? rows : rows.filter((row) => row.line < visible);
   }
 
-  /** List and pane heights; the pane exists only while a row is expanded. */
-  #layout(listLength: number, expanded: boolean, limit: number): { listLimit: number; paneRows: number } {
-    if (!expanded) return { listLimit: limit, paneRows: 0 };
-    const budget = widgetExpandedRowLimit(this.maxRows, this.terminalRows?.());
-    // Two dividers frame the pane. Keep at least two list rows and one pane row.
-    const listLimit = Math.max(2, Math.min(listLength, limit, budget - 5));
-    const paneRows = Math.max(1, Math.min(WIDGET_ACTIVITY_ROWS, budget - Math.min(listLength, listLimit) - 2));
-    return { listLimit, paneRows };
-  }
-
-  #rowLimit(): number {
-    return widgetRowLimit(this.maxRows, this.terminalRows?.());
+  #rowLimit(width = this.#lastWidth): number {
+    const limit = this.focused
+      ? widgetFocusedRowLimit(this.maxRows, this.terminalRows?.())
+      : widgetRowLimit(this.maxRows, this.terminalRows?.());
+    const available = width === undefined ? undefined : this.interaction?.availableRows?.(width);
+    return available === undefined || !Number.isFinite(available)
+      ? limit : Math.min(limit, Math.max(0, Math.floor(available)));
   }
 
   #lastWidth: number | undefined;
@@ -312,21 +383,16 @@ export class FabricWidget implements Component, Focusable {
     const snapshot = this.snapshot();
     // The pane can shrink between renders, so the row budget is part of the
     // cache key: a box measured against a taller terminal must not be reused.
-    const limit = this.#rowLimit();
-    const interactionChanged =
-      this.#renderedFocus !== this.focused ||
-      this.#renderedSelection !== this.#selectedId ||
-      this.#renderedExpansion !== this.#interactionKey();
+    const limit = this.#rowLimit(width);
+    const interactionChanged = this.#renderedInteraction !== this.#interactionKey();
     if (interactionChanged) this.#pending = undefined;
-    // An open pane reads a live log: reuse only the lines hasChanged() just
-    // built, never the last frame, whose snapshot key says nothing about the log.
     const lines =
       !interactionChanged &&
       this.#pending?.width === width &&
       this.#pending.limit === limit &&
       this.#pending.snapshot === snapshot
         ? this.#pending.lines
-        : !interactionChanged && !this.#expandedId &&
+        : !interactionChanged &&
             this.#lastWidth === width &&
             this.#lastLimit === limit &&
             this.#lastSnapshot === snapshot &&
@@ -334,13 +400,12 @@ export class FabricWidget implements Component, Focusable {
           ? this.#lastLines
           : this.#renderLines(snapshot, width, limit);
     this.#pending = undefined;
-    this.#renderedFocus = this.focused;
-    this.#renderedSelection = this.#selectedId;
-    this.#renderedExpansion = this.#interactionKey();
+    this.#renderedInteraction = this.#interactionKey();
     this.#lastWidth = width;
     this.#lastLimit = limit;
     this.#lastSnapshot = snapshot;
     this.#lastLines = lines;
+    this.interaction?.rendered?.();
     return lines;
   }
 
@@ -364,61 +429,79 @@ export class FabricWidget implements Component, Focusable {
     this.#lastLines = undefined;
   }
 
+  /**
+   * A blank row separates the list from the footer above it, as in Claude
+   * Code. It counts toward the row budget like any other row, so a one-row
+   * budget drops it and keeps the header.
+   */
   #renderLines(snapshot: FabricDashboardSnapshot, width: number, limit: number): string[] {
-    const { lines, rows } = this.#content(snapshot);
-    if (this.#selectedId && !rows.some((row) => row.id === this.#selectedId)) this.#selectedId = rows[0]?.id;
-    const expanded = rows.find((row) => row.id === this.#expandedId);
-    if (this.#expandedId && !expanded) this.#expandedId = undefined;
-    // Mark the selected row while the widget has focus.
-    const marked = lines.map((line, index) => {
-      const row = rows.find((candidate) => candidate.line === index);
-      if (!row || !this.focused || row.id !== this.#selectedId) return line;
-      return `${this.theme.fg("accent", "▸")}${line.replace(/^ /, "")}`;
-    });
-    const { listLimit, paneRows } = this.#layout(lines.length, expanded !== undefined, limit);
-    // Rows cut off by the row limit are neither clickable nor selectable.
-    this.#rows = rows.filter((row) => row.line < listLimit);
-    if (!expanded) return this.#boundContent(this.#withFocusHint(marked, rows.length > 0), width, limit);
-    // Expanded: the participant list stays bounded above an inline activity pane,
-    // and both together stay inside the widget's terminal share.
-    const list = this.#boundContent(this.#withFocusHint(marked, true), width, listLimit);
-    this.#paneRows = paneRows;
-    const activity = widgetActivityLines(
-      this.theme,
-      this.interaction?.activity(expanded),
-      width,
-      paneRows,
-      this.#activityScroll,
-      this.interaction?.hideThinking?.() ?? false,
-    );
-    this.#activityMaxScroll = activity.maxScroll;
-    this.#activityScroll = Math.min(this.#activityScroll, activity.maxScroll);
-    const position = this.#activityScroll > 0 ? ` · ↑${this.#activityScroll}` : " · live";
-    const help = this.focused
-      ? "↑↓ switch · PgUp/PgDn scroll · ⏎/click collapse · esc close"
-      : `click or ${FABRIC_WIDGET_FOCUS_SHORTCUT} to focus`;
-    return [
-      ...list,
-      widgetDivider(this.theme, width, this.theme.fg("accent", `${safeText(expanded.name)} activity${position}`)),
-      ...activity.lines,
-      widgetDivider(this.theme, width, this.theme.fg("dim", help)),
-    ].map((line) => truncateToWidth(line, width));
+    if (limit === 0) { this.#rows = []; this.#spacerRows = 0; return []; }
+    const spacer = limit >= 2 ? 1 : 0;
+    const body = Math.max(1, limit - spacer);
+    let { lines, rows } = this.#content(snapshot, width);
+    if (this.#selectedId !== undefined && !rows.some((row) => row.id === this.#selectedId)) {
+      this.#selectedId = rows[0]?.id;
+      // The selected row draws a filled circle, so redraw with the new selection.
+      if (this.focused) ({ lines, rows } = this.#content(snapshot, width));
+    }
+    if (this.#hoveredId !== undefined && this.#hoveredId !== HEADER_ROW && !rows.some((row) => row.id === this.#hoveredId)) {
+      this.#hoveredId = undefined;
+    }
+    // Pin Main and reserve a separate footer only when rows remain below.
+    // On tiny budgets the footer would hide the only participant, so the
+    // below count shares the header instead.
+    const selectedLine = this.focused && body > 1 ? rows.find(row => row.id === this.#selectedId)?.line ?? 0 : 0;
+    let capacity = body - 1;
+    let start = Math.max(1, selectedLine - capacity + 1);
+    let below = Math.max(0, lines.length - start - capacity);
+    if (below > 0 && body >= 3) {
+      capacity--;
+      start = Math.max(1, selectedLine - capacity + 1);
+      below = Math.max(0, lines.length - start - capacity);
+    }
+    const above = start - 1;
+    const upLabel = above > 0 ? `↑ ${above} more` : undefined;
+    const downLabel = body < 3 && below > 0 ? `↓ ${below} more` : undefined;
+    let label = upLabel ?? downLabel;
+    if (upLabel && downLabel) {
+      // Prefer both directions, but never sacrifice the session identity just
+      // to spell out "more". If the full name cannot fit, retain a useful
+      // prefix before falling back to a single direction or no count at all.
+      const identityWidth = 2 + visibleWidth(safeText(snapshot.sessionLabel ?? "Fabric"));
+      const candidates = [`${upLabel} · ${downLabel}`, `↑ ${above} · ↓ ${below}`, upLabel, `↑ ${above}`];
+      const fits = (candidate: string, identity: number) => visibleWidth(candidate) + 1 + identity <= width;
+      label = candidates.find(candidate => fits(candidate, identityWidth))
+        ?? candidates.find(candidate => fits(candidate, Math.min(identityWidth, 8)));
+    }
+    // Fit the header against the reserved space, so hints are dropped whole
+    // in priority order rather than cut off when the label is appended.
+    const headerWidth = label && width >= visibleWidth(label) + 2 ? width - visibleWidth(label) - 1 : width;
+    const header = headerWidth === width ? lines[0] ?? "" : this.#content(snapshot, width, headerWidth).lines[0] ?? "";
+    const boundedHeader = label ? this.#withRightLabel(header, label, width) : truncateToWidth(header, width);
+    const visibleLines = [boundedHeader, ...lines.slice(start, start + capacity).map(line => truncateToWidth(line, width))];
+    if (below > 0 && body >= 3) visibleLines.push(truncateToWidth(this.theme.fg("dim", `↓ ${below} more`), width));
+    // Only participant rows, never the overflow footer, are pointer targets.
+    this.#rows = rows.filter(row => row.line === 0 || (row.line >= start && row.line < start + capacity))
+      .map(row => ({ ...row, line: row.line === 0 ? 0 : row.line - start + 1 }));
+    if (rows.length === 0 && this.interaction?.collapseIdle?.()) return [];
+    this.#spacerRows = spacer;
+    return [...(spacer ? [""] : []), ...visibleLines];
   }
 
-  /** Advertise the expand shortcut on the header while participant rows exist. */
-  #withFocusHint(lines: string[], hasRows: boolean): string[] {
-    if (!this.interaction || lines.length === 0 || !hasRows) return lines;
-    const hint = this.focused ? "↑↓ select · ⏎ expand · esc back" : FABRIC_WIDGET_FOCUS_HINT;
-    return [`${lines[0]} · ${this.theme.fg("dim", hint)}`, ...lines.slice(1)];
+  /** Key hints for the header, most important first; the line fitter drops them from the end. */
+  #hints(hasRows: boolean): string[] {
+    if (!this.interaction || this.interaction.hints === false) return [];
+    if (this.focused) return [...(this.interaction.open ? ["⏎ open"] : []), "↑↓ select", "esc back"];
+    return hasRows ? [FABRIC_WIDGET_FOCUS_HINT] : [];
   }
 
-  #content(snapshot: FabricDashboardSnapshot): { lines: string[]; rows: Array<FabricWidgetRow & { line: number }> } {
+  #content(snapshot: FabricDashboardSnapshot, width: number, headerWidth = width): { lines: string[]; rows: Array<FabricWidgetRow & { line: number }> } {
     const rows: Array<FabricWidgetRow & { line: number }> = [];
-    const lines = this.#buildContent(snapshot, rows);
+    const lines = this.#buildContent(snapshot, rows, width, headerWidth);
     return { lines, rows };
   }
 
-  #buildContent(snapshot: FabricDashboardSnapshot, rows: Array<FabricWidgetRow & { line: number }> = []): string[] {
+  #buildContent(snapshot: FabricDashboardSnapshot, rows: Array<FabricWidgetRow & { line: number }>, width: number, headerWidth: number): string[] {
     const candidateRun = snapshot.runs[0];
     const candidateFinishedAt = candidateRun?.finishedAt ?? candidateRun?.updatedAt ?? 0;
     const run =
@@ -449,10 +532,10 @@ export class FabricWidget implements Component, Focusable {
       .map((actor) => ({ ...actor.worker!, name: actor.name, actorId: actor.id }));
     const nestedCalls =
       run?.calls.filter((call) => call.kind !== "agent" && call.kind !== "actor") ?? [];
-    const title = run?.name ?? "Fabric session";
     const shells = snapshot.shells ?? [];
     const liveShells = shells.filter(job => job.finishedAt === undefined);
     const recentShells = shells.filter(job => job.finishedAt !== undefined && isRecentWidgetCompletion(job.finishedAt, snapshot.now));
+    const listedShells = [...liveShells, ...recentShells];
     const headerStatus =
       run?.status ??
       (activeAgents.length > 0 || activeActorWorkers.length > 0 || liveShells.length > 0 ? "running" : "idle");
@@ -477,9 +560,9 @@ export class FabricWidget implements Component, Focusable {
         );
       }
     }
-    if (liveShells.length > 0) parts.push(`${liveShells.length} shell${liveShells.length === 1 ? "" : "s"}`);
     if (activeAgents.length > 0) parts.push(`${activeAgents.length} running`);
     if (visibleActors.length > 0) parts.push(`${visibleActors.length} actor${visibleActors.length === 1 ? "" : "s"}`);
+    if (liveShells.length > 0) parts.push(`${liveShells.length} shell${liveShells.length === 1 ? "" : "s"}`);
     const tokens = totalTokens(snapshot, run);
     if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
     const cost = totalCost(snapshot, run);
@@ -487,48 +570,84 @@ export class FabricWidget implements Component, Focusable {
     const elapsed = run && formatDuration((run.finishedAt ?? snapshot.now) - run.startedAt);
     if (elapsed) parts.push(elapsed);
 
-    const glyph = colorStatus(this.theme, headerStatus, statusGlyph(headerStatus));
-    const header = `${glyph} ${this.theme.fg("accent", "Fabric")} ${this.theme.fg(
-      "muted",
-      safeText(title),
-    )}${parts.length > 0 ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}`;
-    const hasActiveConversations = activeAgents.some((agent) => !agent.stale) ||
-      activeActorWorkers.length > 0 || visibleActors.some((actor) => isActiveStatus(actor.status));
-    const taskHint = liveShells.length || recentShells.length ? this.theme.fg("dim", " · /fabric tasks · ctrl+alt+t") : "";
-    const taskHeader = taskHint ? `${glyph} ${this.theme.fg("accent", "Fabric")}${taskHint}${parts.length ? this.theme.fg("dim", ` · ${parts.join(" · ")}`) : ""}` : header;
-    const lines = [hasActiveConversations ? `${taskHeader} · ${this.theme.fg("dim", FABRIC_CONVERSATION_HINT)}` : taskHeader];
-    for (const job of [...liveShells, ...recentShells].slice(0, 3)) {
-      const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
-      const status = job.stopping ? "stopping" : job.status;
-      const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
-      const glyph = colorStatus(this.theme, status, statusGlyph(status));
-      lines.push(
-        `  ${glyph} ${this.theme.fg("muted", job.id.slice(0, 8))} ${this.theme.fg("muted", label)}` +
-        `${this.theme.fg("dim", ` · ${elapsed} · `)}${this.theme.fg("muted", safeText(job.description ?? job.command))}`,
-      );
-    }
-    if (liveShells.length + recentShells.length > 3) lines.push(this.theme.fg("dim", `  +${liveShells.length + recentShells.length - 3} more shell tasks`));
+    // One row carries the filled circle: the hovered row, else the selection
+    // while focused, else the participant on screen (the main session here).
+    const headerId = this.interaction?.mainId ?? HEADER_ROW;
+    const marked = this.#hoveredId ??
+      (this.focused && this.#selectedId !== undefined ? this.#selectedId : this.interaction?.viewing?.() ?? headerId);
 
-    const pushParticipant = (agent: FabricUiAgent, kind: "agent" | "actor"): void => {
+    const participants = [...activeAgents, ...terminalAgents, ...activeActorWorkers, ...terminalActorWorkers];
+    const lines: string[] = [];
+    // The header is the main session's row.
+    const label = safeText(snapshot.sessionLabel ?? "Fabric");
+    if (this.interaction?.mainId !== undefined) rows.push({ id: headerId, kind: "main", name: label, line: 0 });
+    const hasRows = participants.length > 0 || listedShells.length > 0 || this.interaction?.mainId !== undefined;
+    lines.push(fitLine(
+      this.theme,
+      headerWidth,
+      `${colorStatus(this.theme, headerStatus, circle(marked === headerId))} ${this.theme.fg("accent", this.theme.bold(label))}`,
+      run?.name ? { text: safeText(run.name), gap: " ", color: "muted" } : undefined,
+      parts,
+      this.#hints(hasRows),
+    ));
+
+    const pushParticipant = (agent: FabricUiAgent, kind: "agent" | "actor", depth = 0): void => {
       const id = kind === "actor" ? agent.actorId ?? agent.id : agent.id;
-      rows.push({ id, kind, name: agent.name, line: lines.length });
-      lines.push(...agentLines(this.theme, agent, snapshot.now));
+      rows.push({
+        id,
+        kind,
+        name: agent.name,
+        ...(agent.model ? { model: agent.model } : {}),
+        line: lines.length,
+      });
+      lines.push(agentLine(this.theme, agent, snapshot.now, depth, id === marked, width));
     };
-    for (const agent of activeAgents) pushParticipant(agent, "agent");
+    // Trees with a running root come first, then retained ones; a child always
+    // sits under its parent, whatever its own status.
+    const liveTrees: Array<{ agent: FabricUiAgent; depth: number }> = [];
+    const settledTrees: Array<{ agent: FabricUiAgent; depth: number }> = [];
+    let liveRoot = false;
+    for (const entry of treeOrder([...activeAgents, ...terminalAgents])) {
+      if (entry.depth === 0) liveRoot = isActiveStatus(entry.agent.status);
+      (liveRoot ? liveTrees : settledTrees).push(entry);
+    }
+    for (const { agent, depth } of liveTrees) pushParticipant(agent, "agent", depth);
     for (const agent of activeActorWorkers) pushParticipant(agent, "actor");
     for (const agent of terminalActorWorkers) pushParticipant(agent, "actor");
-    for (const agent of terminalAgents) pushParticipant(agent, "agent");
+    for (const { agent, depth } of settledTrees) pushParticipant(agent, "agent", depth);
+
+    // Shells follow participants. Every selectable row names an exact task;
+    // Enter opens its detail, with no separate task-list overlay.
+    // The id is the row's name, emphasised like an agent's name.
+    const shellLine = (job: FabricShellJobInfo, name: string, detail: string | undefined, id: string): string => {
+      const status = job.stopping ? "stopping" : job.status;
+      const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
+      const selected = id === marked;
+      return fitLine(
+        this.theme,
+        width,
+        `${colorStatus(this.theme, status, circle(selected))} ${selected ? this.theme.bold(name) : this.theme.fg("muted", name)}${
+          detail ? ` ${this.theme.fg("muted", detail)}` : ""
+        }`,
+        { text: safeText(job.description ?? job.command), gap: this.theme.fg("dim", ` · ${elapsed} · `), color: "muted" },
+        [],
+        [],
+      );
+    };
+    for (const job of listedShells) {
+      const status = job.stopping ? "stopping" : job.status;
+      const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
+      rows.push({ id: job.id, kind: "shell", name: safeText(job.description ?? job.command), line: lines.length });
+      lines.push(shellLine(job, job.id.slice(0, 8), label, job.id));
+    }
     return lines;
   }
 
-  #boundContent(content: string[], width: number, limit: number): string[] {
-    const bounded = content.slice(0, limit);
-    if (content.length > bounded.length && bounded.length > 0) {
-      const marker = this.theme.fg("dim", `+${content.length - bounded.length}`);
-      const available = Math.max(0, width - visibleWidth(marker) - 1);
-      const last = truncateToWidth(bounded[bounded.length - 1] ?? "", available, "");
-      bounded[bounded.length - 1] = `${last} ${marker}`;
-    }
-    return bounded.map((line) => truncateToWidth(line, width));
+  #withRightLabel(line: string, label: string, width: number): string {
+    const labelWidth = visibleWidth(label);
+    // Preserve the row marker when the terminal is too narrow for both.
+    if (width < labelWidth + 2) return truncateToWidth(line, width);
+    const left = truncateToWidth(line, width - labelWidth - 1, "");
+    return `${left}${" ".repeat(width - visibleWidth(left) - labelWidth)}${this.theme.fg("dim", label)}`;
   }
 }

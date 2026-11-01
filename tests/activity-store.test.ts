@@ -209,7 +209,7 @@ describe("FabricActivityStore", () => {
     store.phase("run-2", { name: "Execute" });
     store.beginCall("run-2", { callId: "call-2", ref: "pi.bash", args: {} });
     store.finishCall("run-2", "call-2", { success: false, error: "command failed" });
-    store.finish("run-2", false, "Execution cancelled");
+    store.finish("run-2", false, "Execution cancelled", true);
 
     expect(store.get("run-2")).toMatchObject({
       status: "cancelled",
@@ -304,6 +304,80 @@ describe("FabricActivityStore", () => {
 
     const plain = store.start("hint-3");
     expect(plain.name).toBe("Fabric program");
+  });
+
+  it("keeps a failed run failed when its error text mentions cancelling", () => {
+    const store = new FabricActivityStore();
+    store.start("run-error");
+    store.finish("run-error", false, "Order service rejected the request: already cancelled upstream");
+    expect(store.get("run-error")?.status).toBe("failed");
+
+    store.start("run-aborted");
+    store.finish("run-aborted", false, "Owned work stopped", true);
+    expect(store.get("run-aborted")?.status).toBe("cancelled");
+  });
+
+  it("keeps a stopped call stopped instead of failed", () => {
+    const store = new FabricActivityStore();
+    store.start("run-stop");
+    store.beginCall("run-stop", { callId: "stopped", ref: "agents.run", args: {} });
+    store.finishCall("run-stop", "stopped", { success: true, result: { id: "agent-9", status: "stopped" } });
+    store.beginCall("run-stop", { callId: "timed-out", ref: "agents.run", args: {} });
+    store.finishCall("run-stop", "timed-out", { success: true, result: { status: "timed_out" } });
+
+    expect(store.get("run-stop")?.calls.map((call) => call.status)).toEqual(["stopped", "failed"]);
+  });
+
+  it("keeps an item's status when an update omits it", () => {
+    const store = new FabricActivityStore();
+    store.start("run-item");
+    store.upsertItem("run-item", { id: "pkg", label: "Package", status: "completed" });
+    const finishedAt = store.get("run-item")?.items[0]?.finishedAt;
+    store.upsertItem("run-item", { id: "pkg", label: "Package", detail: "late note" });
+
+    expect(store.get("run-item")?.items[0]).toMatchObject({
+      status: "completed",
+      detail: "late note",
+      finishedAt,
+    });
+    store.upsertItem("run-item", { id: "fresh", label: "Fresh" });
+    expect(store.get("run-item")?.items[1]?.status).toBe("running");
+  });
+
+  it("ignores non-finite call metrics", () => {
+    const store = new FabricActivityStore();
+    store.start("run-metrics");
+    store.beginCall("run-metrics", { callId: "call", ref: "pi.bash", args: {} });
+    store.updateCall("run-metrics", "call", { type: "metrics", tokens: 10, toolCalls: 2, cost: 0.5 });
+    store.updateCall("run-metrics", "call", {
+      type: "metrics",
+      tokens: Number.NaN,
+      toolCalls: Number.POSITIVE_INFINITY,
+      cost: Number.NaN,
+    });
+    expect(store.get("run-metrics")?.calls[0]?.metrics).toEqual({ tokens: 10, toolCalls: 2, cost: 0.5 });
+
+    store.beginCall("run-metrics", { callId: "result", ref: "agents.run", args: {} });
+    store.finishCall("run-metrics", "result", {
+      success: true,
+      result: { toolCalls: Number.NaN, usage: { input: Number.NaN, output: 5, cost: Number.POSITIVE_INFINITY } },
+    });
+    expect(store.get("run-metrics")?.calls[1]?.metrics).toEqual({ tokens: 5 });
+  });
+
+  it("caps entity ids that have no identifier characters", () => {
+    const store = new FabricActivityStore();
+    store.start("run-id");
+    const raw = "/".repeat(10_000);
+    store.beginCall("run-id", { callId: "entity", ref: "pi.bash", args: {} });
+    store.updateCall("run-id", "entity", { type: "entity", id: raw, kind: "custom" });
+    store.beginCall("run-id", { callId: "result", ref: "agents.run", args: {} });
+    store.finishCall("run-id", "result", { success: true, result: { id: raw } });
+
+    for (const call of store.get("run-id")?.calls ?? []) {
+      expect(call.entityId?.length ?? 0).toBeGreaterThan(0);
+      expect(call.entityId!.length).toBeLessThanOrEqual(160);
+    }
   });
 });
 

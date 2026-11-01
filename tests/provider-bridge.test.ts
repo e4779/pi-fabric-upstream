@@ -37,7 +37,7 @@ export default function (pi) {
 `;
 
 function fixture(options: {
-  extensions: Array<{ dir: string; provider?: string; project?: boolean }>;
+  extensions: Array<{ dir: string; provider?: string; project?: boolean; source?: (marker: string) => string }>;
   settings?: Record<string, unknown>;
   models?: Record<string, unknown>;
 }) {
@@ -55,7 +55,7 @@ function fixture(options: {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const marker = path.join(root, `${extension.dir}.marker`);
     markers[extension.dir] = marker;
-    fs.writeFileSync(file, extensionSource(marker, extension.provider));
+    fs.writeFileSync(file, extension.source?.(marker) ?? extensionSource(marker, extension.provider));
     if (!extension.project) globalPaths.push(file);
   }
   fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ extensions: globalPaths, ...options.settings }));
@@ -185,6 +185,68 @@ describe("extension provider bridge", () => {
   });
 
   it.each([
+    ["a provider registration with its own stream", (marker: string) => `
+import fs from "node:fs";
+export default function (pi) {
+  fs.appendFileSync(${JSON.stringify(marker)}, "loaded\\n");
+  pi.registerProvider("relay", { api: "relay-api", streamSimple: () => { throw new Error("fixture stream"); } });
+}
+`],
+    ["a global API provider registration", (marker: string) => `
+import fs from "node:fs";
+import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+export default function (pi) {
+  fs.appendFileSync(${JSON.stringify(marker)}, "loaded\\n");
+  const stream = () => { throw new Error("fixture stream"); };
+  registerApiProvider({ api: "relay-api", stream, streamSimple: stream }, "relay-fixture");
+}
+`],
+  ] as const)("loads the extension that provides a models.json model's stream API through %s", async (_kind, source) => {
+    const { getApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
+    const { cwd, agentDir, loads } = fixture({
+      extensions: [{ dir: "pi-unrelated" }, { dir: "pi-relay", source }],
+      models: { providers: { relay: { baseUrl: "https://relay.invalid/v1", apiKey: "none", api: "relay-api",
+        models: [{ id: "m1", name: "Relay", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 }] } } },
+    });
+    try {
+      expect(getApiProvider("relay-api")).toBeUndefined();
+      const found = await resolveExtensionProviders({ model: "relay/m1", cwd, agentDir });
+      expect(loads("pi-relay")).toEqual(["loaded"]);
+      const viaConfig = found?.configs.some(({ name, config }) => name === "relay" && config.api === "relay-api" && config.streamSimple);
+      expect(viaConfig || getApiProvider("relay-api") !== undefined).toBe(true);
+    } finally {
+      unregisterApiProviders("relay-fixture");
+    }
+  });
+
+  it("warns about broken candidates without rejecting a global API registration", async () => {
+    const { getApiProvider, unregisterApiProviders } = await import("@earendil-works/pi-ai/compat");
+    const { cwd, agentDir } = fixture({
+      extensions: [
+        { dir: "pi-relay-broken", source: () => `export default function () { throw new Error("broken fixture"); }` },
+        { dir: "pi-relay-global", source: () => `
+import { registerApiProvider } from "@earendil-works/pi-ai/compat";
+export default function () {
+  const stream = () => { throw new Error("fixture stream"); };
+  registerApiProvider({ api: "relay-api", stream, streamSimple: stream }, "relay-warning-fixture");
+}` },
+      ],
+      models: { providers: { relay: { baseUrl: "https://relay.invalid/v1", apiKey: "none", api: "relay-api",
+        models: [{ id: "m1", name: "Relay", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 8192, maxTokens: 1024 }] } } },
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await expect(resolveExtensionProviders({ model: "relay/m1", cwd, agentDir })).resolves.toEqual({ configs: [], natives: [] });
+      expect(getApiProvider("relay-api")).toBeDefined();
+      expect(warn).toHaveBeenCalledOnce();
+      expect(warn.mock.calls[0]![0]).toMatch(/pi-relay-broken[\s\S]*inference fails[\s\S]*extensions: true/);
+    } finally {
+      warn.mockRestore();
+      unregisterApiProviders("relay-warning-fixture");
+    }
+  });
+
+  it.each([
     ["ask", false],
     ["always", true],
   ] as const)("applies project trust %s to project-local provider extensions", async (defaultProjectTrust, trusted) => {
@@ -216,53 +278,23 @@ describe("extension provider bridge", () => {
 });
 
 const repo = path.resolve(import.meta.dirname, "..");
-const BUNDLED_ENTRY = path.join(repo, "node_modules", "pi-coralbricks-provider", "index.ts");
 
-describe("resolveExtensionProviders with the bundled provider", () => {
-  const tempDir = (prefix: string): string => {
-    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
-    roots.push(dir);
-    return dir;
-  };
-  afterEach(() => vi.unstubAllGlobals());
-
-  async function setup(packageEntry: unknown) {
-    const agentDir = tempDir("fabric-bridge-agent-");
-    const cwd = tempDir("fabric-bridge-cwd-");
-    fs.writeFileSync(path.join(agentDir, "settings.json"), JSON.stringify({ packages: [packageEntry] }));
+describe("resolveExtensionProviders without bundled providers", () => {
+  it("fails closed for Coral Bricks when only Fabric is installed", async () => {
+    const { cwd, agentDir } = fixture({ extensions: [], settings: { packages: [repo] } });
     vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
-    vi.stubEnv("CORALBRICKS_API_KEY", "");
-    vi.stubGlobal("fetch", async () => { throw new Error("the bridge must stay offline"); });
-    const sdk = await import("@earendil-works/pi-coding-agent");
-    const probed: string[] = [];
-    const recording = {
-      ...sdk,
-      DefaultResourceLoader: class extends sdk.DefaultResourceLoader {
-        constructor(options: ConstructorParameters<typeof sdk.DefaultResourceLoader>[0]) {
-          probed.push(...(options.additionalExtensionPaths ?? []));
-          super(options);
-        }
-      },
-    } as typeof sdk;
-    return { agentDir, cwd, sdk: recording, probed };
-  }
-
-  it("registers coralbricks for an extensions: false child from Fabric's bundled copy only", async () => {
-    const { agentDir, cwd, sdk, probed } = await setup(repo);
-    const found = await resolveExtensionProviders({ model: "coralbricks/deepseek-v4.1-flash-fast", cwd, agentDir }, sdk);
-    expect(found?.configs).toEqual([]);
-    expect(found?.natives.map(({ provider }) => provider.id)).toEqual(["coralbricks"]);
-    expect(fs.realpathSync(found!.natives[0]!.extensionPath)).toBe(fs.realpathSync(BUNDLED_ENTRY));
-    expect(found!.natives[0]!.provider.getModels().map((model) => model.id)).toEqual(
-      expect.arrayContaining(["glm-5.3-fast", "deepseek-v4.1-flash-fast"]),
-    );
-    // Fabric's main extension never loads in the bridge.
-    expect(probed.map((entry) => fs.realpathSync(entry))).toEqual([fs.realpathSync(BUNDLED_ENTRY)]);
+    await expect(resolveExtensionProviders({ model: "coralbricks/glm-5.3-fast", cwd, agentDir }))
+      .rejects.toThrow(/needs provider "coralbricks"[\s\S]*extensions: true/);
   }, 30_000);
 
-  it("fails closed when the user filters the bundled provider out", async () => {
-    const { agentDir, cwd, sdk } = await setup({ source: repo, extensions: ["!node_modules/pi-coralbricks-provider/**"] });
-    await expect(resolveExtensionProviders({ model: "coralbricks/glm-5.3-fast", cwd, agentDir }, sdk))
-      .rejects.toThrow(/needs provider "coralbricks"[\s\S]*extensions: true/);
+  it("still resolves a separately installed Coral Bricks provider extension", async () => {
+    const { cwd, agentDir, loads } = fixture({
+      extensions: [{ dir: "pi-coralbricks-provider", provider: "coralbricks" }],
+      settings: { packages: [repo] },
+    });
+    vi.stubEnv("PI_CODING_AGENT_DIR", agentDir);
+    const found = await resolveExtensionProviders({ model: "coralbricks/m1", cwd, agentDir });
+    expect(found?.configs.map(({ name }) => name)).toEqual(["coralbricks"]);
+    expect(loads("pi-coralbricks-provider")).toEqual(["loaded"]);
   }, 30_000);
 });

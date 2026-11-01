@@ -21,7 +21,7 @@ describe("CI Node runtime prerequisites", () => {
     const { steps, strategy } = workflow.jobs.check;
     expect(strategy.matrix.os).toEqual(["ubuntu-latest", "windows-latest"]);
     const setup = steps.findIndex((step: Step) => step.uses?.startsWith("actions/setup-python@"));
-    const diagnostics = steps.findIndex((step: Step) => step.run === "bunx vitest run tests/kernel-errors.test.ts");
+    const diagnostics = steps.findIndex((step: Step) => step.run?.startsWith("bunx vitest run ") && step.run.split(/\s+/).includes("tests/kernel-errors.test.ts"));
     expect(setup).toBeGreaterThanOrEqual(0);
     expect(steps[setup].with["python-version"]).toBe("3.14");
     expect(steps[setup].if).toBeUndefined();
@@ -29,6 +29,17 @@ describe("CI Node runtime prerequisites", () => {
     expect(steps[diagnostics].if).toBeUndefined();
     const prerequisites = steps.find((step: Step) => step.run?.includes("choco install ripgrep"));
     expect(prerequisites.run).toContain("mkdir -p /tmp");
+  });
+
+  it("keeps every fixed assurance floor unconditional in one Vitest launch", () => {
+    const workflow = parse(fs.readFileSync(new URL(".github/workflows/test.yml", root), "utf8"));
+    const steps = workflow.jobs.check.steps as Step[];
+    const required = ["ci-workflows", "kernel-errors", "verified-kernels", "verified-resources", "verified-providers", "verified-authority", "verified-lifecycle", "verified-storage", "verified-grants", "verified-speculation", "verified-budget", "verified-artifact", "verified-proof-scope", "verified-kernel-pool"];
+    const batches = steps.filter(step => step.run?.startsWith("bunx vitest run ") && step.run.includes("tests/verified-kernels.test.ts"));
+    expect(batches).toHaveLength(1); expect(batches[0]!.if).toBeUndefined();
+    const files = batches[0]!.run!.split(/\s+/).slice(3);
+    expect(files).toHaveLength(required.length);
+    for (const name of required) expect(files.filter(file => file === `tests/${name}.test.ts`)).toHaveLength(1);
   });
 
   it.each(workflows)("%s configures the declared Node runtime before install and execution", (file) => {

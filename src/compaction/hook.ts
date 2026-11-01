@@ -3,7 +3,9 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   SessionBeforeCompactEvent,
+  SessionBeforeCompactResult,
   SessionBeforeTreeEvent,
+  SessionBeforeTreeResult,
   SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { acceptCompactionCut, acceptSummaryBounds } from "../verified/policy.js";
@@ -581,6 +583,11 @@ export interface FabricCompactionDetailsV2 {
   /** Carry-forward focus rendered into this summary (absent when the list is empty). */
   carry?: { count: number; renderedOmittedBytes: number };
   timestamp: string;
+  /**
+   * Set only on a claim owner's fallback summary: the owner's name. Fabric's
+   * own engine never writes it.
+   */
+  claimOwner?: string;
 }
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -737,6 +744,8 @@ export const compileFabricSummary = (
   enrichers: readonly CompactionEnricher[] = NO_BUILTIN_ENRICHERS,
   customInstructions?: string,
   budget?: FabricCompactionBudget,
+  /** Carry-forward items to render instead of the branch's stored list. */
+  carryItems?: readonly string[],
 ): { compaction: CompactionResult<FabricCompactionDetailsV2> } | {
   cancel: true;
   reason: string;
@@ -772,7 +781,7 @@ export const compileFabricSummary = (
   const sections: Sections = projected.sections;
   runEnrichers(enrichers, source.events, sections);
 
-  const carryLines = carryRequestLines(latestCarryItems(branchEntries));
+  const carryLines = carryRequestLines(carryItems ?? latestCarryItems(branchEntries));
   const rendered = renderSummaryWithMetadata(sections, {
     firstEntryId: source.range.first,
     lastEntryId: source.range.last,
@@ -877,7 +886,61 @@ export interface CompactionHookOptions {
   /** Fabric deliberately left this compaction to another owner (pi-vcc sentinel/override). */
   onYield?: () => void;
   enrichers?: readonly CompactionEnricher[];
+  /**
+   * The extension holding the compaction owner claim. While present, Fabric's
+   * compaction handler returns nothing (no summary, no threshold deferral);
+   * `/tree` summaries stay with Fabric unless the claim declares `branchSummary`.
+   */
+  getOwnerClaim?: () => { readonly branchSummary: boolean } | undefined;
 }
+
+/**
+ * Fabric's deterministic compaction for one `session_before_compact` event:
+ * the budget the hook derives from the event and model, then the summary
+ * compiler. Shared by the hook and the owner-claim fallback.
+ */
+export const compileFabricCompactionForEvent = (
+  event: Pick<SessionBeforeCompactEvent, "preparation" | "branchEntries" | "customInstructions" | "reason">,
+  context: Pick<ExtensionContext, "model"> | undefined,
+  targetContextRatio?: number,
+  enrichers?: readonly CompactionEnricher[],
+  carryItems?: readonly string[],
+): ReturnType<typeof compileFabricSummary> => {
+  const { preparation, branchEntries } = event;
+  const contextWindow = context?.model?.contextWindow;
+  const settings = preparation.settings ?? DEFAULT_COMPACTION_SETTINGS;
+  const tokensBefore = preparation.tokensBefore;
+  const evidenceWindow = event.reason === "overflow"
+    && typeof tokensBefore === "number"
+    && Number.isFinite(tokensBefore)
+    && tokensBefore > 0
+    ? Math.max(1, Math.floor(tokensBefore * OVERFLOW_WINDOW_EVIDENCE_RATIO))
+    : undefined;
+  const advertisedWindow = typeof contextWindow === "number"
+    && Number.isFinite(contextWindow)
+    && contextWindow > 0
+    ? contextWindow
+    : undefined;
+  const effectiveWindow = evidenceWindow === undefined
+    ? advertisedWindow
+    : advertisedWindow === undefined
+      ? evidenceWindow
+      : Math.min(advertisedWindow, evidenceWindow);
+  const budget: FabricCompactionBudget = {
+    ...(effectiveWindow !== undefined ? { contextWindow: effectiveWindow } : {}),
+    ...(typeof targetContextRatio === "number" && Number.isFinite(targetContextRatio) ? { targetContextRatio } : {}),
+    reserveTokens: settings.reserveTokens,
+    keepRecentTokens: settings.keepRecentTokens,
+  };
+  return compileFabricSummary(
+    branchEntries ?? [],
+    preparation.tokensBefore,
+    enrichers,
+    event.customInstructions,
+    budget,
+    carryItems,
+  );
+};
 
 const notifyInstructionError = (
   context: ExtensionContext | undefined,
@@ -887,13 +950,38 @@ const notifyInstructionError = (
   context.ui.notify(clipUtf8(`Fabric compaction rejected: ${error.code}: ${error.message}`, 512), "error");
 };
 
-export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
-  pi.on("session_before_compact", (event: SessionBeforeCompactEvent, context: ExtensionContext) => {
+// Pi reports a cancelled compaction only as its generic "Compaction
+// cancelled"; name Fabric's reason the same way instruction errors are shown.
+// Threshold compaction stays quiet: Pi checks the threshold before every
+// assistant response, so a cancel there would repeat the warning each call.
+const notifyCompactionCancelled = (
+  context: ExtensionContext | undefined,
+  reason: string,
+): void => {
+  if (!context?.hasUI) return;
+  context.ui.notify(
+    clipUtf8(`Fabric compaction cancelled: ${reason.replace(/^fabric: /, "")}`, 512),
+    "warning",
+  );
+};
+
+export interface CompactionHandlers {
+  beforeCompact: (event: SessionBeforeCompactEvent, context: ExtensionContext) => SessionBeforeCompactResult | undefined;
+  beforeTree: (event: SessionBeforeTreeEvent, context: ExtensionContext) => SessionBeforeTreeResult | undefined;
+}
+
+export const compactionHandlers = (options: CompactionHookOptions): CompactionHandlers => ({
+  beforeCompact: (event, context) => {
     if (event.customInstructions === "__pi_vcc__") {
       options.onYield?.();
       return;
     }
-    const { preparation, branchEntries } = event;
+    // A claimed owner decides alone: no Fabric summary and no threshold
+    // deferral that could block the owner's own compaction. This is not a
+    // yield to note: under a claim Fabric expects the owner's result, and a
+    // noted yield left unconsumed would hide a later foreign compaction.
+    if (options.getOwnerClaim?.()) return;
+    const { preparation } = event;
     const contextWindow = context?.model?.contextWindow;
     const modelKey = modelCompactionKey(context?.model);
     const outputReserveTokens = options.getOutputReserveTokens?.() ?? 0;
@@ -929,37 +1017,7 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
     }
     if (options.getEngine() !== "fabric") return;
     const targetContextRatio = options.getTargetContextRatio?.();
-    const settings = preparation.settings ?? DEFAULT_COMPACTION_SETTINGS;
-    const tokensBefore = preparation.tokensBefore;
-    const evidenceWindow = event.reason === "overflow"
-      && typeof tokensBefore === "number"
-      && Number.isFinite(tokensBefore)
-      && tokensBefore > 0
-      ? Math.max(1, Math.floor(tokensBefore * OVERFLOW_WINDOW_EVIDENCE_RATIO))
-      : undefined;
-    const advertisedWindow = typeof contextWindow === "number"
-      && Number.isFinite(contextWindow)
-      && contextWindow > 0
-      ? contextWindow
-      : undefined;
-    const effectiveWindow = evidenceWindow === undefined
-      ? advertisedWindow
-      : advertisedWindow === undefined
-        ? evidenceWindow
-        : Math.min(advertisedWindow, evidenceWindow);
-    const budget: FabricCompactionBudget = {
-      ...(effectiveWindow !== undefined ? { contextWindow: effectiveWindow } : {}),
-      ...(typeof targetContextRatio === "number" && Number.isFinite(targetContextRatio) ? { targetContextRatio } : {}),
-      reserveTokens: settings.reserveTokens,
-      keepRecentTokens: settings.keepRecentTokens,
-    };
-    const result = compileFabricSummary(
-      branchEntries ?? [],
-      preparation.tokensBefore,
-      options.enrichers,
-      event.customInstructions,
-      budget,
-    );
+    const result = compileFabricCompactionForEvent(event, context, targetContextRatio, options.enrichers);
     if ("cancel" in result) {
       if (result.instructionError) {
         notifyInstructionError(context, result.instructionError);
@@ -969,13 +1027,17 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
         options.onYield?.();
         return;
       }
+      if (event.reason !== "threshold") notifyCompactionCancelled(context, result.reason);
       return { cancel: true };
     }
     (event as SessionBeforeCompactEvent & { _fabricCompaction?: boolean })._fabricCompaction = true;
     return { compaction: result.compaction };
-  });
+  },
 
-  pi.on("session_before_tree", (event: SessionBeforeTreeEvent, context: ExtensionContext) => {
+  beforeTree: (event, context) => {
+    // A claim takes /tree summaries only when it says so; otherwise they stay
+    // with Fabric's configured engine.
+    if (options.getOwnerClaim?.()?.branchSummary) return;
     if (options.getEngine() !== "fabric") return;
     const { preparation } = event;
     if (!preparation.userWantsSummary) return;
@@ -996,5 +1058,11 @@ export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHook
     );
     if (!compiled) return;
     return { summary: compiled };
-  });
+  },
+});
+
+export const registerCompactionHook = (pi: ExtensionAPI, options: CompactionHookOptions): void => {
+  const handlers = compactionHandlers(options);
+  pi.on("session_before_compact", handlers.beforeCompact);
+  pi.on("session_before_tree", handlers.beforeTree);
 };

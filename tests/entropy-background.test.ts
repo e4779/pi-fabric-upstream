@@ -106,7 +106,7 @@ const emit = async (
   for (const handler of handlers.get(name) ?? []) await handler(event, context);
 };
 
-const retryHarness = async () => {
+const retryHarness = async (hasUI = false) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-entropy-retry-"));
   tempRoots.push(root);
   const agentDir = path.join(root, "agent");
@@ -117,13 +117,14 @@ const retryHarness = async () => {
   const harness = createHarness();
   await piFabric(harness.pi);
   const context = {
-    mode: "code", cwd: root, hasUI: false, isProjectTrusted: () => true,
+    mode: "code", cwd: root, hasUI, isProjectTrusted: () => true,
     ui: { setStatus: vi.fn(), notify: vi.fn() },
     sessionManager: { getBranch: () => [], getSessionId: () => "retry", getSessionFile: () => file },
   } as unknown as ExtensionContext;
   await harness.command()("repairs", context);
   return {
     agentDir,
+    context,
     trigger: async () => {
       await emit(harness.handlers, "tool_execution_end", { toolName: "fabric_exec", isError: false }, context);
       await emit(harness.handlers, "turn_end", {}, context);
@@ -153,6 +154,29 @@ const mockRetryIO = () => {
 };
 
 describe("entropy background scheduler", () => {
+  it("silently persists and activates improved entropy plans in UI sessions", async () => {
+    const harness = await retryHarness(true);
+    const outcome = compileEntropySurface({ traces: [], surface: { version: 1, actions: [{
+      ref: "mcp.render", inputSchema: { type: "object", additionalProperties: false,
+        properties: { format: { type: "string", enum: ["pdf", "html"] } }, required: ["format"] },
+    }] } });
+    expect(outcome.status).toBe("compiled");
+    const artifact = outcome.artifact!;
+    const previous = { ...artifact, gate: { ...artifact.gate, afterScore: outcome.report.score + 1 } };
+    vi.spyOn(compiledStore, "loadCompiledSurfaceAsync").mockResolvedValue({ file: previous });
+    vi.spyOn(BackgroundEntropyCompiler.prototype, "compile").mockResolvedValue(outcome);
+    const save = vi.spyOn(compiledStore, "saveCompiledSurfaceAsync").mockResolvedValue({ file: artifact, written: true });
+    const active = vi.spyOn(activeSurface, "setActiveCompiledSurface");
+    vi.mocked(harness.context.ui.notify).mockClear();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await harness.trigger();
+    await vi.advanceTimersByTimeAsync(250);
+    await harness.shutdown();
+    expect(save).toHaveBeenCalledWith(harness.agentDir, artifact);
+    expect(active).toHaveBeenCalledWith(artifact);
+    expect(harness.context.ui.notify).not.toHaveBeenCalled();
+  });
+
   it("compiles despite a live pool lock and retries without another user turn", async () => {
     const harness = await retryHarness();
     const lock = installLiveLock(harness.agentDir, "observation-pool.lock");

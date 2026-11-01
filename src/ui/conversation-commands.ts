@@ -5,13 +5,12 @@ export const CONVERSATION_COMMANDS = [
   { value: "/copy", label: "/copy", description: "Copy the last assistant response" },
   { value: "/copy selection", label: "/copy selection", description: "Copy selected transcript text" },
   { value: "/latest", label: "/latest", description: "Clear selection and follow latest output" },
-  { value: "/agents", label: "/agents", description: "Choose a conversation" },
   { value: "/back", label: "/back", description: "Return to Main" },
   { value: "/stop", label: "/stop", description: "Confirm stopping this participant" },
   { value: "/help", label: "/help", description: "Show preview commands" },
 ] satisfies AutocompleteItem[];
 
-export const CONVERSATION_COMMAND_HELP = "Commands: /copy [selection] · /latest · /agents · /back · /stop · /help";
+export const CONVERSATION_COMMAND_HELP = "Commands: /copy [selection] · /latest · /back · /stop · /help";
 
 export function conversationCommandCompletion(enabled: () => boolean): AutocompleteProvider {
   return {

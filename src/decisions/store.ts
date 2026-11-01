@@ -86,6 +86,7 @@ export const MAX_DECISION_BODY_CHARS = 4_000;
 export const MAX_DECISION_TEXT_CHARS = 4_000;
 export const MAX_DECISION_OPTIONS = 12;
 export const MAX_DECISION_DEADLINE_MS = 30 * 24 * 60 * 60 * 1_000;
+export const MIN_DECISION_TIMEOUT_MS = 1_000;
 export const MAX_OPEN_DECISIONS = 200;
 export const MAX_ESCALATION_HOPS = 8;
 export const MIN_ESCALATION_HOP_MS = 1_000;
@@ -220,8 +221,8 @@ export const buildDecisionRecord = (
   let deadline: number | undefined;
   if (input.timeoutMs !== undefined) {
     if (typeof input.timeoutMs !== "number" || !Number.isFinite(input.timeoutMs) ||
-        input.timeoutMs < 1_000 || input.timeoutMs > MAX_DECISION_DEADLINE_MS) {
-      throw new Error(`Decision timeoutMs must be 1000..${MAX_DECISION_DEADLINE_MS}`);
+        input.timeoutMs < MIN_DECISION_TIMEOUT_MS || input.timeoutMs > MAX_DECISION_DEADLINE_MS) {
+      throw new Error(`Decision timeoutMs must be ${MIN_DECISION_TIMEOUT_MS}..${MAX_DECISION_DEADLINE_MS}`);
     }
     deadline = now + Math.floor(input.timeoutMs);
   } else if (input.deadline !== undefined) {
@@ -400,6 +401,19 @@ export class DecisionStore {
         (!filter.holder || record.holder === filter.holder))
       .sort((left, right) => right.createdAt - left.createdAt || left.id.localeCompare(right.id))
       .slice(0, limit);
+  }
+
+  /**
+   * Open decisions that this store's identity raised, across processes that
+   * share the identity. Fabric rewrites an open record only to move it along an
+   * escalation chain, so the last writer of a non-escalating open record is its
+   * raiser; escalating records are left out.
+   */
+  async listOwnOpen(): Promise<DecisionRecord[]> {
+    return (await this.#entries())
+      .filter(({ entry, record }) =>
+        record.status === "open" && record.onExpire !== "escalate" && entry.updatedBy?.id === this.identity.id)
+      .map(({ record }) => record);
   }
 
   /** CAS open -> answered. Fails when the decision is missing or no longer open. */

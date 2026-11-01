@@ -10,11 +10,20 @@ import type { AgentRunRecord } from "../src/agents/types.js";
 
 const roots: string[] = [];
 const managers: AgentManager[] = [];
+// Every test here copies the whole dist (18 MB, ~1.5k files) and boots a cold
+// Node child; on Windows the copy also pays for Defender scanning it. Keep the
+// child budget inside the test ceiling so a loaded runner fails with the child
+// output instead of an untimed kill that leaves handles behind.
+const CHILD_TIMEOUT_MS = 20_000;
+const TEST_TIMEOUT_MS = 60_000;
+// Three installations boot one child each under a single test.
+const STRUCTURED_TEST_TIMEOUT_MS = 90_000;
 const tmuxAvailable = process.platform !== "win32" && spawnSync("tmux", ["-V"], { timeout: 5000 }).status === 0;
 afterEach(async () => {
   await Promise.all(managers.splice(0).map(manager => manager.close()));
   vi.unstubAllEnvs();
-  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
+  // Windows can hold a handle on a just-killed child's files for a moment.
+  for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 // Outside the checkout: ancestor node_modules and development peers must not
@@ -44,7 +53,7 @@ const installation = (text = "hi") => {
   };
   const run = async (extra: Record<string, string> = {}, runtimeArgs: string[] = []) => {
     const args = Object.entries({ ...flags, ...extra }).flatMap(([key, value]) => [`--${key}`, value]);
-    const child = await promisify(execFile)(process.execPath, [...runtimeArgs, worker, ...args], { cwd: root, timeout: 12000, maxBuffer: 100000 })
+    const child = await promisify(execFile)(process.execPath, [...runtimeArgs, worker, ...args], { cwd: root, timeout: CHILD_TIMEOUT_MS, maxBuffer: 100000 })
       .then(output => ({ ...output, exitCode: 0 }), error => ({ stderr: String(error.stderr), exitCode: error.code }));
     const file = path.join(root, "status.json");
     const record = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) as AgentRunRecord : undefined;
@@ -59,7 +68,7 @@ describe("standalone worker without Pi host peers", () => {
     const { child, record } = await run();
     expect(child, child.stderr).toMatchObject({ exitCode: 0 });
     expect(record).toMatchObject({ status: "completed", text: "hi" });
-  });
+  }, TEST_TIMEOUT_MS);
 
   it.each([
     { text: '```json\n{"count":2}\n```', status: "completed", value: { count: 2 } },
@@ -73,7 +82,7 @@ describe("standalone worker without Pi host peers", () => {
     expect(record, child.stderr).toMatchObject({ status });
     expect(record?.value).toEqual(value);
     if (status === "failed") expect(record?.error).toContain("Structured agent output was invalid");
-  });
+  }, STRUCTURED_TEST_TIMEOUT_MS);
 
   it("persists failures even before the worker's normal status context exists", async () => {
     const { root, run } = installation();
@@ -82,7 +91,7 @@ describe("standalone worker without Pi host peers", () => {
     expect(child.exitCode).toBe(1);
     expect(record, child.stderr).toMatchObject({ status: "failed", turns: 0, toolCalls: 0 });
     expect(record?.error).toContain("options.js");
-  });
+  }, TEST_TIMEOUT_MS);
 
   it("reports unsupported Node before loading optional worker modules", async () => {
     const { root, run } = installation();
@@ -93,7 +102,18 @@ describe("standalone worker without Pi host peers", () => {
     expect(record, child.stderr).toMatchObject({ status: "failed", turns: 0, toolCalls: 0 });
     expect(record?.error).toContain("Node.js 24+");
     expect(record?.error).toContain("22.22.2");
-  });
+  }, TEST_TIMEOUT_MS);
+
+  it("names the build and the remedy when the build has no installed dependencies", async () => {
+    const { root, run } = installation();
+    fs.rmSync(path.join(root, "node_modules"), { recursive: true });
+    const { child, record } = await run();
+    expect(child.exitCode).toBe(1);
+    expect(record, child.stderr).toMatchObject({ status: "failed", turns: 0, toolCalls: 0 });
+    expect(record?.error).toContain(`Fabric build at ${fs.realpathSync(root)} cannot start a worker: its dependency "cross-spawn" is not installed (the build has no node_modules)`);
+    expect(record?.error).toContain("restart Pi");
+    expect(record?.error).toContain("Cannot find package 'cross-spawn'");
+  }, TEST_TIMEOUT_MS);
 
   it("reports a missing runtime dependency instead of losing stderr", async () => {
     const { root, run } = installation();
@@ -102,7 +122,7 @@ describe("standalone worker without Pi host peers", () => {
     expect(child.exitCode).toBe(1);
     expect(record, child.stderr).toMatchObject({ status: "failed" });
     expect(record?.error).toContain("cross-spawn");
-  });
+  }, TEST_TIMEOUT_MS);
 
   it.skipIf(!tmuxAvailable)("boots and reports early failures through an isolated real tmux server", async () => {
     const { root, worker, piBinary } = installation();
@@ -128,7 +148,7 @@ describe("standalone worker without Pi host peers", () => {
       await manager.close();
       spawnSync(binary, ["-L", socket, "kill-server"], { timeout: 5000 });
     }
-  });
+  }, TEST_TIMEOUT_MS);
 
   it("propagates bootstrap failure through the real process transport", async () => {
     const { root, worker, piBinary } = installation();
@@ -141,5 +161,5 @@ describe("standalone worker without Pi host peers", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toContain("options.js");
     expect(result.error).not.toContain("transport exited without a result");
-  });
+  }, TEST_TIMEOUT_MS);
 });

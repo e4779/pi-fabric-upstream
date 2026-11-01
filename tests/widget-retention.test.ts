@@ -8,7 +8,7 @@ import { FabricWidgetRetention } from "../src/ui/retention.js";
 import { FabricWidget, shouldShowFabricWidget } from "../src/ui/widget.js";
 import type { FabricDashboardSnapshot, FabricUiAgent } from "../src/ui/types.js";
 
-const theme = { fg: (_: string, text: string) => text } as Theme;
+const theme = { fg: (_: string, text: string) => text, bold: (text: string) => text } as Theme;
 const agent = (id: string, finishedAt?: number): FabricUiAgent => ({
   id, name: id, status: "completed", transport: "local", cwd: "/tmp",
   startedAt: 1, ...(finishedAt === undefined ? {} : { updatedAt: finishedAt, finishedAt }),
@@ -22,6 +22,12 @@ const snapshot = (): FabricDashboardSnapshot => ({
 });
 afterEach(() => vi.useRealTimers());
 
+/** The widget's rows below the blank spacer that separates it from the editor. */
+const body = (lines: string[]): string[] => {
+  expect(lines[0]).toBe("");
+  return lines.slice(1);
+};
+
 describe("widget display-only completion retention", () => {
   it.each(["completed", "failed", "stopped", "timed_out", "cancelled"])("expires %s at exactly 30 seconds and auto-hides without mutating stored data", status => {
     vi.useFakeTimers(); vi.setSystemTime(10_000);
@@ -30,13 +36,13 @@ describe("widget display-only completion retention", () => {
     const stored = structuredClone(current);
     const retention = new FabricWidgetRetention();
     const widget = new FabricWidget(theme, () => current, 10, undefined, retention);
-    expect(widget.render(160)).toHaveLength(2);
+    expect(body(widget.render(160))).toHaveLength(2);
     vi.setSystemTime(39_999); current = { ...current, now: Date.now() };
-    expect(widget.render(160).join("\n")).toContain("finished");
+    expect(body(widget.render(160)).join("\n")).toContain("finished");
     expect(shouldShowFabricWidget(current, "auto", retention)).toBe(true);
     vi.setSystemTime(40_000); current = { ...current, now: Date.now() };
     expect(widget.hasChanged()).toBe(true);
-    expect(widget.render(160)).toHaveLength(1);
+    expect(body(widget.render(160))).toHaveLength(1);
     expect(shouldShowFabricWidget(current, "auto", retention)).toBe(false);
     expect(shouldShowFabricWidget(current, "always", retention)).toBe(true);
     expect(shouldShowFabricWidget(current, "hidden", retention)).toBe(false);
@@ -45,26 +51,26 @@ describe("widget display-only completion retention", () => {
     expect(current.agents[0]!.logFile).toBe("/tmp/events.jsonl");
   });
 
-  it("retires rows gradually, fixes +N and running counts, and shrinks height without padding", () => {
+  it("retires rows gradually, updates overflow and running counts, and shrinks height without padding", () => {
     vi.useFakeTimers(); vi.setSystemTime(39_999);
     let current = snapshot();
     current.agents = [agent("older", 10_000), agent("newer", 15_000), { ...agent("live"), status: "running" }];
-    const compact = new FabricWidget(theme, () => current, 2);
+    const compact = new FabricWidget(theme, () => current, 3);
     const full = new FabricWidget(theme, () => current, 8);
-    expect(compact.render(160)[1]).toContain("+2");
-    expect(full.render(160)).toHaveLength(4);
-    expect(full.render(160)[0]).toContain("1 running");
+    expect(body(compact.render(160))[0]).toContain("↓ 2 more");
+    expect(body(full.render(160))).toHaveLength(4);
+    expect(body(full.render(160))[0]).toContain("1 running");
     vi.setSystemTime(40_000); current = { ...current, now: Date.now() };
-    expect(compact.render(160)[1]).toContain("+1");
-    expect(full.render(160)).toHaveLength(3);
-    expect(full.render(160).join("\n")).not.toContain("older");
+    expect(body(compact.render(160))[0]).toContain("↓ 1 more");
+    expect(body(full.render(160))).toHaveLength(3);
+    expect(body(full.render(160)).join("\n")).not.toContain("older");
     vi.setSystemTime(44_999); current = { ...current, now: Date.now() };
-    expect(full.render(160).join("\n")).toContain("newer");
+    expect(body(full.render(160)).join("\n")).toContain("newer");
     vi.setSystemTime(45_000); current = { ...current, now: Date.now() };
-    expect(compact.render(160)[1]).not.toContain("+");
-    expect(full.render(160)).toHaveLength(2);
-    expect(full.render(160).every(line => line.trim().length > 0)).toBe(true);
-    expect(full.render(160)[0]).toContain("1 running");
+    expect(body(compact.render(160))[0]).not.toContain("more");
+    expect(body(full.render(160))).toHaveLength(2);
+    expect(body(full.render(160)).every(line => line.trim().length > 0)).toBe(true);
+    expect(body(full.render(160))[0]).toContain("1 running");
     expect(shouldShowFabricWidget(current, "auto")).toBe(true);
     expect(current.agents).toHaveLength(3);
   });
@@ -106,10 +112,10 @@ describe("widget display-only completion retention", () => {
     current.agents.push({ ...agent("resident", 1), status: "idle", residency: "durable" });
     current.now = 100_000;
     expect(shouldShowFabricWidget(current, "auto", retention)).toBe(true);
-    expect(new FabricWidget(theme, () => current, 8, undefined, retention).render(160).join("\n")).toContain("resident");
+    expect(body(new FabricWidget(theme, () => current, 8, undefined, retention).render(160)).join("\n")).toContain("resident");
     current.agents = [];
     current.actors = [{ id: "actor", name: "actor", status: "idle", worker: agent("worker", 1) } as FabricDashboardSnapshot["actors"][number]];
-    const lines = new FabricWidget(theme, () => current, 8).render(160);
+    const lines = body(new FabricWidget(theme, () => current, 8).render(160));
     expect(lines).toHaveLength(2);
     expect(lines[0]).toContain("1 actor");
     expect(lines.join("\n")).toContain("actor");
@@ -151,18 +157,18 @@ describe("controller idle expiry repaint", () => {
     const stored = structuredClone(records); const h = controllerFixture(refreshMs, records);
     try {
       h.controller.start(h.context);
-      expect(h.widget().render(160)).toHaveLength(3);
+      expect(body(h.widget().render(160))).toHaveLength(3);
       expect(h.controller.snapshot().agents.map(row => row.id).sort()).toEqual(["newer", "older"]);
       await vi.advanceTimersByTimeAsync(29_999);
-      expect(h.widget().render(160).join("\n")).toContain("older");
+      expect(body(h.widget().render(160)).join("\n")).toContain("older");
       h.requestRender.mockClear();
       await vi.advanceTimersByTimeAsync(1);
       expect(h.requestRender).toHaveBeenCalled();
-      expect(h.widget().render(160)).toHaveLength(2);
-      expect(h.widget().render(160).join("\n")).not.toContain("older");
+      expect(body(h.widget().render(160))).toHaveLength(2);
+      expect(body(h.widget().render(160)).join("\n")).not.toContain("older");
       expect(h.controller.snapshot().agents).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(4999);
-      expect(h.widget().render(160).join("\n")).toContain("newer");
+      expect(body(h.widget().render(160)).join("\n")).toContain("newer");
       await vi.advanceTimersByTimeAsync(1);
       expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
       expect(h.controller.snapshot().agents).toHaveLength(2);
@@ -180,7 +186,7 @@ describe("controller idle expiry repaint", () => {
     h.controller.state.peerInfos = () => [peer];
     try {
       h.controller.start(h.context);
-      expect(h.widget().render(160)).toHaveLength(2);
+      expect(body(h.widget().render(160))).toHaveLength(2);
       await vi.advanceTimersByTimeAsync(30_000);
       expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
       expect(h.controller.snapshot().peers).toEqual([peer]);
@@ -193,11 +199,11 @@ describe("controller idle expiry repaint", () => {
     vi.useFakeTimers(); vi.setSystemTime(10_000);
     const records = [participant("legacy")]; const h = controllerFixture(60_000, records);
     try {
-      h.controller.start(h.context); h.widget().render(160);
+      h.controller.start(h.context); body(h.widget().render(160));
       await vi.advanceTimersByTimeAsync(20_000);
       records[0]!.updatedAt = 30_000; h.refresh();
       await vi.advanceTimersByTimeAsync(100);
-      expect(h.widget().render(160).join("\n")).toContain("legacy");
+      expect(body(h.widget().render(160)).join("\n")).toContain("legacy");
       await vi.advanceTimersByTimeAsync(9899);
       expect(h.setWidget).not.toHaveBeenLastCalledWith("pi-fabric", undefined);
       await vi.advanceTimersByTimeAsync(1);

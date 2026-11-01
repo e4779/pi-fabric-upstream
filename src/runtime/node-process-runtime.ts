@@ -138,7 +138,9 @@ export class NodeProcessRuntime {
       };
       const scheduleDeadline = (): void => {
         clearTimeout(deadline);
-        if (settled || finishing || !Number.isFinite(deadlineAt)) return;
+        if (settled || finishing) return;
+        options.onDeadline?.(Number.isFinite(deadlineAt) ? deadlineAt : undefined);
+        if (!Number.isFinite(deadlineAt)) return;
         deadline = setTimeout(() => {
           const error = `Execution timed out after ${effectiveTimeoutMs}ms`;
           finish({ value: undefined, logs: [], terminationReason: "timed_out", error });
@@ -164,6 +166,7 @@ export class NodeProcessRuntime {
         suspend: () => {
           clearTimeout(deadline);
           deadlineAt = Infinity;
+          options.onDeadline?.(undefined);
         },
         resume: (remainingMs) => {
           deadlineAt = Date.now() + remainingMs;
@@ -242,7 +245,7 @@ export class NodeProcessRuntime {
         const waitsForHuman = options.isHumanWaitHostCall?.(message.ref, message.args) === true;
         if (waitsForHuman) humanWait.enter();
         const task = runAbortable(hostAbortController.signal, () =>
-          hostCall(message.ref, message.args, hostAbortController.signal),
+          hostCall(message.ref, message.args, hostAbortController.signal, (wait) => humanWait.run(wait)),
         ).finally(() => {
           if (waitsForHuman) humanWait.leave();
         }).then(
@@ -281,7 +284,7 @@ export class NodeProcessRuntime {
       scheduleDeadline();
       send(child, {
         type: "execute",
-        setup: guestSetupSource(options.piToolCanonicalFields, options.nativeStoreEnabled, options.codemodeProfile, options.nativeToolsEnabled),
+        setup: guestSetupSource(options.piToolCanonicalFields, options.nativeStoreEnabled, options.codemodeProfile, options.nativeToolsEnabled, options.providerGlobals),
         code: guestBundle.code,
         strings: options.strings ?? {},
         tokenBudget: options.tokenBudget,

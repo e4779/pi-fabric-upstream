@@ -28,6 +28,8 @@ export interface FabricUiAgent {
   model?: string;
   thinking?: string;
   currentTool?: string;
+  /** Latest declared fabric_exec display name. */
+  milestone?: string;
   startedAt?: number;
   updatedAt?: number;
   finishedAt?: number;
@@ -78,6 +80,8 @@ export interface FabricUiStateEntry {
 export interface FabricDashboardSnapshot {
   shells?: import("../core/shell-jobs.js").FabricShellJobInfo[];
   now: number;
+  /** This root session's peer label, such as `FAB-3`; it heads the widget. */
+  sessionLabel?: string;
   widgetDismissedAt?: number;
   runs: FabricActivityRun[];
   main: FabricUiMain;

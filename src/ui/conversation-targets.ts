@@ -88,6 +88,9 @@ const targetForAgent = (
   ...(agent.cwd ? { cwd: agent.cwd } : {}),
   ...(agent.branch ? { branch: agent.branch } : {}),
   ...(agent.usage ? { usage: { ...agent.usage } } : {}),
+  ...(agent.toolCalls !== undefined ? { toolCalls: agent.toolCalls } : {}),
+  ...(agent.startedAt !== undefined ? { startedAt: agent.startedAt } : {}),
+  ...(agent.finishedAt !== undefined ? { finishedAt: agent.finishedAt } : {}),
   ...(agent.updatedAt !== undefined ? { updatedAt: agent.updatedAt } : {}),
   ...eligibilityFor({
     status: agent.status,
@@ -132,6 +135,9 @@ const targetForActor = (
     ...(cwd ? { cwd } : {}),
     ...(worker?.branch ? { branch: worker.branch } : {}),
     ...(usage ? { usage: { ...usage } } : {}),
+    ...(worker?.toolCalls !== undefined ? { toolCalls: worker.toolCalls } : {}),
+    ...(worker?.startedAt !== undefined ? { startedAt: worker.startedAt } : {}),
+    ...(worker?.finishedAt !== undefined ? { finishedAt: worker.finishedAt } : {}),
     ...(actor.updatedAt !== undefined ? { updatedAt: actor.updatedAt } : {}),
     ...eligibilityFor({
       status: actor.status,

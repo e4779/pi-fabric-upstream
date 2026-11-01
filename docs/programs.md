@@ -114,7 +114,29 @@ pi.events.emit(FABRIC_PROGRAM_RUN_EVENT, {
 });
 ```
 
-The reply arrives exactly once. A payload without a `reply` function throws synchronously. Other invalid fields, a missing session, an unknown ref, and a failed run all reply `{ ok: false, error }`. The event runs in the live session that Fabric saw at `session_start`.
+The reply arrives exactly once. A payload without a `reply` function makes the listener throw synchronously; Pi's event bus catches and logs that throw, and other listeners still run. A `reply` property whose getter throws cannot be answered: Fabric neither replies nor throws. Other invalid fields, a missing session, an unknown ref, and a failed run all reply `{ ok: false, error }`. The event runs in the live session that Fabric saw at `session_start`.
+
+Fabric reads `reply` and the named fields (`ref`, `input`, `requirePromoted`, `signal`) once, when the event arrives, and ignores every other field. A request without `ref` also has `code` read, once. Fabric keeps a JSON copy of `input`, not the caller's object, and makes it last, so a `toJSON` or getter inside `input` cannot change the other fields. A caller that deletes or changes the request or its `input` afterwards changes nothing, and the reply still arrives on the original `reply`. A named field whose getter throws never escapes the listener: Fabric replies `{ ok: false, error: "Invalid program run request: <field> could not be read" }` before any other check, and nothing runs.
+
+### Running caller-supplied code
+
+A host extension that builds program text itself, such as a program that ships in a package or a small runner it generates per run, can pass the TypeScript text as `code`, with no `ref`. Extensions already run with the user's full permissions, so this adds no new power. Fabric computes the SHA-256 of the code's UTF-8 bytes and records it, so the trace says which text ran.
+
+```ts
+import { FABRIC_PROGRAM_RUN_EVENT, type FabricProgramRunReplyV1 } from "pi-fabric/protocol";
+
+pi.events.emit(FABRIC_PROGRAM_RUN_EVENT, {
+  code: "return { who: input.who };",
+  input: { who: "pi-stack" },      // optional, as for a ref run
+  reply: (result: FabricProgramRunReplyV1) => {},
+});
+```
+
+- A request with `ref` is a saved-program run and ignores `code`. Without `ref`, the request needs `code`. `requirePromoted` applies only to `ref`.
+- Fabric refuses with one `{ ok: false, error }` reply, before running anything, when `code` is empty or longer than 65 536 characters (the saved-program limit), or there is no active session. A session whose kernel is Python also refuses, because the code is TypeScript. So does a session without the `programs` provider, such as a managed embedded host, because the run goes through `programs.run`.
+- The run takes the saved-program path: a one-call host program invokes `programs.run`, which resolves the code in place of a saved record. A policy that denies `programs.run`, through `approvals.execute` or `approvals.actions["programs.run"]`, refuses a `code` request as it refuses a `ref` request. Actions inside the code face their own approvals. The run has the root capability view, `invokedBy: "host"`, and a `pi-fabric-program-run` message labelled `caller-code:<first 12 hex of the hash>`.
+- The trace records one `fabric.program.run` operation with `args: { program: "caller-code:<full sha256>", invokedBy: "host" }`. The reply's `program` and the message details' `program` carry the same value. The message details also carry `source: "caller-code"` and the full `sha256`, never the code. The `:` is outside the characters a program name may use, so no saved program can share this identity.
+- The code is held for that run only and resolves only inside the host run that supplied it, never for a model's `programs.run`. Nothing is written to the program store. The binding lasts for the whole host execution: a saved program that the code runs can itself call `programs.run` with `caller-code:<sha256>` and reach the same code, under the 16-run nesting budget and the same approvals. It is gone when the run ends, whether it succeeded, threw or was aborted.
 
 ## Mesh-triggered runs
 

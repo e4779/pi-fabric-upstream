@@ -4,8 +4,8 @@ import path from "node:path";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MeshStore, type MeshIdentity } from "../src/mesh/store.js";
-import { DecisionStore, type DecisionRecord } from "../src/decisions/store.js";
-import { requestHeadlessApproval, routeChildQuestion } from "../src/decisions/host.js";
+import { DecisionStore, MAX_DECISION_DEADLINE_MS, type DecisionRecord } from "../src/decisions/store.js";
+import { cancelOrphanedChildQuestions, requestHeadlessApproval, routeChildQuestion } from "../src/decisions/host.js";
 import { ApprovalController } from "../src/core/approval-controller.js";
 import type { ResolvedFabricAction } from "../src/core/action-registry.js";
 import type { AgentChildQuestionRequest } from "../src/agents/types.js";
@@ -113,6 +113,81 @@ describe("routeChildQuestion", () => {
     expect((await store.get(open.id))?.status).toBe("cancelled");
   });
 
+  it("holds a question as a root decision with the longest deadline, even with a parent UI", async () => {
+    let now = 1_000_000;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-decision-host-"));
+    roots.push(root);
+    const store = new DecisionStore(new MeshStore(root, 64 * 1024, 500), main, () => now);
+    const select = vi.fn(async () => "Alpha");
+    const notify = vi.fn();
+    const context = { hasUI: true, ui: { select, notify } } as unknown as ExtensionContext;
+    const routed = { ...request({ method: "select", title: "Pick", options: ["Alpha", "Beta"], hold: true }), hold: true as const };
+    const pending = routeChildQuestion(routed, { context, store });
+    const open = await waitForOpen(store);
+    expect(select).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledWith(expect.stringContaining(open.id), "info");
+    expect(open).toMatchObject({ kind: "question", holder: "root", title: "worker: Pick" });
+    expect(open.deadline).toBe(now + MAX_DECISION_DEADLINE_MS);
+    now += 2 * 60 * 60 * 1_000;
+    expect((await store.get(open.id))?.status).toBe("open");
+    await store.answer(open.id, { optionId: "o2" }, human);
+    expect(await pending).toEqual({ value: "Beta" });
+  });
+
+  it("bounds a held decision so a session that died without shutdown cannot leave it open forever", async () => {
+    // The raising session crashes: nothing aborts its wait or cancels the decision.
+    let now = 1_000_000;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-decision-host-"));
+    roots.push(root);
+    const crashed = new DecisionStore(new MeshStore(root, 64 * 1024, 500), main, () => now);
+    const routed = { ...request({ method: "select", title: "Pick", options: ["Alpha", "Beta"] }), hold: true as const };
+    const pending = routeChildQuestion(routed, { store: crashed });
+    const open = await waitForOpen(crashed);
+    // A later session, with a different identity, reads the same mesh.
+    const other: MeshIdentity = { id: "session:later", name: "main", kind: "main", sessionId: "later" };
+    const later = new DecisionStore(new MeshStore(root, 64 * 1024, 500), other, () => now);
+    now += 2 * 60 * 60 * 1_000;
+    expect((await later.get(open.id))?.status).toBe("open");
+    now += MAX_DECISION_DEADLINE_MS;
+    expect((await later.get(open.id))?.status).toBe("expired");
+    expect(await later.list({ status: "open" })).toEqual([]);
+    // Had the raiser lived, its child would have been released with a cancellation.
+    expect(await pending).toEqual({ cancelled: true });
+  });
+
+  it("holds through the UI with no timeout when there is no decision store", async () => {
+    vi.useFakeTimers();
+    try {
+      let answer: ((value: string) => void) | undefined;
+      const select = vi.fn((_title: string, _options: string[], _dialog?: unknown) =>
+        new Promise<string>((resolve) => { answer = resolve; }));
+      const editor = vi.fn(async () => "draft");
+      const context = { hasUI: true, ui: { select, editor } } as unknown as ExtensionContext;
+      const held = (question: Record<string, unknown>) => ({ ...request({ ...question, timeout: 1_000 }), hold: true as const });
+      const pending = routeChildQuestion(held({ method: "select", title: "Pick", options: ["Alpha", "Beta"] }), { context });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(select.mock.calls[0]![2]).not.toHaveProperty("timeout");
+      await vi.advanceTimersByTimeAsync(2 * 60 * 60 * 1_000);
+      answer!("Beta");
+      expect(await pending).toEqual({ value: "Beta" });
+      // The editor has no dialog timeout; a held one is not raced against a timer.
+      expect(await routeChildQuestion(held({ method: "editor", title: "Write" }), { context })).toEqual({ value: "draft" });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the question's deadline when the request does not hold", async () => {
+    const store = decisionStore();
+    const routed = request({ method: "input", title: "Name", hold: true });
+    const pending = routeChildQuestion(routed, { context: { hasUI: false } as ExtensionContext, store });
+    const open = await waitForOpen(store);
+    // The worker payload alone cannot ask for a hold; only the host-set request flag can.
+    expect(open.deadline).toBeDefined();
+    await store.answer(open.id, { text: "x" }, human);
+    expect(await pending).toEqual({ value: "x" });
+  });
+
   it("fails closed without UI or store, and on malformed requests", async () => {
     const context = { hasUI: false } as ExtensionContext;
     expect(await routeChildQuestion(request({ method: "input", title: "x" }), { context })).toEqual({ cancelled: true });
@@ -182,9 +257,42 @@ describe("/fabric decisions", () => {
 
     const text = await store.raise({ title: "Why?" });
     const input = vi.fn(async () => "because");
-    await openFabricDecisions(store.mesh, { hasUI: true, ui: { input, notify } } as unknown as ExtensionContext, text.id.slice(-6));
+    const answerFirst = vi.fn(async (_title: string, labels: string[]) => labels[0]);
+    await openFabricDecisions(store.mesh, { hasUI: true, ui: { select: answerFirst, input, notify } } as unknown as ExtensionContext, text.id.slice(-6));
     expect((await store.get(text.id))?.answer?.text).toBe("because");
     await openFabricDecisions(store.mesh, context);
     expect(notify).toHaveBeenLastCalledWith("No open Fabric decisions", "info");
+  });
+});
+
+describe("cancelOrphanedChildQuestions", () => {
+  const routed = { kind: "question", title: "worker: Pick", input: "text", holder: "root", timeoutMs: 60_000 };
+
+  it("cancels only the open routed questions its own identity raised", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-decision-orphans-"));
+    roots.push(root);
+    const mesh = new MeshStore(root, 64 * 1024, 500);
+    const host = new DecisionStore(mesh, { id: "resident:abc", name: "host", kind: "agent", sessionId: "s" });
+    // The durable child itself runs Fabric under the run id and may raise its own decisions.
+    const child = new DecisionStore(mesh, { id: "run-1", name: "child", kind: "agent", sessionId: "c" });
+    const otherHost = new DecisionStore(mesh, { id: "resident:def", name: "other", kind: "agent", sessionId: "o" });
+
+    const orphan = await host.raise(routed, { participantId: "run-1", runId: "run-1" });
+    const childOwn = await child.raise(routed, { runId: "run-1" });
+    const elsewhere = await otherHost.raise(routed, { participantId: "run-2", runId: "run-2" });
+    const approval = await host.raise({ ...routed, kind: "approval" }, { participantId: "run-1", runId: "run-1" });
+    const runless = await host.raise(routed, {});
+    const answered = await host.raise(routed, { participantId: "run-3", runId: "run-3" });
+    await host.answer(answered.id, { text: "done" }, human);
+
+    expect(await cancelOrphanedChildQuestions(host)).toEqual([orphan.id]);
+    expect(await host.get(orphan.id)).toMatchObject({
+      status: "cancelled",
+      answer: { answeredBy: "resident:abc", via: "restart" },
+    });
+    for (const untouched of [childOwn, elsewhere, approval, runless]) {
+      expect(await host.get(untouched.id)).toMatchObject({ status: "open" });
+    }
+    expect(await host.get(answered.id)).toMatchObject({ status: "answered" });
   });
 });

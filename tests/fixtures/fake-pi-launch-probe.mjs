@@ -27,6 +27,10 @@ const surface = {
   extensions: !argv.includes("--no-extensions"),
   extensionPath: flag("-e"),
   tools: flag("--tools")?.split(",") ?? [],
+  noSkills: argv.includes("--no-skills"),
+  skillPaths: argv.flatMap((arg, index) => (arg === "--skill" ? [argv[index + 1]] : [])),
+  childSkillsEnv: process.env.PI_FABRIC_CHILD_SKILLS,
+  appendSystemPrompt: argv.flatMap((arg, index) => (arg === "--append-system-prompt" ? [argv[index + 1]] : [])),
   fullCodeModeEnv: process.env.PI_FABRIC_FULL_CODE_MODE,
   toolAllowlistEnv: process.env.PI_FABRIC_TOOL_ALLOWLIST
     ? JSON.parse(process.env.PI_FABRIC_TOOL_ALLOWLIST)

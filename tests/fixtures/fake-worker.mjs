@@ -112,6 +112,52 @@ if (task.includes("HANG")) {
       usage: addUsage({ input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0.001 }),
     }),
   );
+} else if (task.includes("REATTACH")) {
+  // A long durable worker that outlives its resident host. Each attempt is
+  // counted beside the status file; it runs until a "release" file appears in
+  // the run directory, then completes with the attempt that finished it. The
+  // --carry-over prefix seeds a relaunched attempt as a real worker does.
+  const runDirectory = path.dirname(statusFile);
+  const marker = path.join(runDirectory, "reattach-attempts");
+  const attempt = fs.existsSync(marker) ? Number(fs.readFileSync(marker, "utf8")) + 1 : 1;
+  fs.writeFileSync(marker, String(attempt));
+  const carryOver = args.has("carry-over") ? JSON.parse(args.get("carry-over")) : undefined;
+  const running = {
+    id: args.get("id"),
+    name: args.get("name"),
+    task,
+    status: "running",
+    runner: args.get("runner") ?? "pi",
+    transport: args.get("transport"),
+    cwd: args.get("cwd"),
+    residency: "durable",
+    startedAt: Date.now(),
+    updatedAt: Date.now(),
+    turns: (carryOver?.turns ?? 0) + 2,
+    toolCalls: (carryOver?.toolCalls ?? 0) + 1,
+    text: "",
+    exitCode: null,
+    usage: carryOver?.usage ?? { input: 7, output: 3, cacheRead: 0, cacheWrite: 0, cost: 0 },
+  };
+  fs.mkdirSync(runDirectory, { recursive: true });
+  fs.writeFileSync(statusFile, JSON.stringify(running));
+  process.on("SIGTERM", () => process.exit(0));
+  const poll = () => {
+    if (!fs.existsSync(path.join(runDirectory, "release"))) {
+      setTimeout(poll, 50);
+      return;
+    }
+    const finishedAt = Date.now();
+    fs.writeFileSync(statusFile, JSON.stringify({
+      ...running,
+      status: "completed",
+      updatedAt: finishedAt,
+      finishedAt,
+      text: `reattach attempt ${attempt}`,
+    }));
+    process.exit(0);
+  };
+  poll();
 } else if (task.includes("LIVE_WITH_PROGRESS")) {
   // A live attempt that already did work, keeps running, and finishes on its own
   // unless a stop or a kill gets there first. Attempts are counted beside the
@@ -248,6 +294,7 @@ if (task.includes("HANG")) {
     ...(args.has("model") ? { model: args.get("model") } : {}),
     ...(args.has("thinking") ? { thinking: args.get("thinking") } : {}),
     ...(args.has("system-prompt") ? { systemPrompt: args.get("system-prompt") } : {}),
+    ...(args.has("skills") ? { skills: JSON.parse(args.get("skills")) } : {}),
   };
   fs.mkdirSync(path.dirname(statusFile), { recursive: true });
   if (lifecycleFile) {

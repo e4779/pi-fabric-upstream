@@ -187,17 +187,16 @@ describe("FabricControlPlane", () => {
     const receiver = plane(meshRoot, "host:receiver");
     const receive = vi.fn(() => ({ accepted: true, messageId: "recovered" }));
     receiver.start(receive);
-    await new Promise((resolve) => setTimeout(resolve, 80));
-
-    expect(receive).toHaveBeenCalledTimes(1);
-    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
+    // The acknowledgement follows the handler; slow runners take well over 80 ms to recover.
+    await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
       expect.objectContaining({
         data: expect.objectContaining({
           commandId: "command:before-start",
           accepted: true,
         }),
       }),
-    );
+    ), { timeout: 5_000 });
+    expect(receive).toHaveBeenCalledTimes(1);
   });
 
   it("rejects an interrupted durable claim as indeterminate after restart", async () => {
@@ -239,10 +238,7 @@ describe("FabricControlPlane", () => {
     const receiver = plane(meshRoot, "host:receiver");
     const receive = vi.fn(() => ({ accepted: true }));
     receiver.start(receive);
-    await new Promise((resolve) => setTimeout(resolve, 80));
-
-    expect(receive).not.toHaveBeenCalled();
-    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
+    await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
       expect.objectContaining({
         data: expect.objectContaining({
           commandId,
@@ -250,7 +246,8 @@ describe("FabricControlPlane", () => {
           error: "Fabric control outcome is indeterminate after owner restart",
         }),
       }),
-    );
+    ), { timeout: 5_000 });
+    expect(receive).not.toHaveBeenCalled();
   });
 
   it("does not re-execute a command republished after owner restart", async () => {
@@ -282,10 +279,8 @@ describe("FabricControlPlane", () => {
       ...(original!.to ? { to: original!.to } : {}),
       ...(original!.data === undefined ? {} : { data: original!.data }),
     });
-    await new Promise((resolve) => setTimeout(resolve, 80));
-
+    await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 }).length).toBeGreaterThan(1), { timeout: 5_000 });
     expect(restartedHandler).not.toHaveBeenCalled();
-    expect(store.read({ topic: "fabric.control.ack", limit: 10 }).length).toBeGreaterThan(1);
   });
 
   it("rejects a replay outside the acknowledgement lifetime", async () => {
@@ -311,10 +306,7 @@ describe("FabricControlPlane", () => {
         requestedAt: Date.now() - 5_000,
       },
     });
-    await new Promise((resolve) => setTimeout(resolve, 80));
-
-    expect(receive).not.toHaveBeenCalled();
-    expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
+    await vi.waitFor(() => expect(store.read({ topic: "fabric.control.ack", limit: 10 })).toContainEqual(
       expect.objectContaining({
         data: expect.objectContaining({
           commandId: "command:replayed",
@@ -322,7 +314,8 @@ describe("FabricControlPlane", () => {
           error: "Fabric control command expired",
         }),
       }),
-    );
+    ), { timeout: 5_000 });
+    expect(receive).not.toHaveBeenCalled();
   });
 
   it("final-drains a command published immediately before close", async () => {

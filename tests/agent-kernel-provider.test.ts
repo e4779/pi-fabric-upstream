@@ -9,6 +9,7 @@ import type { FabricActorRequest } from "../src/actors/types.js";
 import { DEFAULT_FABRIC_CONFIG } from "../src/config.js";
 import type { FabricInvocationContext } from "../src/protocol.js";
 import { AGENTS_ACTION_DESCRIPTORS } from "../src/providers/agents-actions.js";
+import { BUILT_IN_RUNNER_IDS, getAgentRunner } from "../src/agents/runner-registry.js";
 import { AgentsProvider } from "../src/providers/agents-provider.js";
 import { ResidentActorClient } from "../src/residency/actor-client.js";
 import { guestTypeDeclarations } from "../src/runtime/guest-types.js";
@@ -94,6 +95,32 @@ describe("agent kernel public contracts", () => {
     for (const bad of [null, 42, true, {}, []]) {
       expect(Value.Check(schema, { task: "task", systemPrompt: bad })).toBe(false);
     }
+  });
+
+  // The manager joins systemPrompt ahead of component guidance (see the
+  // agent-manager guidance test); the help must not say it goes below.
+  it.each(["run", "spawn"])("describes where agents.%s places systemPrompt", (name) => {
+    const schema = AGENTS_ACTION_DESCRIPTORS.find((action) => action.name === name)!.inputSchema as {
+      properties: { systemPrompt: { description: string } };
+    };
+    const description = schema.properties.systemPrompt.description;
+    expect(description).toContain("ahead of any component guidance");
+    expect(description).not.toContain("below component guidance");
+    expect(description).toContain("<system_instructions>");
+  });
+
+  // The help must name every built-in runner the action cannot serve, so a
+  // caller does not learn about the gap only from the runtime error.
+  it.each([
+    ["compact", "compaction"],
+    ["models", "modelDiscovery"],
+  ] as const)("agents.%s describes each built-in runner without %s", (name, capability) => {
+    const description = AGENTS_ACTION_DESCRIPTORS.find((action) => action.name === name)!.description;
+    const missing = [...BUILT_IN_RUNNER_IDS]
+      .map((id) => getAgentRunner(id)!)
+      .filter((adapter) => !adapter.capabilities[capability]);
+    expect(missing.length).toBeGreaterThan(0);
+    for (const adapter of missing) expect(description).toContain(adapter.label);
   });
 
   it.each(["ask", "tell"])("does not expose an activation-time language switch on %s", (name) => {

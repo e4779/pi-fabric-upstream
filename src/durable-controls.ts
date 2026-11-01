@@ -28,6 +28,7 @@ export async function openDurableControls(options: {
   const Boundary = durable.defineDoc<{ closed: boolean }>({
     kind: "fabric.durable.completion", version: 1, scope: "conversation", history: "latest", fork: "initial",
     initial: () => ({ closed: false }),
+    checkpointWhen: () => true,
   });
   await conversation.commit(async tx => { await tx.doc(Boundary, conversation.id); }, context);
   let stopping = false;

@@ -12,6 +12,10 @@ Pi Fabric uses a core-first, user-opt-in skill hierarchy.
 
 The parent agent behaves like regular Pi until the user explicitly opts into orchestration, recursion, Schema, Jev programs, ambient actors, or swarm coordination.
 
+## Managed host skill loading
+
+Managed embedded hosts supply their own skill resources. Fabric does not contribute its bundled coding workflows to these hosts. Set `managedHost.skillReader` to a dotted host callable such as `mcp.files.read` to use it in both the restored skill catalog and delegated-skill loading hints. If it is omitted, Fabric keeps the host's catalog but adds no reader instruction or delegated-loading hint; host guidance owns that workflow. Ordinary Pi sessions continue using `pi.read` inside `fabric_exec`. See [managed embedded hosts](providers.md#managed-embedded-hosts).
+
 ## Information hierarchy
 
 1. Put required ordered actions and checkable completion criteria in `SKILL.md`.
@@ -38,7 +42,7 @@ A mandatory pointer serves legibility and single-source maintenance. Per-run tok
 
 - `/skill:fabric-guide`: choose a workflow.
 - `/skill:fabric-workflow`: run finite fan-out or pipeline work with verification.
-- `/skill:fabric-council`: get role diversity from the same model.
+- `/skill:fabric-council`: get role diversity, on the session model or with one pinned model per seat.
 - `/skill:fabric-fusion`: run multi-model deliberation (compare) or acting (read-only references + one actor).
 - `/skill:fabric-rlm`: decompose context recursively.
 - `/skill:fabric-schema`: gate mutation behind evidence.

@@ -4,6 +4,7 @@ import type { FabricActivityRun } from "../activity/types.js";
 import type { FabricState } from "../fabric-state.js";
 import type { MeshEvent, MeshStateEntry } from "../mesh/store.js";
 import type { AgentHandleInfo, AgentRunRecord } from "../agents/types.js";
+import type { GlobalActorDefinition } from "../actors/types.js";
 import { safeText } from "./format.js";
 import {
   activeStatuses,
@@ -116,13 +117,29 @@ export const createDashboardSnapshot = (
   const actorRecords = state.actors.list();
   const main = state.mainAgentInfo(context);
   const peers = typeof state.peerInfos === "function" ? state.peerInfos() : [];
-  const globalActors = state.globalActors.list();
+  // An unreadable registry is reported at startup and by every global actor
+  // action; the dashboard shows no templates rather than failing to render.
+  let globalActors: GlobalActorDefinition[];
+  try {
+    globalActors = state.globalActors.list();
+  } catch {
+    globalActors = [];
+  }
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
   const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200) : [];
   const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
-  const inputs = { runs, agentRecords, actorRecords, participants, main, peers, shells,
-    globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt };
+  const sessionLabel = typeof state.sessionLabel === "function" ? state.sessionLabel() : undefined;
+  const residentLogs: Record<string, string> = {};
+  if (typeof state.residentAgentForUi === "function") {
+    for (const participant of participants) {
+      if (participant.kind !== "agent" || participant.rootId !== main.id || participant.residency !== "durable") continue;
+      const record = state.residentAgentForUi(participant.id);
+      if (record && isRunRecord(record) && record.logFile) residentLogs[participant.id] = record.logFile;
+    }
+  }
+  const inputs = { runs, agentRecords, actorRecords, participants, residentLogs, main, peers, shells,
+    globalActors, componentGraph, meshEntries, events, widgetDismissedAt: state.widgetDismissedAt, sessionLabel };
   const previous = cache?.get(inputs);
   if (previous) return previous;
   const agentLinks: Array<{ runId: string; call: FabricActivityRun["calls"][number] }> = [];
@@ -183,6 +200,7 @@ export const createDashboardSnapshot = (
       updatedAt: record.updatedAt,
       ...(record.finishedAt !== undefined ? { finishedAt: record.finishedAt } : {}),
       ...(record.currentTool ? { currentTool: record.currentTool } : {}),
+      ...(record.milestone ? { milestone: record.milestone } : {}),
       turns: record.turns,
       toolCalls: record.toolCalls,
       usage: { ...record.usage },
@@ -270,6 +288,7 @@ export const createDashboardSnapshot = (
       cwd: participant.cwd ?? "",
       ...(participant.model ? { model: participant.model } : {}),
       ...(participant.thinking ? { thinking: participant.thinking } : {}),
+      ...(residentLogs[participant.id] ? { logFile: residentLogs[participant.id] } : {}),
       ...(participant.currentTool ? { currentTool: participant.currentTool } : {}),
       startedAt: participant.startedAt,
       updatedAt: participant.updatedAt,
@@ -324,6 +343,7 @@ export const createDashboardSnapshot = (
     main,
     peers,
     participants,
+    ...(sessionLabel ? { sessionLabel } : {}),
     widgetDismissedAt: state.widgetDismissedAt,
     globalActors,
     agents: visibleAgents,

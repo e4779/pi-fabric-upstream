@@ -1,4 +1,11 @@
-import type { BashOperations, BashToolOptions, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { FabricActionPolicyHookV1 } from "./core/action-policy-hooks.js";
+import type {
+  BashOperations,
+  BashToolOptions,
+  CompactionResult,
+  ExtensionContext,
+  SessionBeforeCompactEvent,
+} from "@earendil-works/pi-coding-agent";
 
 /** Host-local opt-in on a bash ToolDefinition; never serialized into guest schemas. */
 export const FABRIC_BASH_MIDDLEWARE = Symbol.for("pi-fabric:bash-middleware:v1");
@@ -58,22 +65,138 @@ export interface FabricWorkflowItemEventV1 {
   meta?: Record<string, unknown>;
 }
 
-/** Host-local request: run a saved program without the model, like `/fabric run`. */
+/** Host-local request: run a saved program or caller-supplied code without the model, like `/fabric run`. */
 export const FABRIC_PROGRAM_RUN_EVENT = "pi-fabric:program:run:v1";
 
 export type FabricProgramRunReplyV1 =
   | { ok: true; program: string; value: unknown; logs: string[] }
   | { ok: false; error: string; program?: string };
 
-export interface FabricProgramRunRequestV1 {
-  /** name, name@<digest prefix >= 12>, or a full digest. */
-  ref: string;
+interface FabricProgramRunRequestBaseV1 {
+  /** JSON, at most 64 KiB; reaches the program as `input`. */
   input?: unknown;
-  requirePromoted?: boolean;
   signal?: AbortSignal;
   /** Called exactly once. */
   reply: (result: FabricProgramRunReplyV1) => void;
 }
+
+/** Runs a saved program. Exactly one of `ref` or `code` is allowed. */
+export interface FabricProgramRunByRefRequestV1 extends FabricProgramRunRequestBaseV1 {
+  /** name, name@<digest prefix >= 12>, or a full digest. */
+  ref: string;
+  requirePromoted?: boolean;
+  code?: never;
+}
+
+/**
+ * Runs TypeScript program text the caller built, without saving it anywhere.
+ * Fabric computes the SHA-256 of the code and records it in the trace.
+ */
+export interface FabricProgramRunByCodeRequestV1 extends FabricProgramRunRequestBaseV1 {
+  /** Non-empty TypeScript, at most 65 536 characters. */
+  code: string;
+  ref?: never;
+  requirePromoted?: never;
+}
+
+export type FabricProgramRunRequestV1 = FabricProgramRunByRefRequestV1 | FabricProgramRunByCodeRequestV1;
+
+/** The request fields Fabric reads, once, when a program run event arrives. */
+export type FabricProgramRunFieldV1 = "ref" | "code" | "input" | "requirePromoted" | "signal";
+
+/**
+ * Everything a program run listener keeps of a request. Read once, at the event
+ * boundary and before the listener's first await, so a caller that deletes or
+ * replaces a field afterwards cannot change what runs or lose its reply.
+ */
+export interface FabricProgramRunSnapshotV1 {
+  readonly ref: unknown;
+  readonly code: unknown;
+  /** A JSON copy of the caller's `input`, never the caller's object. */
+  readonly input: unknown;
+  readonly requirePromoted: unknown;
+  readonly signal: unknown;
+  /**
+   * The first field whose getter threw when read; the handler refuses the
+   * request by name instead of letting the throw escape.
+   */
+  readonly unreadable: FabricProgramRunFieldV1 | undefined;
+  /** Calls the caller's `reply` at most once, directly, and never throws. */
+  readonly respond: (result: FabricProgramRunReplyV1) => void;
+}
+
+// Stands in for input that is not JSON. It is not JSON either, so the run
+// refuses it with the error it always gave.
+const NOT_JSON_INPUT = Symbol("not JSON");
+
+/**
+ * A JSON copy of `input`, so a caller that changes the input's contents after
+ * emitting cannot change what runs.
+ */
+const copyProgramRunInput = (input: unknown): unknown => {
+  if (input === undefined) return undefined;
+  try {
+    const text = JSON.stringify(input);
+    if (text !== undefined) return JSON.parse(text) as unknown;
+  } catch {
+    // Not JSON-compatible.
+  }
+  return NOT_JSON_INPUT;
+};
+
+/**
+ * Reads `reply` and each named field once, and never lets a getter's throw out.
+ * Returns undefined when `reply` cannot be read, because nobody can be told.
+ * Throws when `reply` reads as something other than a function, as the event
+ * has always done for a payload without a `reply` function.
+ */
+export const snapshotFabricProgramRunRequestV1 = (value: unknown): FabricProgramRunSnapshotV1 | undefined => {
+  const request = value as Record<string, unknown> | null | undefined;
+  let reply: unknown;
+  try {
+    reply = request?.reply;
+  } catch {
+    return undefined;
+  }
+  if (typeof reply !== "function") throw new Error("Invalid Pi Fabric program run request");
+  let unreadable: FabricProgramRunFieldV1 | undefined;
+  const read = (field: FabricProgramRunFieldV1): unknown => {
+    try {
+      return request![field];
+    } catch {
+      unreadable ??= field;
+      return undefined;
+    }
+  };
+  let replied = false;
+  const respond = (result: FabricProgramRunReplyV1): void => {
+    if (replied) return;
+    replied = true;
+    try {
+      reply(result);
+    } catch {
+      // A throwing listener must not turn into an unhandled rejection.
+    }
+  };
+  // Read the plain fields before `input`: copying `input` runs its `toJSON`
+  // and getters, which must not be able to change what else the request says.
+  const ref = read("ref");
+  // A request with `ref` is a saved-program run, as it was before `code`
+  // existed: it never reads `code`, so a getter on it cannot refuse the run.
+  const code = ref === undefined && unreadable === undefined ? read("code") : undefined;
+  const requirePromoted = read("requirePromoted");
+  const signal = read("signal");
+  const input = copyProgramRunInput(read("input"));
+  return Object.freeze({
+    ref,
+    code,
+    input,
+    requirePromoted,
+    signal,
+    unreadable,
+    respond,
+  });
+};
 
 export const FABRIC_PROVIDER_REGISTER_EVENT = "pi-fabric:provider:register:v1";
 export const FABRIC_PROVIDER_DISCOVER_EVENT = "pi-fabric:provider:discover:v1";
@@ -160,6 +283,274 @@ export type {
   FabricChildTraceContextRequestV1,
   FabricTraceContextV1,
 } from "./agents/trace-context.js";
+
+/**
+ * Host-local compaction ownership. One extension at a time may claim
+ * compaction from Fabric: Fabric's compactor, threshold trigger and threshold
+ * deferral stand down, and `compact.*` program calls route to the owner.
+ * `/tree` branch summaries stay with Fabric unless the claim sets
+ * `branchSummary`. Fabric drops the claim on withdrawal, when `signal`
+ * aborts, and at its own `session_shutdown` (reload, session switch, quit).
+ * Fabric loads its claim code on the first message, so the reply may come
+ * after `emit` returns.
+ */
+export const FABRIC_COMPACTION_OWNER_EVENT = "pi-fabric:compaction-owner:v1";
+
+export type FabricCompactionOwnerRequestFieldV1 = "reason" | "instructions" | "preserve" | "requestedBy" | "seed";
+export type FabricCompactionOwnerCarryFieldV1 = "items" | "add" | "remove" | "clear";
+export type FabricCompactionOwnerActionNameV1 = "request" | "status" | "pressure" | "carry" | "cancel";
+
+export interface FabricCompactionOwnerIdentityV1 {
+  /** 1-128 characters, no control characters or surrounding whitespace. */
+  name: string;
+  /** 1-64 characters, same rules. */
+  version: string;
+}
+
+/** Validated `compact.request` arguments; only declared fields ever appear. */
+export interface FabricCompactionOwnerRequestV1 {
+  reason?: string;
+  instructions?: string;
+  preserve?: string[];
+  requestedBy?: string;
+  /**
+   * Text to send after the owner's compaction commits. Send it as Fabric
+   * does: a labelled custom message that starts a turn, not a user message.
+   */
+  seed?: string;
+}
+
+/** Validated `compact.carry` arguments; an empty object reads the list. */
+export interface FabricCompactionOwnerCarryUpdateV1 {
+  items?: string[];
+  add?: string[];
+  remove?: string[];
+  clear?: boolean;
+}
+
+export interface FabricCompactionOwnerCarryResultV1 {
+  items: string[];
+}
+
+/** The owner's own ladder, reported beside Fabric's pressure band. */
+export interface FabricCompactionOwnerPressureV1 {
+  /** 1-64 characters. */
+  stage: string;
+  /** At most 16 named finite numbers (names 1-64 characters). */
+  thresholds?: Record<string, number>;
+}
+
+type FabricCompactionOwnerResult<T> = T | Promise<T>;
+
+/** Passed to every owner handler. */
+export interface FabricCompactionOwnerCallV1 {
+  /** The invoking session's extension context, when Fabric has one. */
+  context: ExtensionContext | undefined;
+  /**
+   * Aborts when the calling program is cancelled or the handler runs longer
+   * than 30 seconds. Fabric has already failed the program call by then,
+   * naming the owner and the action; stop the work.
+   */
+  signal: AbortSignal;
+}
+
+/**
+ * Supported `compact.*` actions. An absent action, or a request/carry field
+ * absent from `fields`, fails the program call with an error naming the owner.
+ * Every handler receives `{ context, signal }` (`FabricCompactionOwnerCallV1`).
+ */
+export interface FabricCompactionOwnerActionsV1 {
+  request?: {
+    fields: readonly FabricCompactionOwnerRequestFieldV1[];
+    handler: (request: FabricCompactionOwnerRequestV1, call: FabricCompactionOwnerCallV1) => unknown;
+  };
+  /** Result: JSON, at most 16 KiB; reported as `ownerStatus`. */
+  status?: { handler: (call: FabricCompactionOwnerCallV1) => unknown };
+  pressure?: {
+    handler: (call: FabricCompactionOwnerCallV1) => FabricCompactionOwnerResult<FabricCompactionOwnerPressureV1>;
+  };
+  carry?: {
+    fields: readonly FabricCompactionOwnerCarryFieldV1[];
+    handler: (
+      update: FabricCompactionOwnerCarryUpdateV1,
+      call: FabricCompactionOwnerCallV1,
+    ) => FabricCompactionOwnerResult<FabricCompactionOwnerCarryResultV1>;
+  };
+  cancel?: { handler: (call: FabricCompactionOwnerCallV1) => unknown };
+}
+
+export type FabricCompactionFallbackResultV1 =
+  | { ok: true; compaction: CompactionResult }
+  | { ok: false; reason: string };
+
+export interface FabricCompactionFallbackOptionsV1 {
+  /** Carry-forward items to render; omitted renders Fabric's stored list. */
+  carry?: readonly string[];
+}
+
+/** Returned to the claimant only; the token is the withdrawal credential. */
+export interface FabricCompactionOwnerHandleV1 {
+  readonly token: string;
+  /** False once the claim is withdrawn or cleared. */
+  readonly active: boolean;
+  /** Releases the claim and restores Fabric's engine; false when no longer held. */
+  withdraw(): boolean;
+  /**
+   * Fabric's deterministic summary (summary compiler plus its enrichers) for
+   * the given `session_before_compact` event. Return `{ compaction }` from
+   * the owner's own handler when its model summary fails.
+   */
+  fallback(
+    event: SessionBeforeCompactEvent,
+    context?: ExtensionContext,
+    options?: FabricCompactionFallbackOptionsV1,
+  ): FabricCompactionFallbackResultV1;
+}
+
+export type FabricCompactionOwnerClaimResultV1 =
+  | {
+    ok: true;
+    handle: FabricCompactionOwnerHandleV1;
+    /**
+     * Fabric's carry-forward items when the claim was made, as a frozen copy.
+     * Under the claim `compact.carry` goes to the owner, so this is the list
+     * the owner takes over. Absent when Fabric has not started the session
+     * yet (the owner's `session_start` ran before Fabric's).
+     */
+    carry?: readonly string[];
+  }
+  | { ok: false; error: string; holder?: FabricCompactionOwnerIdentityV1 };
+
+export interface FabricCompactionOwnerClaimV1 {
+  version: 1;
+  type: "claim";
+  owner: FabricCompactionOwnerIdentityV1;
+  actions: FabricCompactionOwnerActionsV1;
+  /** Also take `/tree` branch summaries. Omitted or false: Fabric keeps them. */
+  branchSummary?: boolean;
+  /** Aborting releases the claim; bind it to the owner's own lifetime. */
+  signal?: AbortSignal;
+  /**
+   * Called once, possibly after `emit` returns. Wait with a timeout, abort
+   * `signal` when giving up, and withdraw a grant that arrives late.
+   */
+  reply: (result: FabricCompactionOwnerClaimResultV1) => void;
+}
+
+export type FabricCompactionOwnerWithdrawResultV1 =
+  | { ok: true }
+  | { ok: false; error: string };
+
+export interface FabricCompactionOwnerWithdrawV1 {
+  version: 1;
+  type: "withdraw";
+  /** The token from the claim handle; any other token is refused. */
+  token: string;
+  reply?: (result: FabricCompactionOwnerWithdrawResultV1) => void;
+}
+
+export type FabricCompactionOwnerMessageV1 =
+  | FabricCompactionOwnerClaimV1
+  | FabricCompactionOwnerWithdrawV1;
+export const FABRIC_HOST_POLICY_EVENT = "pi-fabric:host-policy:v1";
+export const MAX_FABRIC_HOST_POLICY_NAMES = 256;
+
+/** Every policy field this build enforces. A request naming any other field is refused. */
+export const FABRIC_HOST_POLICY_FIELDS = ["owner", "reason", "deniedTools", "deniedProviders", "allowedRefs"] as const;
+export type FabricHostPolicyField = (typeof FABRIC_HOST_POLICY_FIELDS)[number];
+
+/**
+ * The one restriction an embedding host (for example a delegate worker runner)
+ * places on this Fabric instance. The host sends it before the instance runs
+ * anything; Fabric seals it on the first program or provider call, so it
+ * cannot be replaced, widened or added to afterwards.
+ *
+ * - `deniedTools`: Pi core and captured extension tool names refused through
+ *   `pi.*` and `extensions.*`.
+ * - `deniedProviders`: Fabric providers refused entirely.
+ * - `allowedRefs`: exact `provider.action` refs, or `provider.*`, that the
+ *   host allows outside `pi.*` and `extensions.*`. Those providers do not
+ *   replay Pi `tool_call` hooks. Without an entry, only Fabric's fixed set of
+ *   built-in read-only actions is allowed; a provider's own `risk` label never
+ *   grants anything.
+ *
+ * Any policy also refuses native executors, which bypass tool hooks.
+ */
+export interface FabricHostPolicyV1 {
+  owner: string;
+  reason: string;
+  deniedTools?: string[];
+  deniedProviders?: string[];
+  allowedRefs?: string[];
+}
+
+/** `accepted: true` means the policy is in force and will be sealed unchanged. */
+export type FabricHostPolicyReplyV1 =
+  | { version: 1; accepted: true; digest: string; enforced: FabricHostPolicyField[] }
+  | { version: 1; accepted: false; reason: string };
+
+/** Host-local synchronous request; Fabric replies before `emit` returns. */
+export interface FabricHostPolicyRequestV1 {
+  policy: FabricHostPolicyV1;
+  reply: (reply: FabricHostPolicyReplyV1) => void;
+}
+
+const HOST_POLICY_FIELD_SET: ReadonlySet<string> = new Set(FABRIC_HOST_POLICY_FIELDS);
+const HOST_POLICY_REF = /^[a-z][a-z0-9_-]*\.(?:\*|[^\s*]+(?:\.\*)?)$/;
+// Same rule as the registry's provider names, so an entry that can never name
+// a provider ("MCP", "mcp ") is refused instead of acknowledged and ignored.
+const HOST_POLICY_PROVIDER = /^[a-z][a-z0-9_-]*$/;
+// Tool names as model APIs accept them: letters, digits, `_` and `-`.
+const HOST_POLICY_TOOL = /^[A-Za-z0-9_-]+$/;
+
+const boundedNames = (value: unknown, pattern?: RegExp): value is string[] =>
+  Array.isArray(value) &&
+  value.length <= MAX_FABRIC_HOST_POLICY_NAMES &&
+  value.every((name) => typeof name === "string" && name.length > 0 && name.length <= 256 && (!pattern || pattern.test(name)));
+
+const boundedLabel = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= 1_024;
+
+/**
+ * Copies named fields only. A request without a reply function is ignored.
+ * A malformed policy, or one with a field this build does not enforce, is
+ * refused whole with a reason and never partially applied.
+ */
+export const readFabricHostPolicyRequestV1 = (
+  value: unknown,
+):
+  | { ok: true; request: FabricHostPolicyRequestV1 }
+  | { ok: false; reason: string; reply: FabricHostPolicyRequestV1["reply"] }
+  | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.reply !== "function") return undefined;
+  const reply = record.reply as FabricHostPolicyRequestV1["reply"];
+  const refuse = (reason: string) => ({ ok: false as const, reason, reply });
+  const raw = record.policy;
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return refuse("policy must be an object");
+  const policy = raw as Record<string, unknown>;
+  const unknown = Object.keys(policy).filter((key) => !HOST_POLICY_FIELD_SET.has(key));
+  if (unknown.length > 0) return refuse(`unsupported policy fields: ${unknown.slice(0, 8).join(", ")}`);
+  if (!boundedLabel(policy.owner) || !boundedLabel(policy.reason)) return refuse("owner and reason must be non-empty strings of at most 1024 characters");
+  if (policy.deniedTools !== undefined && !boundedNames(policy.deniedTools, HOST_POLICY_TOOL)) return refuse("deniedTools must be a list of tool names (letters, digits, _ and -)");
+  if (policy.deniedProviders !== undefined && !boundedNames(policy.deniedProviders, HOST_POLICY_PROVIDER)) return refuse("deniedProviders must be a list of provider names (lowercase letters, digits, _ and -, starting with a letter)");
+  if (policy.allowedRefs !== undefined && !boundedNames(policy.allowedRefs, HOST_POLICY_REF)) return refuse("allowedRefs must be a list of provider.action or provider.* refs");
+  return {
+    ok: true,
+    request: {
+      policy: {
+        owner: policy.owner,
+        reason: policy.reason,
+        ...(policy.deniedTools ? { deniedTools: [...policy.deniedTools] } : {}),
+        ...(policy.deniedProviders ? { deniedProviders: [...policy.deniedProviders] } : {}),
+        ...(policy.allowedRefs ? { allowedRefs: [...policy.allowedRefs] } : {}),
+      },
+      reply,
+    },
+  };
+};
+
 export const FABRIC_COMPONENT_REGISTER_EVENT = "pi-fabric:component:register:v1";
 export const FABRIC_COMPONENT_DISCOVER_EVENT = "pi-fabric:component:discover:v1";
 export const FABRIC_PREWALK_REQUEST_EVENT = "pi-fabric:prewalk:request:v1";
@@ -195,6 +586,32 @@ export const readFabricPrewalkRequestV1 = (
 
 export const FABRIC_PEER_CARDS_EVENT = "pi-fabric:peers:cards:v1";
 export const FABRIC_PEER_AWAIT_SETTLE_EVENT = "pi-fabric:peer:await-settle:v1";
+
+/**
+ * Custom session entry a root Fabric session appends once the project mesh
+ * mints its peer label, and again only if the label changes. Headless hosts
+ * read it with Pi's RPC `get_entries`: unlike the `fabric-label` footer status,
+ * it is structured, outlives the event stream, and does not depend on
+ * `ui.sessionLabel.footer`.
+ */
+export const FABRIC_PEER_ENTRY_TYPE = "pi-fabric-peer";
+
+/**
+ * Generation of the project-wide label counter. Raising it restarts numbering
+ * at 1 and retires every label an older generation recorded. Generation 3 is
+ * the first that takes a number only at a session's first Fabric use.
+ */
+export const FABRIC_PEER_LABEL_SEQUENCE = 3;
+
+export interface FabricPeerEntryV1 {
+  version: 1;
+  /** Counter generation that minted the label; a resumed session reuses only the current one. */
+  sequence: number;
+  /** Participant id other sessions and the mesh use for this session. */
+  participantId: string;
+  /** Linear-style project label (e.g. "PQS-2"). */
+  label: string;
+}
 
 /** One root peer session on the project mesh, for pickers and status lines. */
 export interface FabricPeerCardV1 {
@@ -284,6 +701,254 @@ export const readFabricPeerAwaitSettleRequestV1 = (
     return undefined;
   }
   return value as FabricPeerAwaitSettleRequestV1;
+};
+
+/**
+ * Host-local registration of an extension action policy hook (issue #312).
+ * Fabric consults registered hooks at the fabric_exec approve stage only when
+ * `approvals.policyHooks` is true. Registering under an existing `name`
+ * replaces that hook. `respond`, when given, receives an `unregister`
+ * function that removes only this registration.
+ */
+export const FABRIC_ACTION_POLICY_REGISTER_EVENT = "pi-fabric:action-policy:register:v1";
+
+export interface FabricActionPolicyRegistrationV1 {
+  version: 1;
+  /** Must match `[A-Za-z0-9@][A-Za-z0-9@._/-]{0,63}`; shown in denial messages. */
+  name: string;
+  hook: FabricActionPolicyHookV1;
+  respond?: (result: { ok: true; unregister: () => void } | { ok: false; error: string }) => void;
+}
+
+export const readFabricActionPolicyRegistrationV1 = (
+  value: unknown,
+): FabricActionPolicyRegistrationV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.name !== "string" ||
+    typeof record.hook !== "function" ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  // Copy named fields: a later change to the caller's object changes nothing here.
+  return {
+    version: 1,
+    name: record.name,
+    hook: record.hook as FabricActionPolicyRegistrationV1["hook"],
+    ...(record.respond ? { respond: record.respond as NonNullable<FabricActionPolicyRegistrationV1["respond"]> } : {}),
+  };
+};
+
+export const FABRIC_DECISIONS_CAPABILITY_EVENT = "pi-fabric:decisions:capability:v1";
+export const FABRIC_DECISION_REQUEST_EVENT = "pi-fabric:decisions:request:v1";
+
+export type FabricDecisionInputV1 = "text" | "confirm" | "select" | "editor";
+
+export type FabricDecisionsCapabilityResultV1 =
+  | {
+      ok: true;
+      available: true;
+      inputs: FabricDecisionInputV1[];
+      maxOptions: number;
+      maxTitleChars: number;
+      maxBodyChars: number;
+      maxTextChars: number;
+      minTimeoutMs: number;
+      maxTimeoutMs: number;
+    }
+  | { ok: true; available: false; reason: string }
+  | { ok: false; error: string };
+
+/**
+ * Host-local request: does this session offer user-held durable decisions?
+ * An unclaimed request means no compatible Fabric runtime is installed.
+ */
+export interface FabricDecisionsCapabilityRequestV1 {
+  version: 1;
+  context: ExtensionContext;
+  claim: () => boolean;
+  respond: (result: FabricDecisionsCapabilityResultV1) => void;
+}
+
+/** One question for a person. Fabric always holds it for `"user"` and never applies a default. */
+export interface FabricDecisionQuestionV1 {
+  title: string;
+  body?: string;
+  /** Defaults to `"select"` with options, else `"text"`. `"confirm"` supplies yes/no. */
+  input?: FabricDecisionInputV1;
+  options?: Array<{ id: string; label: string }>;
+  /** Omit to wait until a person answers or cancels, or the request signal aborts. */
+  timeoutMs?: number;
+}
+
+export interface FabricDecisionAnswerV1 {
+  optionId?: string;
+  text?: string;
+  answeredBy: string;
+  via: string;
+  at: number;
+}
+
+/** Only `answered` carries an answer; `cancelled` and `expired` never do. */
+export type FabricDecisionResultV1 =
+  | { ok: true; id: string; status: "answered"; answer: FabricDecisionAnswerV1 }
+  | { ok: true; id: string; status: "cancelled" | "expired" }
+  | { ok: false; error: string; id?: string };
+
+/**
+ * Host-local request: raise a user-held question decision and respond once it
+ * settles. Aborting `signal` cancels the decision and responds `ok: false`.
+ */
+export interface FabricDecisionRequestV1 {
+  version: 1;
+  context: ExtensionContext;
+  question: FabricDecisionQuestionV1;
+  signal?: AbortSignal;
+  /**
+   * Names the asking extension, for example its package name. Recorded as
+   * `raisedBy.participantId: "extension:<source>"`. Must match
+   * `[A-Za-z0-9@][A-Za-z0-9@._/-]{0,63}`; omit it to record the session.
+   */
+  source?: string;
+  /** Called once the decision is stored, before waiting starts. */
+  onRaised?: (id: string) => void;
+  claim: () => boolean;
+  respond: (result: FabricDecisionResultV1) => void;
+}
+
+export const readFabricDecisionsCapabilityRequestV1 = (
+  value: unknown,
+): FabricDecisionsCapabilityRequestV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.context !== "object" ||
+    record.context === null ||
+    typeof record.claim !== "function" ||
+    typeof record.respond !== "function"
+  ) {
+    return undefined;
+  }
+  return value as FabricDecisionsCapabilityRequestV1;
+};
+
+export const readFabricDecisionRequestV1 = (
+  value: unknown,
+): FabricDecisionRequestV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const signal = record.signal as AbortSignal | undefined;
+  if (
+    record.version !== 1 ||
+    typeof record.context !== "object" ||
+    record.context === null ||
+    typeof record.question !== "object" ||
+    record.question === null ||
+    Array.isArray(record.question) ||
+    typeof record.claim !== "function" ||
+    typeof record.respond !== "function" ||
+    (signal !== undefined && (typeof signal !== "object" || signal === null || typeof signal.aborted !== "boolean")) ||
+    (record.source !== undefined && typeof record.source !== "string") ||
+    (record.onRaised !== undefined && typeof record.onRaised !== "function")
+  ) {
+    return undefined;
+  }
+  return value as FabricDecisionRequestV1;
+};
+
+/**
+ * Host-local registration of a question renderer: an extension that shows
+ * Fabric's decisions to the person at this terminal in its own interface.
+ * Fabric offers a routed child question, and the decision picked in
+ * `/fabric decisions`, to registered renderers only when
+ * `ui.questionRenderers` is true. Registering under an existing `name`
+ * replaces that renderer in its original position. `respond`, when given,
+ * receives an `unregister` function that removes only this registration.
+ */
+export const FABRIC_QUESTION_RENDERER_REGISTER_EVENT = "pi-fabric:question-renderer:register:v1";
+
+/** Where Fabric is about to show a decision to the person at this terminal. */
+export type FabricQuestionRenderSurfaceV1 = "child-question" | "decisions-command";
+
+/** A copy of the stored decision. Changing it changes nothing in the store. */
+export interface FabricQuestionDecisionV1 {
+  id: string;
+  kind: "approval" | "question" | "escalation";
+  title: string;
+  body?: string;
+  input: FabricDecisionInputV1;
+  /** Present for `select` and `confirm`; an answer must use one of these ids. */
+  options?: Array<{ id: string; label: string }>;
+  holder: string;
+  raisedBy: { participantId: string; runId?: string; sessionId?: string };
+  createdAt: number;
+  /** Epoch ms after which the decision expires and `signal` aborts. */
+  deadline?: number;
+}
+
+export interface FabricQuestionRenderInputV1 {
+  version: 1;
+  surface: FabricQuestionRenderSurfaceV1;
+  ui: ExtensionContext["ui"];
+  decision: FabricQuestionDecisionV1;
+  /**
+   * Aborts when the decision is answered, cancelled, or expires elsewhere, or
+   * when the asking child run settles. Fabric then uses the stored record.
+   */
+  signal: AbortSignal;
+}
+
+/**
+ * What a renderer reports. `decisionId` must name the decision it was handed.
+ * `dismissed` means the person closed the renderer without deciding.
+ */
+export type FabricQuestionRenderResultV1 =
+  | { status: "answered"; decisionId: string; answer: { optionId?: string; text?: string } }
+  | { status: "cancelled"; decisionId: string }
+  | { status: "dismissed"; decisionId: string };
+
+/**
+ * Returns `undefined` to decline, so the next renderer or Fabric's own dialog
+ * shows the decision. A throw, a rejection, a malformed result, a result for
+ * another decision, or an answer the store refuses falls back to Fabric's own
+ * dialog. Fabric writes an accepted result to the store itself.
+ */
+export type FabricQuestionRendererV1 = (
+  input: FabricQuestionRenderInputV1,
+) => FabricQuestionRenderResultV1 | undefined | Promise<FabricQuestionRenderResultV1 | undefined>;
+
+export interface FabricQuestionRendererRegistrationV1 {
+  version: 1;
+  /** Must match `[A-Za-z0-9@][A-Za-z0-9@._/-]{0,63}`. */
+  name: string;
+  render: FabricQuestionRendererV1;
+  respond?: (result: { ok: true; unregister: () => void } | { ok: false; error: string }) => void;
+}
+
+export const readFabricQuestionRendererRegistrationV1 = (
+  value: unknown,
+): FabricQuestionRendererRegistrationV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    typeof record.name !== "string" ||
+    typeof record.render !== "function" ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  // Copy named fields: a later change to the caller's object changes nothing here.
+  return {
+    version: 1,
+    name: record.name,
+    render: record.render as FabricQuestionRendererV1,
+    ...(record.respond ? { respond: record.respond as NonNullable<FabricQuestionRendererRegistrationV1["respond"]> } : {}),
+  };
 };
 
 /** Identifies host-side tool lifecycle events replayed for a nested Fabric call. */
@@ -433,6 +1098,7 @@ export interface FabricCapabilityCatalog {
 export interface FabricProviderListRequest {
   namespace?: string;
   query?: string;
+  /** Optional presentation cap. Omitted means enumerate all matching descriptors. */
   limit?: number;
 }
 
@@ -448,6 +1114,16 @@ export interface FabricMcpServerTypeSource {
   tools: FabricNamedActionTypeSource[];
 }
 
+/**
+ * One registered provider that gets a program global named after it. Its
+ * actions' input schemas are its TypeScript declarations; an empty list
+ * declares the global loosely (any action, one argument object).
+ */
+export interface FabricProviderTypeSource {
+  provider: string;
+  actions: FabricNamedActionTypeSource[];
+}
+
 export type {
   FabricKernel,
   FabricKernelRuntime,
@@ -460,21 +1136,30 @@ export type { FabricPythonRuntime } from "./config.js";
 
 /**
  * Live descriptor snapshot the registry hands to the guest declaration
- * builder so dynamic surfaces (mcp, extensions) get argument checking before
- * the sandbox runs. Empty/absent sections keep the loose static declarations.
+ * builder so dynamic surfaces (mcp, extensions, provider globals) get argument
+ * checking before the sandbox runs. Empty/absent sections keep the loose
+ * static declarations.
  */
 export interface FabricGuestTypeSources {
   mcpServers?: FabricMcpServerTypeSource[];
   extensionTools?: FabricNamedActionTypeSource[];
+  /**
+   * Providers registered outside Fabric whose names can be program globals
+   * (see `src/provider-globals.ts`). Each entry is exactly one global the
+   * program gets, typed or loose.
+   */
+  providers?: FabricProviderTypeSource[];
 }
 
 /**
  * Pre-rendered `declare const` blocks replacing the loose mcp/extensions
  * declaration lines. Values are full replacement text (helpers + declare).
+ * `providers` replaces nothing: it declares one new global per provider.
  */
 export interface FabricDynamicGuestDeclarations {
   mcp?: string;
   extensions?: string;
+  providers?: string;
 }
 
 /**
@@ -577,6 +1262,10 @@ export interface FabricInvocationContext {
   // Ephemeral renderer-only metadata. It is exposed to live Fabric previews but
   // never projected into the durable execution trace.
   attachPreview?(preview: unknown): void;
+  // Host-supplied inside fabric_exec. A provider calls this when a successful
+  // nested tool result sets Pi's `terminate: true`; the outer fabric_exec
+  // result then carries `terminate: true` once the program succeeds.
+  requestTerminate?(): void;
   capabilityView?: FabricCommittedCapabilityView;
   /** Frozen host-issued scope; set by the registry only, absent when unscoped. */
   scope?: Readonly<FabricScope>;

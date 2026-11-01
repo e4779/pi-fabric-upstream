@@ -1,16 +1,19 @@
 import releaseSyncVariant from "@jitl/quickjs-singlefile-mjs-release-sync";
-import { newQuickJSWASMModuleFromVariant } from "quickjs-emscripten-core";
+import { newQuickJSWASMModuleFromVariant, newVariant } from "quickjs-emscripten-core";
 import ts from "typescript";
 import { runAbortable, settleWithin } from "../async-settlement.js";
 import { piBashExitMetadata } from "../core/pi-bash-error.js";
 import { PI_ARGUMENT_NORMALIZATION_SOURCE } from "../core/pi-arguments.js";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
+import { providerGlobalNames } from "../provider-globals.js";
 import { HumanWaitDeadlinePause } from "./deadline-pause.js";
 import { createGuestStackMap, remapGuestErrorText } from "./guest-stack-map.js";
-import { transpileFabricCodeWithSourceMap } from "./type-checker.js";
+import { transpileFabricCodeWithSourceMap } from "./transpile.js";
 
 import type {
   FabricHostCall,
+  FabricJournalDriver,
+  FabricJournalOutcome,
   FabricSandboxOptions,
   FabricSandboxResult,
   FabricSandboxTerminationReason,
@@ -66,13 +69,35 @@ const missingStringsKeys = (
   return referencedPiKeys(code).filter((key) => !(key in provided));
 };
 
-const quickJsModule = (): Promise<QuickJsModule> => {
-  quickJsModulePromise ??= newQuickJSWASMModuleFromVariant(releaseSyncVariant);
-  return quickJsModulePromise;
+const precompiledModules = new WeakMap<WebAssembly.Module, Promise<QuickJsModule>>();
+// The bundled variant compiles its inlined wasm bytes; hosts that forbid that
+// (Cloudflare Workers) pass a precompiled WebAssembly.Module of the same build.
+const quickJsModule = (wasmModule?: WebAssembly.Module): Promise<QuickJsModule> => {
+  if (wasmModule === undefined) {
+    quickJsModulePromise ??= newQuickJSWASMModuleFromVariant(releaseSyncVariant);
+    return quickJsModulePromise;
+  }
+  let loaded = precompiledModules.get(wasmModule);
+  if (loaded === undefined) {
+    loaded = newQuickJSWASMModuleFromVariant(newVariant(releaseSyncVariant, { wasmModule }));
+    precompiledModules.set(wasmModule, loaded);
+  }
+  return loaded;
 };
 
-export const guestSetupSource = (fields?: Record<string, string[]>, nativeStoreEnabled = false, profile = "additive", nativeToolsEnabled = false): string =>
-  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})}; const __nativeStoreEnabled = ${nativeStoreEnabled}; const __nativeProfile = ${profile === "native"}; const __nativeToolsEnabled = ${nativeToolsEnabled};\n${GUEST_SETUP}`;
+/** One macrotask turn; setImmediate is Node/Bun only, Workers have setTimeout. */
+const nextMacrotask = (): Promise<void> => new Promise((resolve) => {
+  if (typeof setImmediate === "function") setImmediate(() => resolve());
+  else setTimeout(resolve, 0);
+});
+
+export interface QuickJsRuntimeOptions {
+  /** A precompiled QuickJS wasm module (the `@jitl/quickjs-singlefile-mjs-release-sync` build), for hosts that cannot compile wasm from bytes. */
+  readonly wasmModule?: WebAssembly.Module;
+}
+
+export const guestSetupSource = (fields?: Record<string, string[]>, nativeStoreEnabled = false, profile = "additive", nativeToolsEnabled = false, providerGlobals: readonly string[] = []): string =>
+  `const __piCanonicalFields = ${JSON.stringify(fields ?? {})}; const __nativeStoreEnabled = ${nativeStoreEnabled}; const __nativeProfile = ${profile === "native"}; const __nativeToolsEnabled = ${nativeToolsEnabled}; const __providerGlobals = ${JSON.stringify(providerGlobalNames(providerGlobals))};\n${GUEST_SETUP}`;
 
 import { NATIVE_CODEMODE_GUEST } from "./native-codemode-guest.js";
 
@@ -500,12 +525,16 @@ globalThis.agents = Object.freeze({
   main: () => __call("agents.main", {}),
   sessions: () => __call("agents.sessions", {}),
   peers: () => __call("agents.peers", {}),
+  departed: (args = {}) => __call("agents.departed", args),
+  definitions: () => __call("agents.definitions", {}),
   subscribe: (args) => __call("agents.subscribe", args),
   subscriptions: (args = {}) => __call("agents.subscriptions", args),
   unsubscribe: (args) => __call("agents.unsubscribe", args),
   models: (args = {}) => __call("agents.models", args),
   stop: (args) => __call("agents.stop", args),
   cleanup: (args) => __call("agents.cleanup", args),
+  sleep: (args) => __call("agents.sleep", args),
+  wake: (args) => __call("agents.wake", args),
   create: __createActor,
   ask: (args) => __call("agents.ask", args),
   tell: (args) => __call("agents.tell", args),
@@ -523,7 +552,7 @@ globalThis.agents = Object.freeze({
   setDeliveryPolicy: (args) => __call("agents.setDeliveryPolicy", args),
   clearMessages: (args) => __call("agents.clearMessages", args),
   setInstructions: (args) => __call("agents.setInstructions", args),
-  actors: () => __call("agents.actors", {}),
+  actors: (args = {}) => __call("agents.actors", args),
   messages: (args) => __call("agents.messages", args),
   remove: (args) => __call("agents.remove", args),
   // Keyword keys for the actor-template routes, spelled as the provider,
@@ -763,6 +792,29 @@ globalThis.setInterval = (callback, ms = 0) => {
 };
 globalThis.clearTimeout = (id) => { __timerCallbacks.delete(id); };
 globalThis.clearInterval = (id) => { __timerCallbacks.delete(id); };
+// Providers other extensions register, as globals named after them. The host
+// lists only names src/provider-globals.ts accepts; installing last, and only
+// where no global exists, keeps every Fabric and language global intact.
+// Each call is tools.call, so it takes the same host path, policy and limits.
+const __providerGlobal = (provider) => new Proxy(Object.create(null), {
+  get(_target, property) {
+    if (typeof property === "symbol" || property === "then" || property === "toJSON") return undefined;
+    const ref = provider + "." + property;
+    return (args = {}) => {
+      if (args === null || typeof args !== "object" || Array.isArray(args)) {
+        return Promise.reject(new TypeError(ref + " takes one argument object"));
+      }
+      return __call("fabric.$call", { ref, args });
+    };
+  },
+  set() { return false; },
+  defineProperty() { return false; },
+  deleteProperty() { return false; },
+});
+for (const __name of (typeof __providerGlobals === "undefined" ? [] : __providerGlobals)) {
+  if (typeof __name !== "string" || !/^[a-z][a-z0-9_]{0,63}$/.test(__name) || __name in globalThis) continue;
+  globalThis[__name] = __providerGlobal(__name);
+}
 })();
 `;
 
@@ -823,6 +875,11 @@ const disposeQuickJsContext = (context: any): void => {
 };
 
 export class QuickJsRuntime {
+  readonly #wasmModule: WebAssembly.Module | undefined;
+  constructor(options: QuickJsRuntimeOptions = {}) {
+    this.#wasmModule = options.wasmModule;
+  }
+
   async execute(
     code: string,
     hostCall: FabricHostCall,
@@ -880,7 +937,7 @@ export class QuickJsRuntime {
         error: "QuickJS memory limit must be an integer between 1 byte and 4294967295 bytes (WASM32 maximum)",
       };
     }
-    const module = await quickJsModule();
+    const module = await quickJsModule(this.#wasmModule);
     const context = module.newContext();
     const runtime = context.runtime;
     const jsonObject = context.getProp(context.global, "JSON");
@@ -960,6 +1017,7 @@ export class QuickJsRuntime {
     const scheduleDeadline = (): void => {
       if (!rejectDeadline || closing || cancelled || timedOut) return;
       clearTimeout(timeout);
+      options.onDeadline?.(Number.isFinite(executionDeadlineAt) ? executionDeadlineAt : undefined);
       if (!Number.isFinite(executionDeadlineAt)) return;
       timeout = setTimeout(expireDeadline, Math.min(2_147_483_647, Math.max(0, executionDeadlineAt - Date.now())));
     };
@@ -992,12 +1050,242 @@ export class QuickJsRuntime {
       suspend: () => {
         clearTimeout(timeout);
         executionDeadlineAt = Infinity;
+        options.onDeadline?.(undefined);
       },
       resume: (remainingMs) => {
         executionDeadlineAt = Date.now() + remainingMs;
         scheduleDeadline();
       },
     });
+
+    // Journal mode (see exec-journal.ts). Each host call gets an issue number,
+    // each result is recorded before the guest sees it, and results reach the
+    // guest one at a time. On resume, calls wait in `held` until the recorded
+    // results are served. The guest clock is the time of the latest result.
+    const journal = options.journal;
+    let issued = 0;
+    let replaying = journal?.resuming === true;
+    let logicalNow = journal?.startedAt ?? 0;
+    let timerCount = 0;
+    const held = new Map<number, { ref: string; args: Record<string, unknown>; promise: any }>();
+    let stopReport: string | undefined;
+    let journalFailure: string | undefined;
+    const failJournal = (error: unknown): void => {
+      if (journalFailure !== undefined) return;
+      journalFailure = `Fabric could not write its journal: ${error instanceof Error ? error.message : String(error)}`;
+      abortHostCalls(journalFailure);
+      rejectExecutionGate(journalFailure);
+    };
+    const errorOutcome = (reference: string, error: unknown): FabricJournalOutcome => {
+      const exit = reference === "pi.bash" || reference === "pi.powershell"
+        ? piBashExitMetadata(error)
+        : undefined;
+      const fields = guestErrorFields(error);
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+        ...(exit ? { bashExit: exit } : {}),
+        ...(fields.length > 0 ? { fields } : {}),
+      };
+    };
+    const deliverOutcome = (promise: any, outcome: FabricJournalOutcome): void => {
+      if (outcome.ok) {
+        const handle = outcome.json === undefined
+          ? context.undefined
+          : jsonHandle(context, jsonObject, jsonParse, JSON.parse(outcome.json));
+        promise.resolve(handle);
+        handle.dispose();
+        return;
+      }
+      const errorHandle = context.newError(outcome.message);
+      if (outcome.bashExit) {
+        const metadata = jsonHandle(context, jsonObject, jsonParse, outcome.bashExit);
+        context.setProp(errorHandle, "__fabricBashExit", metadata);
+        metadata.dispose();
+      }
+      for (const [key, value] of outcome.fields ?? []) {
+        const field = context.newNumber(value);
+        context.setProp(errorHandle, key, field);
+        field.dispose();
+      }
+      promise.reject(errorHandle);
+      errorHandle.dispose();
+    };
+    // Record a result, hand it to the guest, and let the guest run to idle
+    // before any other result arrives. A driver whose complete() returns a
+    // promise is waited for: the guest sees the result only after it is saved,
+    // and results reach the guest in the order complete() was called.
+    let journalTail: Promise<void> | undefined;
+    const journalStopped = (promise: any): boolean =>
+      closing || promise.alive === false || journalFailure !== undefined || hostAbortController.signal.aborted;
+    const recordAndDeliver = (
+      seq: number,
+      reference: string,
+      args: Record<string, unknown>,
+      promise: any,
+      value: unknown,
+      outcome: () => FabricJournalOutcome,
+    ): void | Promise<void> => {
+      // An aborted call is in flight when the run ends; it is never recorded.
+      if (journalStopped(promise)) return;
+      let result: FabricJournalOutcome;
+      try {
+        result = outcome();
+      } catch (error) {
+        result = errorOutcome(reference, error);
+      }
+      const deliver = (at: number): void => {
+        if (journalStopped(promise)) return;
+        logicalNow = at;
+        cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
+        deliverOutcome(promise, result);
+        pumpJobs();
+      };
+      let saved: number | Promise<number>;
+      try {
+        saved = journal!.complete(seq, reference, args, value, result);
+      } catch (error) {
+        failJournal(error);
+        return;
+      }
+      if (typeof saved === "number") {
+        deliver(saved);
+        return;
+      }
+      return saved.then(deliver, failJournal);
+    };
+    const settleJournaled = (
+      seq: number,
+      reference: string,
+      args: Record<string, unknown>,
+      promise: any,
+      value: unknown,
+      outcome: () => FabricJournalOutcome,
+    ): void | Promise<void> => {
+      const run = (): void | Promise<void> => recordAndDeliver(seq, reference, args, promise, value, outcome);
+      const pending = journalTail ? journalTail.then(run) : run();
+      if (pending === undefined) return;
+      const tail: Promise<void> = pending.catch(failJournal).finally(() => {
+        if (journalTail === tail) journalTail = undefined;
+      });
+      journalTail = tail;
+      hostTasks.add(tail);
+      void tail.finally(() => hostTasks.delete(tail));
+      return tail;
+    };
+    const startTimer = (seq: number, args: Record<string, unknown>, promise: any): void => {
+      const ms = Math.max(0, Number(args.ms ?? 0));
+      const timer = setTimeout(() => {
+        if (closing || promise.alive === false) return;
+        if (journal) {
+          settleJournaled(seq, "fabric.$timer", args, promise, undefined, () => ({ ok: true }));
+          return;
+        }
+        promise.resolve(context.undefined);
+        pumpJobs();
+      }, ms);
+      timer.unref?.();
+      pendingTimers.add(timer);
+      void promise.settled.then(() => pendingTimers.delete(timer));
+    };
+    const startHostCall = (
+      seq: number,
+      reference: string,
+      args: Record<string, unknown>,
+      promise: any,
+    ): void => {
+      const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
+      if (waitsForHuman) humanWait.enter();
+      const call = runAbortable(hostAbortController.signal, () =>
+        journal
+          ? hostCall(reference, args, hostAbortController.signal, (wait) => humanWait.run(wait), { seq })
+          : hostCall(reference, args, hostAbortController.signal, (wait) => humanWait.run(wait)),
+      )
+        .finally(() => {
+          if (waitsForHuman) humanWait.leave();
+        });
+      const task = journal
+        ? call
+          .then(
+            (value) => settleJournaled(seq, reference, args, promise, value, () => ({
+              ok: true,
+              ...(value === undefined ? {} : { json: jsonText(value) }),
+            })),
+            (error) => settleJournaled(seq, reference, args, promise, undefined, () => errorOutcome(reference, error)),
+          )
+          .catch(failJournal)
+        : call
+          .then((value) => {
+            if (closing || promise.alive === false) return;
+            cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
+            const handle = jsonHandle(context, jsonObject, jsonParse, value);
+            promise.resolve(handle);
+            handle.dispose();
+          })
+          .catch((error) => {
+            if (closing || promise.alive === false) return;
+            deliverOutcome(promise, errorOutcome(reference, error));
+          })
+          .finally(() => {
+            if (!closing) pumpJobs();
+          });
+      hostTasks.add(task);
+      void task.finally(() => hostTasks.delete(task));
+    };
+    // Ask whether a call that may have run should run again. Only a yes repeats
+    // it; a no, a dismissal, a failure, or a stopped program keeps the stop.
+    const confirmRepeat = async (question: string): Promise<boolean> => {
+      const confirm = options.confirmRepeat;
+      if (!confirm) return false;
+      if (confirm.pausesDeadline) humanWait.enter();
+      try {
+        return await confirm.ask(question, hostAbortController.signal) === true;
+      } catch {
+        return false;
+      } finally {
+        if (confirm.pausesDeadline) humanWait.leave();
+      }
+    };
+    // Serve recorded results in their recorded order, then decide the calls
+    // still waiting: a stop ends the program, otherwise they run live.
+    const replayJournal = async (driver: FabricJournalDriver): Promise<string | undefined> => {
+      for (const delivery of driver.replay) {
+        if (cancelled || timedOut || closing) return undefined;
+        const call = held.get(delivery.seq);
+        if (!call || call.ref !== delivery.ref || driver.digest(call.args) !== delivery.digest) {
+          const actual = call ?? [...held.entries()].sort(([left], [right]) => left - right)[0]?.[1];
+          return driver.diverged(delivery, actual ? { ref: actual.ref, args: actual.args } : undefined);
+        }
+        held.delete(delivery.seq);
+        try {
+          await runAbortable(hostAbortController.signal, () => driver.served(delivery, call.args, hostAbortController.signal));
+        } catch (error) {
+          // A failed restore stops the run like a divergence: nothing after it runs.
+          return error instanceof Error ? error.message : String(error);
+        }
+        if (cancelled || timedOut || closing || call.promise.alive === false) return undefined;
+        logicalNow = delivery.at;
+        cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
+        deliverOutcome(call.promise, delivery.outcome);
+        pumpJobs();
+      }
+      if (cancelled || timedOut || closing) return undefined;
+      const waiting = [...held.entries()].sort(([left], [right]) => left - right);
+      const stop = driver.frontier(waiting.map(([seq, call]) => ({ seq, ref: call.ref, args: call.args })));
+      if (stop !== undefined) {
+        // A stopped run keeps holding: no call it issues from here reaches the host.
+        if (stop.question === undefined || !(await confirmRepeat(stop.question))) return stop.report;
+        if (cancelled || timedOut || closing) return undefined;
+      }
+      if (cancelled || timedOut || closing) return undefined;
+      replaying = false;
+      held.clear();
+      for (const [seq, call] of waiting) {
+        if (call.ref === "fabric.$timer") startTimer(seq, call.args, call.promise);
+        else startHostCall(seq, call.ref, call.args, call.promise);
+      }
+      return undefined;
+    };
 
     try {
       const hostFunction = context.newFunction(
@@ -1009,69 +1297,31 @@ export class QuickJsRuntime {
             typeof dumpedArgs === "object" && dumpedArgs !== null && !Array.isArray(dumpedArgs)
               ? (dumpedArgs as Record<string, unknown>)
               : {};
+          const seq = journal ? issued++ : -1;
           extendExecutionTimeout(reference, args);
           const promise = context.newPromise();
           pendingHostPromises.add(promise);
           void promise.settled.then(() => pendingHostPromises.delete(promise));
           if (reference === "fabric.$timer") {
-            if (pendingTimers.size >= (options.maxPendingTimers ?? Infinity)) {
+            if (timerCount >= (options.maxPendingTimers ?? Infinity)) {
               const errorHandle = context.newError("Guest pending timer limit exceeded");
               promise.reject(errorHandle);
               errorHandle.dispose();
               return promise.handle;
             }
-            const ms = Math.max(0, Number(args.ms ?? 0));
-            const timer = setTimeout(() => {
-              if (closing || promise.alive === false) return;
-              promise.resolve(context.undefined);
-              pumpJobs();
-            }, ms);
-            timer.unref?.();
-            pendingTimers.add(timer);
-            void promise.settled.then(() => pendingTimers.delete(timer));
+            timerCount++;
+            void promise.settled.then(() => {
+              timerCount--;
+            });
+            if (replaying || journalFailure !== undefined) held.set(seq, { ref: reference, args, promise });
+            else startTimer(seq, args, promise);
             return promise.handle;
           }
-          const waitsForHuman = options.isHumanWaitHostCall?.(reference, args) === true;
-          if (waitsForHuman) humanWait.enter();
-          const task = runAbortable(hostAbortController.signal, () =>
-            hostCall(reference, args, hostAbortController.signal),
-          )
-            .finally(() => {
-              if (waitsForHuman) humanWait.leave();
-            })
-            .then((value) => {
-              if (closing || promise.alive === false) return;
-              cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-              const handle = jsonHandle(context, jsonObject, jsonParse, value);
-              promise.resolve(handle);
-              handle.dispose();
-            })
-            .catch((error) => {
-              if (closing || promise.alive === false) return;
-              const errorHandle = context.newError(
-                error instanceof Error ? error.message : String(error),
-              );
-              const exit = reference === "pi.bash" || reference === "pi.powershell"
-                ? piBashExitMetadata(error)
-                : undefined;
-              if (exit) {
-                const metadata = jsonHandle(context, jsonObject, jsonParse, exit);
-                context.setProp(errorHandle, "__fabricBashExit", metadata);
-                metadata.dispose();
-              }
-              for (const [key, value] of guestErrorFields(error)) {
-                const field = context.newNumber(value);
-                context.setProp(errorHandle, key, field);
-                field.dispose();
-              }
-              promise.reject(errorHandle);
-              errorHandle.dispose();
-            })
-            .finally(() => {
-              if (!closing) pumpJobs();
-            });
-          hostTasks.add(task);
-          void task.finally(() => hostTasks.delete(task));
+          if (replaying || journalFailure !== undefined) {
+            held.set(seq, { ref: reference, args, promise });
+            return promise.handle;
+          }
+          startHostCall(seq, reference, args, promise);
           return promise.handle;
         },
       );
@@ -1102,7 +1352,7 @@ export class QuickJsRuntime {
       tokenBudget.dispose();
 
       cpuDeadlineAt = Date.now() + (options.maxCpuSliceMs ?? Infinity);
-      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.nativeStoreEnabled, options.codemodeProfile, options.nativeToolsEnabled), "pi-fabric-setup.js");
+      const setupResult = context.evalCode(guestSetupSource(options.piToolCanonicalFields, options.nativeStoreEnabled, options.codemodeProfile, options.nativeToolsEnabled, options.providerGlobals), "pi-fabric-setup.js");
       if (setupResult.error) {
         const deadlineExceeded = interruptedByDeadline || interruptedByCpu || Date.now() > executionDeadlineAt;
         if (deadlineExceeded) timedOut = true;
@@ -1125,6 +1375,20 @@ export class QuickJsRuntime {
         };
       }
       setupResult.value.dispose();
+      if (journal) {
+        // Pin the clock, Math.random, and the time zone so a resume reproduces
+        // the program's calls. The guest clock reads `logicalNow`.
+        const journalNow = context.newFunction("__fabricJournalNow", () => context.newNumber(logicalNow));
+        context.setProp(context.global, "__fabricJournalNow", journalNow);
+        journalNow.dispose();
+        const shim = context.evalCode(journal.shim, "pi-fabric-journal-shim.js");
+        if (shim.error) {
+          const message = formatValue(context.dump(shim.error));
+          shim.error.dispose();
+          throw new Error(`Fabric journal shim failed: ${message}`);
+        }
+        shim.value.dispose();
+      }
 
       executionGate = context.newPromise();
       context.setProp(context.global, "__fabricExecutionGate", executionGate.handle);
@@ -1175,12 +1439,39 @@ export class QuickJsRuntime {
         rejectDeadline = reject;
         scheduleDeadline();
       });
+      // A resume can expire before the race below attaches its handler.
+      void deadline.catch(() => undefined);
       pendingResolution = context.resolvePromise(activePromiseHandle);
       pumpJobs();
-      const resolution = await Promise.race([pendingResolution, deadline, cancellation]);
+      // Restoration is execution too: a stalled hook must not hold the caller
+      // past cancellation/deadline, nor touch QuickJS after its context closes.
+      const execution = (async () => {
+        if (journal?.resuming) {
+          const report = await replayJournal(journal);
+          if (report !== undefined && !cancelled && !timedOut && !closing) {
+            stopReport = report;
+            abortHostCalls(report);
+            rejectExecutionGate(report);
+          }
+        }
+        return pendingResolution;
+      })();
+      const resolution = await Promise.race([execution, deadline, cancellation]);
       pendingResolution = undefined;
       activePromiseHandle.dispose();
       activePromiseHandle = undefined;
+      const stopped = stopReport ?? journalFailure;
+      if (stopped !== undefined) {
+        if (resolution.error) resolution.error.dispose();
+        else resolution.value.dispose();
+        return {
+          value: undefined,
+          logs,
+          emitted: emittedSnapshot(),
+          terminationReason: "runtime_error",
+          error: stopped,
+        };
+      }
       if (resolution.error) {
         const deadlineExceeded = timedOut || interruptedByDeadline || interruptedByCpu || Date.now() > executionDeadlineAt;
         if (deadlineExceeded) timedOut = true;
@@ -1255,7 +1546,7 @@ export class QuickJsRuntime {
         for (const promise of pendingHostPromises) promise.reject(errorHandle);
         errorHandle.dispose();
         pumpJobs();
-        await new Promise((resolve) => setImmediate(resolve));
+        await nextMacrotask();
         const settled = await Promise.race<any>([
           pendingResolution ? pendingResolution.catch(() => undefined) : Promise.resolve(undefined),
           new Promise<undefined>((resolve) => {

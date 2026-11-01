@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { settleWithin } from "../async-settlement.js";
-import { BEND_NAT_MAX } from "../verified/nat.js";
+import { VERIFIED_NAT_MAX } from "../verified/nat.js";
 import { consume } from "../verified/policy.js";
-import { bindingStep, type BindingLife, type BindingEvent, type BindingOutcome } from "../verified/generated/lifecycle-kernel.js";
+import { bindingStep, type BindingLife, type BindingEvent, type BindingOutcome } from "../verified/lifecycle.js";
 import type { FabricComponentProviderLease } from "../components/types.js";
 import type { FabricProvider } from "../protocol.js";
 
@@ -36,8 +36,8 @@ const useOnce = (): (() => boolean) => {
   let active = true;
   return () => {
     const next = consume(active);
-    active = next.snd;
-    return next.fst;
+    active = next.active;
+    return next.released;
   };
 };
 
@@ -357,17 +357,17 @@ export class FabricProviderBindings {
 
   #canBegin(id: string, cleanup: boolean): boolean {
     const life = this.#lifecycles.get(id);
-    return !!life && life.calls < BEND_NAT_MAX && bindingStep(life, { $: "Begin", cleanup }).command.$ === "Granted";
+    return !!life && life.calls < VERIFIED_NAT_MAX && bindingStep(life, { $: "Begin", cleanup }).command.$ === "Granted";
   }
 
   #step(binding: FabricProviderBinding, event: BindingEvent): BindingOutcome["command"]["$"] {
     const life = this.#lifecycles.get(binding.id);
     if (!life) return "Denied";
-    if ((event.$ === "Begin" && life.calls >= BEND_NAT_MAX) || (event.$ === "Retain" && life.holds >= BEND_NAT_MAX)) {
+    if ((event.$ === "Begin" && life.calls >= VERIFIED_NAT_MAX) || (event.$ === "Retain" && life.holds >= VERIFIED_NAT_MAX)) {
       throw new Error("Provider lifecycle accounting overflow");
     }
     const outcome = bindingStep(life, event);
-    if (outcome.next.holds > BEND_NAT_MAX || outcome.next.calls > BEND_NAT_MAX) {
+    if (outcome.next.holds > VERIFIED_NAT_MAX || outcome.next.calls > VERIFIED_NAT_MAX) {
       throw new Error("Provider lifecycle accounting overflow");
     }
     this.#lifecycles.set(binding.id, outcome.next);

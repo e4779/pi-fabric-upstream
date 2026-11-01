@@ -9,7 +9,6 @@ import type { CapturedToolCatalog } from "../src/capture/catalog.js";
 import { registerFabricCommand } from "../src/commands/fabric.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
-import { FABRIC_CONVERSATION_SHORTCUT } from "../src/ui/conversation-shortcut.js";
 import "../src/ui/dashboard.js";
 import "../src/ui/model-picker.js";
 import { readConversationAppearance } from "../src/ui/conversation-chrome.js";
@@ -329,18 +328,13 @@ describe("/fabric chat command routing", () => {
     expect(fabricUi.openConversation).not.toHaveBeenCalled();
   });
 
-  it("registers the ctrl+shift+a conversation shortcut and initializes state before opening", async () => {
+  it("registers no ctrl+shift+a conversation shortcut", () => {
     const state = stubState();
     const controller = new FabricUiController(state);
     controllers.push(controller);
-    let shortcutHandler: ((context: ExtensionContext) => Promise<void>) | undefined;
     const pi = {
       registerCommand: vi.fn(),
-      registerShortcut: vi.fn(
-        (shortcut: string, definition: { handler: (context: ExtensionContext) => Promise<void> }) => {
-          if (shortcut === FABRIC_CONVERSATION_SHORTCUT) shortcutHandler = definition.handler;
-        },
-      ),
+      registerShortcut: vi.fn(),
     } as unknown as ExtensionAPI;
     registerFabricCommand(pi, {
       state,
@@ -349,21 +343,10 @@ describe("/fabric chat command routing", () => {
       applyFabricMode: vi.fn(),
       suspendToolCapture: vi.fn(),
     });
-    expect(vi.mocked(pi.registerShortcut).mock.calls[0]?.[0]).toBe(FABRIC_CONVERSATION_SHORTCUT);
-
-    const harness = createHarness(state);
-    const pending = shortcutHandler!(harness.context);
-    await waitForView(1);
-
-    expect(state.ensure).toHaveBeenCalledWith(harness.context);
-    // Opening via the shortcut is silent: no Main prompt or error notice.
-    expect(harness.notify).not.toHaveBeenCalled();
-
-    // The shortcut toggles: a second press closes the open conversation.
-    const second = shortcutHandler!(harness.context);
-    await Promise.all([pending, second]);
-    expect(harness.controller.ownsInput).toBe(false);
-    expect(captures.views[0]!.dispose).toHaveBeenCalled();
+    const shortcuts = vi.mocked(pi.registerShortcut).mock.calls.map(([shortcut]) => shortcut);
+    // Other Fabric shortcuts still register; /fabric chat is the only way in.
+    expect(shortcuts.length).toBeGreaterThan(0);
+    expect(shortcuts).not.toContain("ctrl+shift+a");
   });
 
   it("chat completions include nested agent ids and exclude global actor templates", () => {

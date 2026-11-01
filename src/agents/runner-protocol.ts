@@ -83,6 +83,8 @@ const childQuestion = Type.Object({
   placeholder: Type.Optional(Type.String({ maxLength: 8_000 })),
   prefill: Type.Optional(Type.String({ maxLength: 8_000 })),
   timeout: Type.Integer({ minimum: 1, maximum: 86_400_000 }),
+  /** The run holds this question with no deadline; `timeout` is then nominal. */
+  hold: Type.Optional(Type.Literal(true)),
 });
 
 /** `lifecycleFile`: one JSON object per line, appended. */
@@ -181,6 +183,14 @@ export const SteerCommandSchema = Type.Union([
     value: Type.Optional(Type.String()),
     confirmed: Type.Optional(Type.Boolean()),
     cancelled: Type.Optional(Type.Literal(true)),
+  }),
+  /** Names the decision behind a routed `question` while it waits; the worker records it in `blockedOn`. */
+  Type.Object({
+    type: Type.Literal("ui_decision"),
+    id: Type.String(),
+    ts: Type.Number(),
+    requestId: Type.String(),
+    decisionId: Type.String(),
   }),
 ]);
 export type SteerCommand = Static<typeof SteerCommandSchema>;

@@ -92,6 +92,11 @@ export const parseShellPid = (text: string): number | undefined => {
   return Number.isSafeInteger(pid) && pid > 1 ? pid : undefined;
 };
 
+/** Shell tools, plus `fabric_exec` programs moved to the background. */
+export type FabricTaskTool = PiShellToolName | "fabric_exec";
+/** Final output a detached program hands to its completion event. */
+const PROGRAM_SUMMARY_BYTES = 8_000;
+
 type FabricShellJobStatus = "running" | "spilled" | "exited" | "failed" | "killed" | "timed_out";
 
 /** A task whose process is owned by a jev-fabric store, not this Pi process. */
@@ -124,7 +129,7 @@ export interface FabricShellJobEvent {
 
 export interface FabricShellJobInfo {
   id: string;
-  tool: PiShellToolName;
+  tool: FabricTaskTool;
   command: string;
   pid?: number;
   logPath?: string;
@@ -147,7 +152,7 @@ export interface FabricShellJobInfo {
 
 export interface FabricShellJobHandle {
   readonly id: string;
-  readonly tool: PiShellToolName;
+  readonly tool: FabricTaskTool;
   readonly command: string;
   readonly abort: AbortController;
   readonly detached: AbortController;
@@ -170,7 +175,7 @@ export interface FabricShellJobHandle {
 
 class FabricShellJob implements FabricShellJobHandle {
   readonly id: string;
-  readonly tool: PiShellToolName;
+  readonly tool: FabricTaskTool;
   readonly command: string;
   readonly abort = new AbortController();
   /** Aborted when this session lets go of a durable process without stopping it. */
@@ -209,7 +214,7 @@ class FabricShellJob implements FabricShellJobHandle {
 
   get eventCount(): number { return this.#replay.cursor; }
 
-  constructor(tool: PiShellToolName, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly options: FabricShellJobOptions = {}) {
+  constructor(tool: FabricTaskTool, command: string, readonly onChange: (type: FabricShellJobEvent["type"], output?: string) => void, tempRoot: string, readonly options: FabricShellJobOptions = {}) {
     this.id = options.id ?? randomUUID();
     this.startedAt = options.startedAt ?? Date.now();
     this.durable = options.durable ? { ...options.durable } : undefined;
@@ -412,7 +417,7 @@ class FabricShellJob implements FabricShellJobHandle {
     if (this.finished) return;
     // A fast exit can beat the provider's persistLog continuation after spill.
     const persistence = this.spilled && !this.logPath ? this.persistLog() : undefined;
-    const output = this.snapshotText(2000);
+    const output = this.snapshotText(this.tool === "fabric_exec" ? PROGRAM_SUMMARY_BYTES : 2000);
     this.finished = true;
     if (this.#deadline) clearTimeout(this.#deadline);
     this.#deadline = undefined;
@@ -519,7 +524,7 @@ export class FabricShellJobStore {
     }
   }
 
-  begin(tool: PiShellToolName, command: string, options: FabricShellJobOptions = {}): FabricShellJob {
+  begin(tool: FabricTaskTool, command: string, options: FabricShellJobOptions = {}): FabricShellJob {
     if (this.#closed) throw new Error("Shell job store is closed");
     this.#prune();
     if (options.id !== undefined && this.#jobs.has(options.id)) throw new Error(`Shell task already tracked: ${options.id}`);

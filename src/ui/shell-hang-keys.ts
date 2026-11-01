@@ -1,4 +1,5 @@
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { FabricProgramTasks } from "../core/program-tasks.js";
 import type { FabricShellJobStore } from "../core/shell-jobs.js";
 import { installFabricEscapeHalt } from "./escape-halt.js";
 
@@ -10,9 +11,15 @@ interface ShellHangKeyOptions {
   enabled: () => boolean;
   ownsInput: () => boolean;
   jobs: () => FabricShellJobStore | undefined;
+  programs?: () => FabricProgramTasks | undefined;
 }
 
-/** Spill or kill a nested shell that is still waiting, without a jobs API. */
+/**
+ * Spill or kill a nested shell that is still waiting, without a jobs API. With
+ * no shell waiting, Ctrl+B twice from an empty editor moves the running
+ * `fabric_exec` program to the background instead. A non-empty editor keeps
+ * Ctrl+B as cursor-left.
+ */
 export function installFabricShellHangKeys(
   context: ExtensionContext,
   options: ShellHangKeyOptions,
@@ -33,7 +40,9 @@ export function installFabricShellHangKeys(
       return undefined;
     }
     const jobs = options.jobs();
-    if (!jobs || jobs.waiting().length === 0) {
+    const shells = jobs?.waiting().length ?? 0;
+    const programs = shells === 0 && data === CTRL_B && editorEmpty(context) ? options.programs?.() : undefined;
+    if (!jobs || (shells === 0 && !programs?.waiting())) {
       chordArmedAt = 0;
       return undefined;
     }
@@ -41,6 +50,18 @@ export function installFabricShellHangKeys(
       const now = Date.now();
       if (chordArmedAt > 0 && now - chordArmedAt <= CTRL_B_CHORD_MS) {
         chordArmedAt = 0;
+        if (programs) {
+          const count = programs.detachWaiting();
+          if (count > 0) {
+            context.ui.notify(
+              count === 1
+                ? "Fabric: program moved to the background · /fabric tasks"
+                : `Fabric: ${count} programs moved to the background · /fabric tasks`,
+              "info",
+            );
+          }
+          return { consume: true };
+        }
         const count = jobs.spillWaiting();
         if (count > 0) {
           context.ui.notify(
@@ -53,6 +74,7 @@ export function installFabricShellHangKeys(
         return { consume: true };
       }
       chordArmedAt = now;
+      if (shells > 0) context.ui.notify("Fabric: press Ctrl+B again to background the waiting shell", "info");
       return { consume: true };
     }
     chordArmedAt = 0;
@@ -70,3 +92,7 @@ export function installFabricShellHangKeys(
   });
   return () => { stopMonitors(); unsubscribe(); };
 }
+
+const editorEmpty = (context: ExtensionContext): boolean => {
+  try { return (context.ui.getEditorText?.() ?? "") === ""; } catch { return false; }
+};

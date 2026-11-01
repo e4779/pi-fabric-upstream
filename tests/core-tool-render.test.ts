@@ -1,7 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { CodePreviewSettings } from "../src/ui/code-preview.js";
 import { visibleWidth } from "@earendil-works/pi-tui";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   configureHighlighting,
   highlightCode,
@@ -12,6 +12,7 @@ import {
   coreToolPreviewEnabled,
   coreToolRendererEnabled,
   coreToolTitle,
+  loadWordEmphasis,
   renderCoreToolBody,
   type CoreToolRenderOptions,
 } from "../src/ui/core-tool-render.js";
@@ -70,7 +71,44 @@ const audit = (
   values: Omit<FabricRenderAudit, "ref" | "provider" | "tool">,
 ): FabricRenderAudit => ({ ref: `pi.${tool}`, provider: "pi", tool, ...values });
 
+const wordChangeWrite = (): FabricRenderAudit => audit("write", {
+  args: {
+    path: "src/example.ts",
+    content: `const value = "${"new".repeat(40)}";`,
+  },
+  preview: {
+    details: {
+      codePreviewBeforeWrite: {
+        kind: "content",
+        content: `const value = "${"old".repeat(40)}";`,
+      },
+    },
+    writeBeforeCaptured: true,
+  },
+  success: true,
+});
+
 describe("Fabric core tool parity rendering", () => {
+  // Load the word matcher before any render starts the highlighter.
+  beforeAll(() => loadWordEmphasis());
+
+  it("repaints a diff with word emphasis once the matcher loads", async () => {
+    vi.resetModules();
+    const fresh = await import("../src/ui/core-tool-render.js");
+    const invalidate = vi.fn();
+    const quiet = options({ invalidate, settings: { ...settings, syntaxHighlighting: false } });
+
+    const first = fresh.renderCoreToolBody(wordChangeWrite(), theme, quiet)!.lines.join("\n");
+    expect(first).toContain("Write applied");
+    expect(first).not.toContain("\x1b[48;2;148;62;70m");
+
+    await fresh.loadWordEmphasis();
+    expect(invalidate).toHaveBeenCalledOnce();
+    const repainted = fresh.renderCoreToolBody(wordChangeWrite(), theme, quiet)!.lines.join("\n");
+    expect(repainted).toContain("\x1b[48;2;148;62;70m");
+    expect(repainted).toContain("\x1b[48;2;64;132;82m");
+  });
+
   it("renders offset-aware read gutters and secret warnings", () => {
     const rendered = renderCoreToolBody(
       audit("read", {

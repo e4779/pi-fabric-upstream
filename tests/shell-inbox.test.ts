@@ -137,6 +137,85 @@ describe("live shell awareness", () => {
   });
 });
 
+describe("idle cache warming while spilled work can wake the owner", () => {
+  // Pi's idle decision: 15% continuation, so 0.15 * 0.46 - 0.05 < 0.05 and it stops.
+  const idleStop = { type: "cache_warming_decision", action: "stop", continuationProbability: 0.15, missCost: 0.46, warmCost: 0.05 };
+  const decide = (h: ReturnType<typeof harness>, event: Record<string, unknown> = idleStop) => h.emit("cache_warming_decision", event);
+
+  it("re-prices an idle stop at certain continuation for spilled builds and wake monitors", async () => {
+    const h = harness(); h.idle();
+    expect(decide(h)).toBeUndefined();
+    const foreground = h.jobs.begin("bash", "still in the tool call");
+    expect(decide(h)).toBeUndefined();
+    foreground.spill();
+    expect(decide(h)).toEqual({ action: "warm" });
+    await foreground.finish(0);
+    expect(decide(h)).toBeUndefined();
+    const watch = h.begin("wake");
+    expect(decide(h)).toEqual({ action: "warm" });
+    h.jobs.stop(watch.id);
+    expect(decide(h)).toBeUndefined();
+  });
+
+  it("never warms for UI-only monitors, and never downgrades or overrides streaming decisions", () => {
+    const h = harness(); h.idle(); h.begin("ui");
+    expect(decide(h)).toBeUndefined();
+    h.begin();
+    expect(decide(h, { ...idleStop, action: "warm" })).toBeUndefined();
+    expect(decide(h, { ...idleStop, continuationProbability: 1 })).toBeUndefined();
+  });
+
+  it("keeps Pi's savings threshold and stops on unknown economics", () => {
+    const h = harness(); h.idle(); h.begin();
+    expect(decide(h, { ...idleStop, missCost: 0.09, warmCost: 0.05 })).toBeUndefined();
+    expect(decide(h, { ...idleStop, missCost: 0.1, warmCost: 0.05 })).toEqual({ action: "warm" });
+    expect(decide(h, { ...idleStop, missCost: Number.NaN })).toBeUndefined();
+    expect(decide(h, { ...idleStop, missCost: 0, warmCost: 0 })).toBeUndefined();
+  });
+
+  it("suppresses refreshes on provider failure and resumes only after recovery or input", () => {
+    const h = harness(); h.idle(); const build = h.begin(); h.begin("wake");
+    h.emit("turn_end", { message: { stopReason: "error" } });
+    expect(decide(h)).toBeUndefined();
+    h.emit("turn_end", { message: { stopReason: "stop" } });
+    expect(decide(h)).toEqual({ action: "warm" });
+    h.emit("turn_end", { message: { stopReason: "error" } });
+    h.emit("agent_settled", { aborted: false });
+    expect(decide(h)).toBeUndefined();
+    h.emit("input");
+    expect(build.abort.signal.aborted).toBe(false);
+    expect(decide(h)).toEqual({ action: "warm" });
+  });
+
+  it("checks the current decision signal and remains inert for an in-flight callback after close", () => {
+    const h = harness(); h.idle(); h.begin();
+    const controller = new AbortController(); controller.abort();
+    Object.assign(h.ctx, { signal: controller.signal });
+    expect(decide(h)).toBeUndefined();
+    Object.assign(h.ctx, { signal: undefined });
+    expect(decide(h)).toEqual({ action: "warm" });
+    const inFlight = h.handlers.get("cache_warming_decision")!;
+    h.inbox.close();
+    expect(inFlight(idleStop, h.ctx)).toBeUndefined();
+    expect(h.sendMessage).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not warm after interruption, branch navigation, or close", () => {
+    const h = harness(); h.idle(); h.begin();
+    h.emit("turn_end", { message: { stopReason: "aborted" } });
+    expect(decide(h)).toBeUndefined();
+    h.emit("input");
+    expect(decide(h)).toEqual({ action: "warm" });
+    h.emit("session_tree");
+    expect(decide(h)).toBeUndefined();
+    h.begin();
+    expect(decide(h)).toEqual({ action: "warm" });
+    h.inbox.close();
+    expect(h.handlers.has("cache_warming_decision")).toBe(false);
+  });
+});
+
 describe("shell event delivery", () => {
   it("resumes delivery after a recovered provider error without cancelling live monitors", async () => {
     const h = harness(); const build = h.begin(), watch = h.begin("wake");

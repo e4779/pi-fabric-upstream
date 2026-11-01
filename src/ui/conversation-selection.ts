@@ -3,29 +3,69 @@ import { sliceByColumn, stripTerminalSequences, visibleWidth } from "@earendil-w
 
 interface Point { row: number; col: number }
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+const words = new Intl.Segmenter(undefined, { granularity: "word" });
+// Match Pi's terminal word boundaries, including model IDs and filesystem paths.
+const wordJoiners = new Set(["/", "-"]);
 
 /** One immutable rendered-history reference; no history-sized copy on drag. */
 export class ConversationTextSelection {
   source: readonly string[] | undefined;
   private anchor: Point | undefined;
   private focus: Point | undefined;
+  private initialRange: { start: Point; end: Point } | undefined;
+  private granularity: "character" | "word" | "line" = "character";
   dragging = false;
 
   clear(): void {
     this.source = undefined;
     this.anchor = this.focus = undefined;
+    this.initialRange = undefined;
+    this.granularity = "character";
     this.dragging = false;
   }
 
-  start(source: readonly string[], row: number, col: number): void {
+  start(source: readonly string[], row: number, col: number, clickCount = 1): void {
     this.source = source;
-    this.anchor = this.point(row, col);
-    this.focus = this.anchor;
+    const point = this.point(row, col);
+    this.granularity = clickCount === 2 ? "word" : clickCount === 3 ? "line" : "character";
+    this.initialRange = this.range(point);
+    this.anchor = this.initialRange?.start ?? point;
+    this.focus = this.initialRange?.end ?? point;
     this.dragging = true;
   }
 
   move(row: number, col: number): void {
-    if (this.dragging) this.focus = this.point(row, col);
+    if (!this.dragging) return;
+    const point = this.point(row, col);
+    const range = this.range(point);
+    if (!this.initialRange || !range) { this.focus = point; return; }
+    const before = range.start.row < this.initialRange.start.row ||
+      (range.start.row === this.initialRange.start.row && range.start.col < this.initialRange.start.col);
+    this.anchor = before ? this.initialRange.end : this.initialRange.start;
+    this.focus = before ? range.start : range.end;
+  }
+
+  private range(point: Point): { start: Point; end: Point } | undefined {
+    if (this.granularity === "character") return undefined;
+    const line = stripTerminalSequences(this.source?.[point.row] ?? "");
+    if (this.granularity === "line") return {
+      start: { row: point.row, col: 0 }, end: { row: point.row, col: visibleWidth(line) },
+    };
+    let col = 0;
+    const segments = Array.from(words.segment(line), ({ segment, isWordLike }) => {
+      const start = col;
+      col += visibleWidth(segment);
+      const joiner = wordJoiners.has(segment);
+      return { start, end: col, selectable: isWordLike === true || joiner, joiner };
+    });
+    let index = segments.findIndex(segment => point.col >= segment.start && point.col < segment.end);
+    if (index < 0) return undefined;
+    let endIndex = index;
+    const joins = (left: typeof segments[number], right: typeof segments[number]) =>
+      left.selectable && right.selectable && (left.joiner || right.joiner);
+    while (index > 0 && joins(segments[index - 1]!, segments[index]!)) index--;
+    while (endIndex + 1 < segments.length && joins(segments[endIndex]!, segments[endIndex + 1]!)) endIndex++;
+    return { start: { row: point.row, col: segments[index]!.start }, end: { row: point.row, col: segments[endIndex]!.end } };
   }
 
   finish(row: number, col: number): void {

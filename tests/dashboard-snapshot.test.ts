@@ -1,9 +1,14 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { GlobalActorRegistry } from "../src/actors/global-registry.js";
 import type { FabricActivityRun } from "../src/activity/types.js";
 import type { FabricState } from "../src/fabric-state.js";
 import type { AgentRunRecord } from "../src/agents/types.js";
 import type { FabricParticipantInfo } from "../src/topology/types.js";
 import { createDashboardSnapshot } from "../src/ui/snapshot.js";
+import { NativeConversationReader } from "../src/ui/conversation-native-reader.js";
 
 const usage = { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: 0 };
 
@@ -389,6 +394,30 @@ describe("dashboard snapshot agent ownership", () => {
     expect(snapshot.actors[0]?.worker?.id).toBe("actor-running");
   });
 
+  it("attaches the resident run transcript to a remote participant", () => {
+    const participant: FabricParticipantInfo = {
+      format: 1, id: "resident-run", kind: "agent", rootId: "session:test",
+      ownerHostId: "resident:test", ownerIdentityId: "resident:test", parentId: "session:test",
+      name: "worker", status: "running", runner: "pi-durable", transport: "process",
+      residency: "durable", capabilities: [], startedAt: 1, updatedAt: 2, local: false, stale: false, controlProtocol: "v1",
+    };
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), "fabric-resident-ui-"));
+    try {
+      const logFile = path.join(directory, "events.jsonl");
+      fs.writeFileSync(logFile, JSON.stringify({ type: "message_end", message: { role: "user", content: "hello", timestamp: 1 } }) + "\n");
+      const state = fakeState([], [], [], [], [participant]);
+      Object.assign(state, { residentAgentForUi: (id: string) => id === participant.id
+        ? { ...record(id), runner: "pi-durable", logFile }
+        : undefined });
+      const snapshot = createDashboardSnapshot(state, []);
+      expect(snapshot.agents[0]?.logFile).toBe(logFile);
+      const transcript = new NativeConversationReader().read(snapshot.agents[0]!);
+      expect(transcript.messages).toEqual([expect.objectContaining({ role: "user", content: "hello" })]);
+    } finally {
+      fs.rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it("shows provider-registered participants as agent rows", () => {
     const participant: FabricParticipantInfo = {
       format: 1,
@@ -423,5 +452,25 @@ describe("dashboard snapshot agent ownership", () => {
       }),
     ]);
     expect(snapshot.agents[0]).not.toHaveProperty("runner");
+  });
+});
+
+describe("dashboard snapshot global actors", () => {
+  it("renders without templates when the global actor registry cannot be read", () => {
+    const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-global-"));
+    try {
+      const file = path.join(agentDir, "fabric", "actors", "global-actors.json");
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, '{"format":1,"actors":[');
+      const globalActors = new GlobalActorRegistry(agentDir, 64 * 1024);
+      const state = { ...fakeState([], []), globalActors } as unknown as FabricState;
+
+      const snapshot = createDashboardSnapshot(state, []);
+
+      expect(snapshot.main).toMatchObject({ id: "session:test" });
+      expect(snapshot.globalActors).toEqual([]);
+    } finally {
+      fs.rmSync(agentDir, { recursive: true, force: true });
+    }
   });
 });

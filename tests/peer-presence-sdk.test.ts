@@ -68,7 +68,8 @@ describe("peer presence with the real Pi SDK", () => {
       const modelRuntime = await ModelRuntime.create({ authPath: path.join(cwd, "auth.json"), modelsPath: null, modelsStorePath: path.join(cwd, "models.json"), refreshOnCreate: false });
       const { session } = await createAgentSession({ cwd, agentDir: cwd, settingsManager, modelRuntime, resourceLoader: loader, sessionManager: SessionManager.inMemory(cwd) });
       try {
-        await session.bindExtensions({ onError: error => errors.push(error) });
+        // A bound UI context is what makes hasUI true; print mode binds none.
+        await session.bindExtensions({ uiContext: { notify() {} } as never, onError: error => errors.push(error) });
         await session.setModel(modelRuntime.getModel("offline-presence", "fixture")!);
         await session.prompt("Do the work.");
         await session.waitForIdle();

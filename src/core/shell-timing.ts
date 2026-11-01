@@ -13,6 +13,8 @@ export class FabricShellTimingBridge {
     jobs: FabricShellJobStore,
   ) {
     this.#unsubscribe = jobs.subscribe(({ type, job }) => {
+      // The v1 contract names shell tools only; detached programs are not metered here.
+      if (job.tool === "fabric_exec") return;
       if (type === "spilled" && !this.#active.has(job.id)) {
         this.#active.set(job.id, job.tool);
         this.#emit(job.id, job.tool, "started");

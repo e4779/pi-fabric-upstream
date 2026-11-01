@@ -22,16 +22,26 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     roots.push(directory);
     return directory;
   };
-  const run = async (scenario: string, model = requested) => {
+  const run = async (
+    scenario: string,
+    model = requested,
+    options: { admission?: "permissive"; exact?: true } = {},
+  ) => {
     const directory = root();
     const scenarioFile = path.join(directory, "scenario");
     fs.writeFileSync(scenarioFile, scenario);
     vi.stubEnv("FAKE_MODEL_SCENARIO", scenarioFile);
-    const manager = new AgentManager(directory, { ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 5_000 }, {
+    const manager = new AgentManager(directory, {
+      ...DEFAULT_FABRIC_CONFIG.agents, runner: "pi" as const, timeoutMs: 5_000,
+      ...(options.admission ? { modelAdmission: options.admission } : {}),
+    }, {
       workerPath, piBinary: path.resolve("tests/fixtures/fake-pi-model.mjs"), runRoot: path.join(directory, "runs"),
     });
     managers.push(manager);
-    const result = await manager.run({ task: "must run on requested model", model, thinking: "high", transport: "process" });
+    const result = await manager.run({
+      task: "must run on requested model", model, thinking: "high", transport: "process",
+      ...(options.exact ? { modelMatch: "exact" as const } : {}),
+    });
     // The manager may win the overall deadline and return a synthetic result
     // without logFile. Inspect the durable log at its known run location either way.
     const logFile = path.join(directory, "runs", result.id, "events.jsonl");
@@ -66,6 +76,26 @@ describe.skipIf(!fs.existsSync(workerPath))("real worker model admission", () =>
     expect(result).toMatchObject({ status: "failed", model: "runinfra/glm-5-3-flash", requestedModel: requested });
     expect(result.error).toContain("terminating child");
     expect(manager.listForUi()[0]).toMatchObject({ status: "failed", model: "runinfra/glm-5-3-flash" });
+  });
+
+  // Permissive admission accepts a child that reports another model. These tests use the
+  // real compiled worker: an exact request must fail where a default request is let through.
+  it.each(["reswitch", "drift"])("lets permissive admission accept another model for a default request: %s", async scenario => {
+    const { result } = await run(scenario, requested, { admission: "permissive" });
+    expect(result).toMatchObject({ status: "completed", model: "runinfra/glm-5-3-flash" });
+  });
+
+  it("fails an exact request when the child reports another model after selection, even with permissive admission configured", async () => {
+    const { result, frames } = await run("reswitch", requested, { admission: "permissive", exact: true });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("requested openai-codex/gpt-5.6-sol, but child reports runinfra/glm-5-3-flash after set_model; task was not sent");
+    expect(frames.some(frame => frame.type === "prompt")).toBe(false);
+  });
+
+  it("fails an exact request when a reply is attributed to another model, even with permissive admission configured", async () => {
+    const { result } = await run("drift", requested, { admission: "permissive", exact: true });
+    expect(result).toMatchObject({ status: "failed", requestedModel: requested });
+    expect(result.error).toContain("terminating child");
   });
 
   it("supports an exact bare model ID without using the startup default", async () => {

@@ -67,8 +67,8 @@ const isBundledPackageEntry = (entry: string): boolean =>
 
 /**
  * Fabric's own manifest entries: they never register chat providers. Entries
- * of bundled Pi packages (pi-coralbricks-provider) are not Fabric's own: they
- * stay probe candidates, so the bundled provider resolves without loading
+ * of bundled Pi packages are not Fabric's own: they stay probe candidates,
+ * so a bundled provider can resolve without loading
  * Fabric's main extension.
  */
 export function fabricExtensionEntries(moduleUrl = import.meta.url): string[] {
@@ -131,10 +131,11 @@ async function loadProviderRegistrations(
 
 /**
  * Find the extension registrations that make `model` resolvable in a child
- * without its other extensions. Returns `undefined` when Pi already knows the
- * model (built in, models.json, or a cached catalog), so those children keep
- * their exact extension-free behaviour. Throws an actionable error when no
- * installed extension registers the provider.
+ * without its other extensions. Returns `undefined` when Pi can already serve
+ * the model on its own (a known model whose API a built-in provider streams),
+ * so those children keep their exact extension-free behaviour. Throws an
+ * actionable error when the model is unknown and no installed extension
+ * registers its provider.
  */
 export async function resolveExtensionProviders(
   options: ResolveExtensionProvidersOptions,
@@ -148,9 +149,15 @@ export async function resolveExtensionProviders(
     modelsPath: path.join(options.agentDir, "models.json"),
     refreshOnCreate: false,
   });
-  if (models.getModel(key.provider, key.id)) return undefined;
-  await models.refresh({ allowNetwork: false, signal: AbortSignal.timeout(15_000) });
-  if (models.getModel(key.provider, key.id)) return undefined;
+  let known = models.getModel(key.provider, key.id);
+  if (!known) {
+    await models.refresh({ allowNetwork: false, signal: AbortSignal.timeout(15_000) });
+    known = models.getModel(key.provider, key.id);
+  }
+  // A known model (models.json, a cached catalog) still needs an extension when
+  // its API is one no built-in provider streams: an extension supplies that
+  // stream, through registerProvider's streamSimple or pi-ai's registerApiProvider.
+  if (known && await builtInStreamsApi(pi, options.agentDir, known.api)) return undefined;
 
   // Same trust a headless child applies without consulting extension
   // project_trust handlers: those belong to the extensions left out here.
@@ -170,9 +177,32 @@ export async function resolveExtensionProviders(
     .filter((resource) => resource.enabled && !resource.path.startsWith("builtin:"))
     .map((resource) => resource.path)
     .filter((candidate) => !excluded.has(realPath(candidate)));
-  const { named, rest } = orderProviderCandidates(candidates, key.provider);
   const context = { cwd: options.cwd, agentDir: options.agentDir, settingsManager };
   const failures: string[] = [];
+  if (known) {
+    // Loading runs each candidate's factory in the isolated runtime; a factory
+    // that calls registerApiProvider fills the API registry this child streams
+    // through. Fabric cannot observe that registry from its own module realm,
+    // so stop early only on a provider registration that brings the stream.
+    const { named, rest } = orderProviderCandidates(candidates, key.provider);
+    const byApi = orderProviderCandidates(rest, known.api);
+    const found = emptyRegistrations();
+    for (const group of [named, byApi.named, byApi.rest]) {
+      const loaded = await loadProviderRegistrations(pi, group, key.provider, context, failures);
+      found.configs.push(...loaded.configs);
+      found.natives.push(...loaded.natives);
+      if (found.natives.length > 0 || found.configs.some(({ config }) => config.streamSimple && config.api === known.api)) break;
+    }
+    if (failures.length > 0) {
+      // The global API registry may still have been populated, so this is only
+      // diagnostic. stderr is retained in the worker log without corrupting RPC.
+      const paths = [...new Set(failures)];
+      const shown = paths.slice(0, 5).map((file) => JSON.stringify(file.slice(0, 200)));
+      console.warn(`Provider bridge: extensions failed to load while searching for ${JSON.stringify(options.model.slice(0, 200))}: ${shown.join(", ")}${paths.length > 5 ? ` (and ${paths.length - 5} more)` : ""}. Check these extensions if inference fails, or use extensions: true.`);
+    }
+    return found;
+  }
+  const { named, rest } = orderProviderCandidates(candidates, key.provider);
   for (const group of [named, rest]) {
     const found = await loadProviderRegistrations(pi, group, key.provider, context, failures);
     if (found.configs.length > 0 || found.natives.length > 0) return found;
@@ -183,6 +213,16 @@ export async function resolveExtensionProviders(
       "Install the extension that provides it, or run the child with extensions: true." +
       (failures.length > 0 ? ` Extensions that failed to load while searching: ${[...new Set(failures)].join(", ")}.` : ""),
   );
+}
+
+/** Whether a provider built into Pi streams `api`, so no extension has to. */
+async function builtInStreamsApi(pi: PiSdk, agentDir: string, api: string): Promise<boolean> {
+  const builtIns = await pi.ModelRuntime.create({
+    authPath: path.join(agentDir, "auth.json"),
+    modelsPath: null,
+    refreshOnCreate: false,
+  });
+  return builtIns.getAllModels().some((model) => model.api === api);
 }
 
 /**

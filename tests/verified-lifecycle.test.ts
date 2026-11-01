@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { FabricProviderBindings } from "../src/core/provider-bindings.js";
-import { bindingStep, type BindingLife, type BindingEvent } from "../src/verified/generated/lifecycle-kernel.js";
+import { bindingStep, type BindingLife, type BindingEvent } from "../src/verified/lifecycle.js";
 import type { FabricProvider } from "../src/protocol.js";
 
 const deferred = () => { let resolve!: () => void; const promise = new Promise<void>(done => { resolve = done; }); return { promise, resolve }; };

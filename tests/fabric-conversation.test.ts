@@ -16,6 +16,8 @@ import {
   type FabricConversationTarget,
 } from "../src/ui/conversation.js";
 import { FabricConversationTranscriptRenderer } from "../src/ui/conversation-render.js";
+import type { FabricDashboardSnapshot, FabricUiAgent } from "../src/ui/types.js";
+import { FabricWidget, type FabricWidgetInteraction } from "../src/ui/widget.js";
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { nativeTranscript, userMessage, assistantMessage } from "./fixtures/native-conversation.js";
 initTheme("dark", false);
@@ -28,7 +30,7 @@ const theme = {
 
 /** Row of the editor's top border while the streaming indicator is embedded. */
 const editorStatusRow = (lines: string[]): number =>
-  lines.findIndex((line) => /^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+ Main > .+ ──$/.test(line));
+  lines.findIndex((line) => /^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+ [^─\s][^─]* ──$/.test(line));
 
 const historyText = (line: string): string => stripTerminalSequences(line).replace(/[│┃█]$/, "").trimEnd();
 
@@ -129,6 +131,8 @@ interface HarnessOverrides {
   keybindings?: Harness["keybindings"];
   rows?: number;
   transcript?: FabricConversationOptions["transcript"];
+  participants?: FabricConversationOptions["participants"];
+  openTasks?: (id?: string) => void;
 }
 
 const makeHarness = (overrides: HarnessOverrides = {}): Harness => {
@@ -155,6 +159,8 @@ const makeHarness = (overrides: HarnessOverrides = {}): Harness => {
     stop: vi.fn(async () => undefined),
     close: vi.fn(),
     keybindings,
+    ...(overrides.participants ? { participants: overrides.participants } : {}),
+    ...(overrides.openTasks ? { openTasks: overrides.openTasks } : {}),
   };
   const view = new FabricConversationView(tui, theme, options);
   views.push(view);
@@ -225,7 +231,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     h.view.render(100);
     h.view.handleInput("\x1b[<64;4;4M");
     const lines = h.view.render(100);
-    const border = lines.findIndex((line) => /^─+ Main > .+ ──$/.test(line));
+    const border = lines.findIndex((line) => /^─+ [^─\s][^─]* ──$/.test(line));
     const scroll = h.state.view("b").scroll;
     expect(h.state.view("b").following).toBe(false);
     expect(lines.slice(0, border - 1).map(historyText)).toEqual(history.slice(scroll, scroll + border - 1));
@@ -320,12 +326,12 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     ]);
     const h = makeHarness({ mode, initialTargetId: "b" });
     const lines = h.view.render(100);
-    const border = lines.findIndex((line) => /^─+ Main > .+ ──$/.test(line));
+    const border = lines.findIndex((line) => /^─+ [^─\s][^─]* ──$/.test(line));
     expect(border).toBeGreaterThan(3);
     expect(lines.slice(border - 3, border)).toEqual(["history-last", tail, ""]);
   });
 
-  it("animates the border indicator and stops on idle, picker, switch and disposal", async () => {
+  it("animates the border indicator and stops on idle, switch and disposal", async () => {
     vi.useFakeTimers();
     const colors = vi.spyOn(theme, "fg");
     const targets = makeTargets();
@@ -339,7 +345,7 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     const native = new WorkingStatusIndicator(h.tui, "Working");
     const nativeStatus = stripTerminalSequences(native.renderInBorder(95));
     native.dispose();
-    const badge = " Main > Agent A ──";
+    const badge = " Agent A ──";
     expect(lines[statusRow]).toBe(`── ${nativeStatus} ${"─".repeat(100 - visibleWidth(nativeStatus) - 4 - visibleWidth(badge))}${badge}`);
     expect(lines.slice(0, statusRow).join("\n")).not.toContain("Working");
     // Pi paints the embedded spinner and label with the thinking-level border color.
@@ -358,11 +364,6 @@ describe.each(["regular", "fullscreen"] as const)("native conversation dock in %
     expect(vi.getTimerCount()).toBe(0);
     expect(h.view.render(100).join("\n")).not.toContain("Working");
     targets[1]!.status = "running";
-    h.view.render(100);
-    expect(vi.getTimerCount()).toBe(1);
-    h.view.handleInput("\x0e");
-    expect(vi.getTimerCount()).toBe(0);
-    h.view.handleInput("\x1b");
     h.view.render(100);
     expect(vi.getTimerCount()).toBe(1);
     h.view.selectTarget("b");
@@ -419,7 +420,8 @@ describe("conversation view change observation", () => {
     h.view.handleInput("x");
     expect(targets).toHaveBeenCalledTimes(1);
     roster[1] = { ...roster[1]!, name: "Changed", parentId: "b", canSteer: false, readOnlyReason: "owner stale" };
-    expect(h.view.render(100).join("\n")).toContain("Agent B > Changed");
+    // The badge shows the refreshed name and permissions (its lineage now lives in the agent list).
+    expect(h.view.render(100).map((line) => stripTerminalSequences(line))).toContainEqual(expect.stringMatching(/ Changed · read-only ──$/));
     h.view.handleInput("\r");
     expect(h.send).not.toHaveBeenCalled();
     h.view.dispose();
@@ -451,23 +453,24 @@ describe("conversation view change observation", () => {
     expect(source).not.toHaveBeenCalled();
   });
 
-  it("updates unread picker markers after cached roster changes without reading picker history", () => {
+  it("reads only the selected transcript and marks only the selected target seen", () => {
     const targets = makeTargets();
+    targets[1]!.updatedAt = 50;
     targets[2]!.updatedAt = 100;
-    const transcript = vi.fn(() => nativeTranscript([]));
+    const transcript = vi.fn((id: string) => transcriptFor(id));
     const h = makeHarness({ targets: () => targets, transcript });
     h.view.render(100);
-    transcript.mockClear();
-    h.view.handleInput("\x0e");
-    expect(h.view.render(100).find((line) => line.includes("Agent B"))).toContain("●");
-    expect(transcript).not.toHaveBeenCalled();
+    h.view.refresh();
+    expect(new Set(transcript.mock.calls.map(([id]) => id))).toEqual(new Set(["a"]));
+    expect(h.state.peek("a")?.lastSeenUpdatedAt).toBe(50);
+    // Rendering never creates or advances another target's seen state.
+    expect(h.state.peek("b")?.lastSeenUpdatedAt ?? 0).toBeLessThan(100);
     h.view.selectTarget("b");
-    h.view.selectTarget("a");
-    h.view.handleInput("\x0e");
-    expect(h.view.render(100).find((line) => line.includes("Agent B"))).not.toContain("●");
+    expect(h.state.peek("b")?.lastSeenUpdatedAt).toBe(100);
     targets[2]!.updatedAt = 101;
     h.view.refresh();
-    expect(h.view.render(100).find((line) => line.includes("Agent B"))).toContain("●");
+    h.view.render(100);
+    expect(h.state.peek("b")?.lastSeenUpdatedAt).toBe(101);
   });
 
   it("keeps pinned navigation, drafts and pending sends beyond the lightweight state limit", () => {
@@ -496,129 +499,6 @@ const renderText = (view: FabricConversationView, width = 80): string =>
 const type = (view: FabricConversationView, text: string): void => {
   for (const char of text) view.handleInput(char);
 };
-
-describe.each(["regular", "fullscreen"] as const)("grouped conversation picker in %s mode", (mode) => {
-  const pickerLines = (view: FabricConversationView): string[] => view.render(100)
-    .map(stripTerminalSequences)
-    .filter((line) => /^  (Active|Inactive)$/.test(line) || /^  (→ |  ).*\((native session|agent ·|actor ·|peer ·)/.test(line))
-    .map((line) => line.trim().replace(/^→ /, "").replace(/ ●$/, ""));
-  const pickerNames = (view: FabricConversationView): string[] => pickerLines(view)
-    .map((line) => line.replace(/ \(.*/, ""));
-
-  it("groups active targets including idle Main above inactive targets, newest first regardless of ancestry", () => {
-    const targets = makeTargets();
-    Object.assign(targets[0]!, { status: "idle", updatedAt: 50 });
-    targets[1]!.updatedAt = 20;
-    targets[2]!.updatedAt = 90;
-    Object.assign(targets[3]!, { updatedAt: 70, parentId: "b" });
-    targets.push(
-      { ...targets[1]!, id: "peer", name: "Peer", kind: "peer", status: "loading", updatedAt: 60 },
-      { ...targets[1]!, id: "actor", name: "Actor", kind: "actor", status: "queued", updatedAt: 40 },
-      { ...targets[1]!, id: "stale", name: "Stale", stale: true, updatedAt: 100 },
-      { ...targets[1]!, id: "failed", name: "Failed", status: "failed", updatedAt: 80 },
-      { ...targets[1]!, id: "idle", name: "Idle", status: "idle", updatedAt: 30 },
-    );
-    const originalIds = targets.map((target) => target.id);
-    const h = makeHarness({ mode, targets: () => targets });
-    h.view.handleInput("\x0e");
-    expect(pickerNames(h.view)).toEqual([
-      "Active", "Nested", "Peer", "Main", "Actor", "Agent A",
-      "Inactive", "Stale", "Agent B", "Failed", "Idle",
-    ]);
-    expect(targets.map((target) => target.id)).toEqual(originalIds);
-  });
-
-  it("keeps equal and missing timestamps in source order", () => {
-    const targets = makeTargets();
-    targets[1]!.updatedAt = 5;
-    targets[3]!.updatedAt = 5;
-    targets.push({ ...targets[0]!, id: "peer", name: "Peer", kind: "peer" });
-    const h = makeHarness({ mode, targets: () => targets });
-    h.view.handleInput("\x0e");
-    expect(pickerNames(h.view)).toEqual(["Active", "Agent A", "Nested", "Main", "Peer", "Inactive", "Agent B"]);
-  });
-
-  it("freezes groups, order and arrivals during a visit but updates metadata and re-sorts on reopening", () => {
-    const targets = makeTargets();
-    [30, 20, 40, 10].forEach((updatedAt, index) => targets[index]!.updatedAt = updatedAt);
-    const transcript = vi.fn(() => nativeTranscript([]));
-    const h = makeHarness({ mode, targets: () => targets, transcript });
-    h.view.handleInput("\x0e");
-    transcript.mockClear();
-    const names = pickerNames(h.view);
-    expect(names).toEqual(["Active", "Main", "Agent A", "Nested", "Inactive", "Agent B"]);
-    targets[0]!.updatedAt = 1;
-    targets[1] = { ...targets[1]!, status: "completed", updatedAt: 100 };
-    Object.assign(targets[2]!, { status: "running", updatedAt: 300 });
-    targets[3]!.updatedAt = 999;
-    targets.push({ ...targets[3]!, id: "new", name: "New arrival", updatedAt: 2000 });
-    targets.reverse();
-    h.view.refresh();
-    expect(pickerNames(h.view)).toEqual(names);
-    expect(pickerLines(h.view)).toContain("Agent A (agent · completed)");
-    expect(pickerLines(h.view)).toContain("Agent B (agent · running)");
-    expect(h.view.render(100).find((line) => line.includes("Agent B"))).toContain("●");
-    expect(h.view.render(100).find((line) => line.includes("→ Agent A"))).toBeDefined();
-    type(h.view, "agent");
-    expect(pickerNames(h.view)).toEqual(["Active", "Agent A", "Nested", "Inactive", "Agent B"]);
-    h.view.handleInput("\x15"); // clear search without refreshing the snapshot
-    expect(pickerNames(h.view)).toEqual(names);
-    expect(transcript).not.toHaveBeenCalled();
-    h.view.handleInput("\x1b");
-    h.view.handleInput("\x0e");
-    expect(pickerNames(h.view)).toEqual([
-      "Active", "New arrival", "Nested", "Agent B", "Main", "Inactive", "Agent A",
-    ]);
-  });
-
-  it("keeps filtering in group order and skips headers for arrows, wheel and Enter", () => {
-    const h = makeHarness({ mode });
-    h.view.handleInput("\x0e");
-    type(h.view, "agent");
-    expect(pickerNames(h.view)).toEqual(["Active", "Agent A", "Nested", "Inactive", "Agent B"]);
-    h.view.handleInput("\x1b[B");
-    h.view.handleInput("\x1b[<65;4;4M");
-    expect(h.view.render(100).find((line) => line.includes("→ Agent B"))).toBeDefined();
-    h.view.handleInput("\r");
-    expect(h.state.selectedId).toBe("b");
-    h.view.handleInput("\x0e");
-    type(h.view, "no-such-target");
-    expect(renderText(h.view)).toContain("no matching targets");
-    h.view.handleInput("\r");
-    expect(h.state.selectedId).toBe("b");
-    expect(h.close).not.toHaveBeenCalled();
-  });
-
-  it("drops removed targets before handling input without selecting a stale row", () => {
-    const targets = makeTargets();
-    const h = makeHarness({ mode, targets: () => targets });
-    h.view.handleInput("\x0e");
-    targets.splice(1, 1);
-    // No intervening render: input itself must reconcile the removed selection.
-    h.view.handleInput("\x1b[B");
-    h.view.handleInput("\r");
-    expect(h.state.selectedId).toBe("child");
-    expect(h.close).not.toHaveBeenCalled();
-  });
-
-  it.each([5, 6, 7, 8, 12])("keeps the selected target visible across groups in a %i-row viewport", (rows) => {
-    const targets = makeTargets();
-    for (let index = 0; index < 12; index++) {
-      targets.push({ ...targets[1]!, id: `extra-${index}`, name: `Extra ${index}`, status: index < 6 ? "running" : "completed" });
-    }
-    const h = makeHarness({ mode, rows, targets: () => targets });
-    h.view.handleInput("\x0e");
-    for (let index = 0; index <= targets.length; index++) {
-      for (const width of [24, 100]) {
-        const lines = h.view.render(width);
-        expect(lines).toHaveLength(rows);
-        expect(lines.every((line) => visibleWidth(line) <= width)).toBe(true);
-        expect(lines.filter((line) => line.includes("→ "))).toHaveLength(1);
-      }
-      h.view.handleInput("\x1b[B");
-    }
-  });
-});
 
 describe("FabricConversationView", () => {
   it("keeps native queue rows until an actual new user message is observed", async () => {
@@ -740,24 +620,6 @@ describe("FabricConversationView", () => {
     expect(text).toContain("late message");
   });
 
-  it("navigates nested hierarchy with ctrl+shift+arrows and closes to main", () => {
-    const h = makeHarness({ initialTargetId: "a" });
-    h.view.handleInput("\x1b[1;6C");
-    expect(h.state.selectedId).toBe("child");
-    h.view.handleInput("\x1b[1;6D");
-    expect(h.state.selectedId).toBe("a");
-    h.view.handleInput("\x1b[1;6D");
-    expect(h.close).toHaveBeenCalledTimes(1);
-  });
-
-  it("cycles non-main targets with ctrl+tab and shift+ctrl+tab", () => {
-    const h = makeHarness({ initialTargetId: "a" });
-    h.view.handleInput("\x1b[9;5u");
-    expect(h.state.selectedId).toBe("b");
-    h.view.handleInput("\x1b[9;6u");
-    expect(h.state.selectedId).toBe("a");
-  });
-
   it("pages older and newer via callbacks and follows latest on End", () => {
     const h = makeHarness({ initialTargetId: "a", keybindings: {
       matches: (data, action) => (action === "tui.altScreen.previousPrompt" && data === "\x1b[1;5A") || (action === "tui.altScreen.nextPrompt" && data === "\x1b[1;5B"),
@@ -783,26 +645,115 @@ describe("FabricConversationView", () => {
     expect(h.stop).not.toHaveBeenCalled();
   });
 
-  it("picker lists Main and nested descendants; searching and selecting Main closes", () => {
-    const h = makeHarness({ initialTargetId: "child" });
-    h.view.handleInput("\x0e");
-    const text = renderText(h.view);
-    expect(text).toContain("Main (native session)");
-    expect(text).toContain("Agent A");
-    expect(text).toContain("Nested");
-    // Search for Main, then confirm to return to the native session.
-    type(h.view, "main");
+  it("shows the agent list below the footer and drives it from the editor with ↓, enter and esc", () => {
+    const now = Date.now();
+    const agent = (id: string, name: string, startedAt: number): FabricUiAgent => ({
+      id, name, status: "running", transport: "process", cwd: "/tmp", startedAt, toolCalls: 0,
+    });
+    const snapshot = {
+      now, sessionLabel: "Fabric session", peers: [], runs: [], actors: [], globalActors: [], state: [], events: [],
+      componentGraph: { nodes: [], edges: [] },
+      agents: [agent("a", "Agent A", now - 2_000), agent("b", "Agent B", now - 1_000)],
+    } as unknown as FabricDashboardSnapshot;
+    let received: FabricWidgetInteraction | undefined;
+    let widget: FabricWidget | undefined;
+    const h = makeHarness({
+      initialTargetId: "a",
+      participants: (interaction) => {
+        received = interaction;
+        return widget = new FabricWidget(theme, () => snapshot, 6, undefined, undefined, interaction);
+      },
+    });
+    expect(widget?.interaction).toBe(received);
+    const marker = "\x1b_pi:c\x07";
+    // The editor's top border carries the target badge (after Working while A runs).
+    const badge = (lines: string[]) => lines.find((line) => /^──.* [^─\s][^─]* ──$/.test(line));
+    let lines = h.view.render(100);
+    expect(lines).toHaveLength(40);
+    // Spacer, header (the Main row), then one row per agent: the frame's last lines.
+    const list = widget!.render(100);
+    expect(list).toHaveLength(4);
+    expect(lines.slice(-4)).toEqual(list);
+    expect(list[0]).toBe("");
+    expect(list[1]).toContain("Fabric session");
+    // Hints tell editor focus from list focus, as on the main screen.
+    expect(list[1]).toMatch(/↓ to manage$/);
+    expect(list[2]).toContain("Agent A");
+    expect(list[3]).toContain("Agent B");
+    expect(badge(lines)).toMatch(/─ Agent A( · read-only)? ──$/);
+    expect(lines.join("\n")).toContain(marker);
+
+    // ↓ in the empty editor moves focus into the list.
+    h.view.handleInput("\x1b[B");
+    expect(widget!.focused).toBe(true);
+    expect(widget!.render(100)[1]).toMatch(/⏎ open · ↑↓ select · esc back$/);
+    expect(renderText(h.view, 100)).not.toContain(marker);
+    // ↓ selects the next agent; enter opens it and gives focus back to the editor.
+    h.view.handleInput("\x1b[B");
+    h.view.handleInput("\r");
+    expect(h.state.selectedId).toBe("b");
+    expect(widget!.focused).toBe(false);
+    lines = h.view.render(100);
+    expect(badge(lines)).toMatch(/─ Agent B( · read-only)? ──$/);
+    expect(lines.join("\n")).toContain(marker);
+    expect(h.send).not.toHaveBeenCalled();
+
+    // esc in the list returns to the editor without closing the view.
+    h.view.handleInput("\x1b[B");
+    expect(widget!.focused).toBe(true);
+    h.view.handleInput("\x1b");
+    expect(widget!.focused).toBe(false);
+    expect(renderText(h.view, 100)).toContain(marker);
+    expect(h.close).not.toHaveBeenCalled();
+
+    // The header is the Main row: enter on it closes the view.
+    h.view.handleInput("\x1b[B");
+    h.view.handleInput("\x1b[A");
+    h.view.handleInput("\x1b[A");
+    expect(h.close).not.toHaveBeenCalled();
     h.view.handleInput("\r");
     expect(h.close).toHaveBeenCalledTimes(1);
+    expect(h.stop).not.toHaveBeenCalled();
   });
 
-  it("shows unread markers from target.updatedAt without mutating state", () => {
-    const targets = makeTargets();
-    targets[2]!.updatedAt = 9_999;
-    const h = makeHarness({ initialTargetId: "a", targets: () => targets });
-    h.view.handleInput("\x0e");
-    expect(renderText(h.view)).toContain("●");
-    expect(h.state.peek("b")?.lastSeenUpdatedAt ?? 0).toBeLessThan(9_999);
+  it("opens the shell tasks view from a shell row in the agent list", () => {
+    const now = Date.now();
+    const snapshot = {
+      now, peers: [], runs: [], actors: [], globalActors: [], state: [], events: [],
+      componentGraph: { nodes: [], edges: [] },
+      agents: [{ id: "a", name: "Agent A", status: "running", transport: "process", cwd: "/tmp", startedAt: now - 2_000 }],
+      shells: [{ id: "job-1", tool: "bash", command: "sleep 30", startedAt: now - 1_000, spilledAt: now,
+        status: "spilled", eventCount: 0, unread: false, stopping: false }],
+    } as unknown as FabricDashboardSnapshot;
+    const openTasks = vi.fn();
+    let widget: FabricWidget | undefined;
+    const h = makeHarness({
+      initialTargetId: "a",
+      openTasks,
+      participants: (interaction) => widget = new FabricWidget(theme, () => snapshot, 6, undefined, undefined, interaction),
+    });
+    expect(h.view.render(100).at(-1)).toMatch(/^○ job-1 spilled · /);
+    // ↓ lands on the agent on screen; ↓ again reaches the shell row.
+    h.view.handleInput("\x1b[B");
+    h.view.handleInput("\x1b[B");
+    h.view.handleInput("\r");
+    expect(openTasks).toHaveBeenCalledWith("job-1");
+    expect(widget!.focused).toBe(false);
+    expect(h.state.selectedId).toBe("a");
+    expect(h.close).not.toHaveBeenCalled();
+  });
+
+  it("bottom-aligns a short transcript on the editor, as Pi does", () => {
+    const h = makeHarness({ initialTargetId: "a" });
+    const lines = h.view.render(100).map((line) => stripTerminalSequences(line));
+    expect(lines).toHaveLength(40);
+    const first = lines.findIndex((line) => line.trim() !== "");
+    const border = lines.findIndex((line) => /^──.* [^─\s][^─]* ──$/.test(line));
+    // Blank rows fill the top; the transcript ends just above the editor.
+    expect(first).toBeGreaterThan(10);
+    expect(border).toBeGreaterThan(first);
+    expect(lines.slice(first, border).filter((line) => line.trim() !== "").length).toBeGreaterThan(0);
+    expect(border - first).toBeLessThan(15);
   });
 
   it("escape closes the view without stopping any agent", () => {
@@ -863,12 +814,14 @@ describe("FabricConversationView", () => {
     expect(h.send).toHaveBeenCalledWith("a", "queued later", "followUp");
   });
 
-  it("reports unbound configured bindings and does not fall back", () => {
+  it("does not fall back to default keys for an unbound configured binding", async () => {
     const h = makeHarness({ initialTargetId: "a" });
     type(h.view, "hi");
+    // ctrl+q is a follow-up fallback key, but the injected manager binds nothing.
     h.view.handleInput("\x11");
+    await flush();
     expect(h.send).not.toHaveBeenCalled();
-    expect(renderText(h.view)).toContain("unbound");
+    expect(h.state.peek("a")?.draft).toBe("hi");
   });
 
   it("expands tool previews with the native configured tools expand key", () => {
@@ -971,6 +924,6 @@ describe("FabricConversationView", () => {
     expect(lines.length).toBeLessThanOrEqual(4);
     const text = lines.join("\n");
     expect(text).toContain("tiny");
-    expect(text).toContain("Main");
+    expect(text).toContain("Agent A");
   });
 });

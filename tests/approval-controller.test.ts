@@ -216,6 +216,22 @@ describe("ApprovalController", () => {
     expect(custom).toHaveBeenCalledOnce();
   });
 
+  it("reports whether policy alone settles an approval, without prompting", () => {
+    const custom = vi.fn(async () => "allow-once");
+    const readAction: ResolvedFabricAction = { ...action, ref: "demo.read", name: "read", risk: "read" };
+    const controller = new ApprovalController(policies, tuiContext(custom));
+    expect(controller.decidesWithoutInteraction(readAction)).toBe(true);
+    expect(controller.decidesWithoutInteraction({ ...action, risk: "execute" })).toBe(true);
+    expect(controller.decidesWithoutInteraction(action)).toBe(false);
+    expect(controller.decidesWithoutInteraction({ ...action, risk: "network" })).toBe(false);
+    const asking = new ApprovalController({ ...policies, read: "auto" }, tuiContext(custom));
+    expect(asking.decidesWithoutInteraction(readAction)).toBe(false);
+    const overridden = new ApprovalController({ ...policies, actions: { "demo.write": "allow", "demo.read": "deny" } }, tuiContext(custom));
+    expect(overridden.decidesWithoutInteraction(action)).toBe(true);
+    expect(overridden.decidesWithoutInteraction(readAction)).toBe(true);
+    expect(custom).not.toHaveBeenCalled();
+  });
+
   it("denies actions blocked by policy without prompting", async () => {
     const custom = vi.fn(async () => "allow-once");
     const controller = new ApprovalController(policies, tuiContext(custom));

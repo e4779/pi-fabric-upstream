@@ -281,6 +281,38 @@ describe("FabricState lazy bootstrap", () => {
     vi.unstubAllEnvs();
   });
 
+  it("probes actors under PI_FABRIC_MESH_ROOT instead of mesh.root for eager activation", async () => {
+    const actor = { id: "c".repeat(32), name: "shared", instructions: "Coordinate", createdAt: Date.now() };
+    const writeRegistry = (root: string, actors: unknown[]) => {
+      fs.mkdirSync(path.join(root, "actors"), { recursive: true });
+      fs.writeFileSync(path.join(root, "actors", "actors.json"), JSON.stringify({ actors }));
+    };
+    const sharedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-shared-mesh-"));
+    writeRegistry(sharedRoot, [actor]);
+    const cwd = project({ prewalk: { alwaysRearm: false }, mesh: { enabled: true, root: "configured-mesh" } });
+    writeRegistry(path.join(cwd, "configured-mesh"), []);
+    const state = createState(runtimeHarness().loader);
+    const context = contextAt(cwd);
+    await state.bootstrap(context);
+    vi.stubEnv("PI_FABRIC_ACTOR_ID", "");
+    vi.stubEnv("PI_FABRIC_PARENT_RUN", "");
+    vi.stubEnv("PI_FABRIC_SESSION_ID", "");
+    vi.stubEnv("PI_FABRIC_MESH_ROOT", undefined);
+    try {
+      expect(state.shouldEagerlyActivate(context)).toBe(false);
+      vi.stubEnv("PI_FABRIC_MESH_ROOT", sharedRoot);
+      expect(state.shouldEagerlyActivate(context)).toBe(true);
+
+      writeRegistry(sharedRoot, []);
+      writeRegistry(path.join(cwd, "configured-mesh"), [actor]);
+      expect(state.shouldEagerlyActivate(context)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+      fs.rmSync(cwd, { recursive: true, force: true });
+      fs.rmSync(sharedRoot, { recursive: true, force: true });
+    }
+  });
+
   it("eagerly activates configured components before the first turn", async () => {
     const cwd = project({
       components: [{ id: "model-guidance", component: "model-guidance" }],

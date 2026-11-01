@@ -57,7 +57,10 @@ const parseValueCount = (value: unknown): EntropyPoolValueCount | undefined => {
 const parseEntry = (value: unknown): EntropyObservationPoolEntry | undefined => {
   if (!isRecord(value) || typeof value.ref !== "string" || !value.ref.trim()) return undefined;
   if (typeof value.key !== "string" || !value.key.trim()) return undefined;
-  if (!Number.isSafeInteger(value.total) || (value.total as number) < 0) return undefined;
+  // The total is a derived aggregate, recomputed below from the retained
+  // counts. Earlier releases could persist a negative or short total
+  // after value eviction (#273), so a stale total must not brick the pool.
+  if (!Number.isSafeInteger(value.total)) return undefined;
   if (!Array.isArray(value.values) || value.values.length > POOL_MAX_VALUES_PER_ENTRY) {
     return undefined;
   }
@@ -73,7 +76,8 @@ const parseEntry = (value: unknown): EntropyObservationPoolEntry | undefined => 
     if (seen.has(key)) return undefined;
     seen.add(key);
   }
-  return { ref: value.ref.trim(), key: value.key.trim(), total: value.total as number, values };
+  const total = values.reduce((sum, item) => sum + item.count, 0);
+  return { ref: value.ref.trim(), key: value.key.trim(), total, values };
 };
 
 const parseTrackedSession = (value: unknown): EntropyPoolTrackedSession | undefined => {

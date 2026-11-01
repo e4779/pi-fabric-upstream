@@ -1,8 +1,10 @@
+import { stripVTControlCharacters } from "node:util";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
 import type { TUI } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { FabricActivityRun } from "../src/activity/types.js";
 import { FabricActivityStore } from "../src/activity/store.js";
+import { ActorStoreReadError } from "../src/actors/store-read.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
@@ -228,6 +230,61 @@ describe("FabricUiController dashboard wiring", () => {
         "Global actor event subscriptions updated",
         "info",
       );
+    } finally {
+      dashboard?.dispose();
+      controller.stop();
+    }
+  });
+
+  it("reports an unreadable template library on import instead of throwing from the key handler", async () => {
+    const state = stubState();
+    vi.mocked(state.globalActors.list).mockReturnValue([
+      {
+        id: "g-actor-1",
+        name: "global-reviewer",
+        instructions: "Review when asked.",
+        runner: "pi",
+        events: ["turn_end"],
+        topics: [],
+        delivery: "mailbox",
+        responseMode: "directive",
+        triggerTurn: false,
+        coalesce: true,
+        createdAt: 0,
+        updatedAt: 0,
+      },
+    ] as never);
+    // The library became unreadable after the dashboard listed it.
+    const readError = new ActorStoreReadError("/project/global-actors.json", "invalid JSON");
+    vi.mocked(state.globalActors.resolve).mockImplementation(() => {
+      throw readError;
+    });
+    const create = vi.fn();
+    Object.assign(state.actors, { create });
+    const controller = new FabricUiController(state);
+    const tui = { requestRender: vi.fn() } as unknown as TUI;
+    let dashboard: FabricDashboard | undefined;
+    const context = {
+      mode: "tui",
+      modelRegistry: { getAvailable: () => [] },
+      ui: {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        custom: vi.fn(async (factory: any) => {
+          dashboard = factory(tui, theme, {}, () => {}) as FabricDashboard;
+        }),
+        notify: vi.fn(),
+        setWidget: vi.fn(),
+      },
+    } as unknown as ExtensionContext;
+
+    try {
+      await controller.openDashboard(context);
+      // Select the global template and press p to import it.
+      dashboard!.handleInput("l");
+      dashboard!.handleInput("j");
+      expect(() => dashboard!.handleInput("p")).not.toThrow();
+      expect(create).not.toHaveBeenCalled();
+      expect(context.ui.notify).toHaveBeenCalledWith(readError.message, "error");
     } finally {
       dashboard?.dispose();
       controller.stop();
@@ -488,6 +545,10 @@ describe("FabricUiController dashboard wiring", () => {
     state.config.ui.refreshMs = 500;
     state.config.ui.maxRows = 6;
     vi.mocked(state.actors.list).mockReturnValue([]);
+    // A running agent gives the list a row; a header-only list collapses.
+    vi.mocked(state.agents.list).mockReturnValue([{
+      id: "agent-1", name: "reviewer", status: "running", transport: "process", cwd: "/tmp", startedAt: Date.now(),
+    }] as never);
     const activity = new FabricActivityStore();
     Object.assign(state, { activity });
     let widget: FabricWidget | undefined;
@@ -532,6 +593,329 @@ describe("FabricUiController dashboard wiring", () => {
     } finally {
       controller.stop();
       vi.useRealTimers();
+    }
+  });
+});
+
+describe("FabricUiController widget arrow entry", () => {
+  /** Pi's interactive layout: below-editor widgets in the order last set, then the footer, last. */
+  type Layout = "regular" | "fullscreen" | "unknown";
+  const container = () => {
+    const node = {
+      children: [] as unknown[],
+      addChild: vi.fn((child: unknown) => { node.children.push(child); }),
+      removeChild: vi.fn((child: unknown) => { node.children = node.children.filter((entry) => entry !== child); }),
+    };
+    return node;
+  };
+  const mount = (layout: Layout = "regular", options: { shells?: boolean; agents?: boolean; label?: string; idleActors?: boolean } = {}) => {
+    const state = stubState();
+    if (options.label) Object.assign(state, { sessionLabel: () => options.label });
+    if (options.shells) {
+      const job = { id: "job-1", tool: "bash", command: "sleep 30", startedAt: Date.now(), spilledAt: Date.now(),
+        status: "spilled", eventCount: 0, unread: false, stopping: false };
+      Object.assign(state, { shellJobs: { list: () => [job], subscribe: () => () => {} } });
+    }
+    state.config.ui.widget = "always";
+    state.config.ui.maxRows = 6;
+    vi.mocked(state.actors.list).mockReturnValue(options.idleActors ? [stubActor, { ...stubActor, id: "actor-2", name: "reviewer" }] as never : []);
+    vi.mocked(state.agents.list).mockReturnValue(options.agents === false ? [] : [{
+      id: "agent-1", name: "reviewer", status: "running", transport: "process", cwd: "/tmp",
+      model: "anthropic/claude-opus-5-5", task: "Review the diff", startedAt: Date.now(),
+    }] as never);
+    let focused: unknown;
+    const editor = { text: "", getText() { return this.text; }, handleInput: vi.fn(), render: () => [], invalidate: () => {} };
+    focused = editor;
+    let overlay = false;
+    const below = container();
+    const footer = { render: () => ["~/project (main)"] };
+    // Regular mode mounts Pi's containers as TUI roots; fullscreen keeps them in an input dock.
+    const host = container();
+    // Pi's editor container renders its bordered editor; it sits right before the widgets.
+    const editorBox = { render: (width: number) => ["─".repeat(width), "> ", "─".repeat(width)] };
+    host.children = [{ render: () => [] }, editorBox, below, ...(layout === "unknown" ? [] : [footer])];
+    const viewport = { children: [{ render: () => [] }, host] };
+    const roots = (): unknown[] => layout === "fullscreen" ? [viewport] : host.children;
+    const tui = {
+      get children() { return roots(); },
+      getMountedRoots: roots,
+      addChild: (child: unknown) => host.addChild(child),
+      removeChild: (child: unknown) => host.removeChild(child),
+      requestRender: vi.fn(),
+      hasOverlay: () => overlay,
+      getFocusedComponent: () => focused,
+      setFocus: (component: unknown) => {
+        if (focused instanceof FabricWidget) focused.focused = false;
+        if (component instanceof FabricWidget) component.focused = true;
+        focused = component;
+      },
+    } as unknown as TUI;
+    const listeners: Array<(data: string) => { consume?: boolean } | undefined> = [];
+    // Pi keeps one widget per key and moves a re-set key to the end.
+    const byKey = new Map<string, unknown>();
+    const setWidget = vi.fn((key: string, content: unknown) => {
+      const previous = byKey.get(key);
+      (previous as { dispose?: () => void } | undefined)?.dispose?.();
+      byKey.delete(key);
+      if (typeof content === "function") {
+        byKey.set(key, (content as (t: TUI, theme: Theme) => unknown)(tui, theme));
+      }
+      below.children = [...below.children.filter((child) => child !== previous && ![...byKey.values()].includes(child)), ...byKey.values()];
+    });
+    const context = {
+      mode: "tui",
+      ui: {
+        notify: vi.fn(),
+        setWidget,
+        onTerminalInput: (handler: (data: string) => { consume?: boolean } | undefined) => {
+          listeners.push(handler);
+          return () => listeners.splice(listeners.indexOf(handler), 1);
+        },
+      },
+    } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    controller.start(context);
+    const press = (data: string) => listeners.map((listener) => listener(data)).find(Boolean);
+    const list = () => [...host.children, ...below.children].find((child) => child instanceof FabricWidget) as FabricWidget;
+    return { controller, editor, press, setWidget, below, host, footer, editorBox, list, focused: () => focused, setOverlay: (value: boolean) => { overlay = value; } };
+  };
+
+  it.each(["regular", "fullscreen"] as const)("docks the list after Pi's footer in the %s renderer", (layout) => {
+    const { controller, setWidget, below, host, footer, list } = mount(layout);
+    try {
+      expect(setWidget).toHaveBeenCalledTimes(1);
+      expect(setWidget).toHaveBeenCalledWith("pi-fabric", expect.any(Function), { placement: "belowEditor" });
+      // The registered widget is a zero-height anchor; the list sits last, after the footer.
+      expect(host.children.at(-2)).toBe(footer);
+      expect(host.children.at(-1)).toBe(list());
+      expect((below.children[0] as { render(width: number): string[] }).render(120)).toEqual([]);
+      const lines = list().render(120).join("\n");
+      expect(lines).toContain("claude-opus-5-5");
+      expect(lines).not.toContain("anthropic/");
+      expect(lines).toContain("↓ to manage");
+      controller.stop();
+      expect(host.children).not.toContain(list());
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it.each(["regular", "fullscreen"] as const)("lets Main hover win after returning from a conversation in %s mode", async (layout) => {
+    const { controller, editor, list, focused } = mount(layout);
+    let returnToMain!: () => void;
+    const closed = new Promise<void>((resolve) => { returnToMain = resolve; });
+    const open = vi.spyOn(controller, "openConversation").mockImplementation(() => closed);
+    try {
+      const widget = list();
+      const pointer = (type: "move" | "click", y: number) => widget.handleMouse({
+        type, button: type === "click" ? "left" : "none", x: 4, y, screenX: 4, screenY: y,
+        width: 120, height: 40, shift: false, alt: false, ctrl: false,
+      });
+      widget.render(120);
+      pointer("click", 2);
+      expect(open).toHaveBeenCalledWith(expect.anything(), "agent-1");
+      returnToMain();
+      await vi.waitFor(() => expect(focused()).toBe(widget));
+      expect(widget.render(120)[2]).toMatch(/^● reviewer/);
+
+      // The native list retains keyboard selection after the preview closes.
+      // Main must still win on hover without typing to release that focus.
+      for (let index = 0; index < 2; index++) {
+        pointer("move", 1);
+        const main = widget.render(120);
+        expect(main[1]).toMatch(/^● Fabric/);
+        expect(main[2]).toMatch(/^○ reviewer/);
+        pointer("move", 2);
+        expect(widget.render(120)[2]).toMatch(/^● reviewer/);
+      }
+      expect(editor.handleInput).not.toHaveBeenCalled();
+      expect(open).toHaveBeenCalledTimes(1);
+    } finally {
+      returnToMain();
+      open.mockRestore();
+      controller.stop();
+    }
+  });
+
+  it("moves the label to the editor border and collapses the list while only Main is left", () => {
+    const { controller, editorBox, list } = mount("regular", { agents: false, label: "PBO-21" });
+    try {
+      // Pi's editor render now carries the label at the right of its top border.
+      expect(stripVTControlCharacters(editorBox.render(40)[0]!)).toBe(`${"─".repeat(30)} PBO-21 ──`);
+      expect(editorBox.render(40)[2]).toBe("─".repeat(40));
+      expect(list().render(40)).toEqual([]);
+      controller.stop();
+      // Stopping restores Pi's own render.
+      expect(editorBox.render(40)[0]).toBe("─".repeat(40));
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("keeps the header when the editor border is too narrow to show the label", () => {
+    const { controller, editorBox, list } = mount("regular", { agents: false, label: "PBO-21" });
+    try {
+      // A 10-column border has no room for the badge; Pi draws it before the list each frame.
+      expect(editorBox.render(10)[0]).toBe("─".repeat(10));
+      expect(list().render(40)[1]).toMatch(/^● PBO-21/);
+      // Wide enough again: the badge shows, and the header-only list collapses.
+      expect(stripVTControlCharacters(editorBox.render(40)[0]!)).toContain(" PBO-21 ");
+      expect(list().render(40)).toEqual([]);
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("collapses a header-only list without a label, such as for idle actors", () => {
+    const { controller, editorBox, list } = mount("regular", { agents: false, idleActors: true });
+    try {
+      // Two idle actors keep the widget mounted, but give it nothing to select.
+      expect(controller.snapshot().actors).toHaveLength(2);
+      expect(list().render(120)).toEqual([]);
+      expect(editorBox.render(40)[0]).toBe("─".repeat(40));
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("leaves another extension's later render wrapper in place when it stops", () => {
+    const { controller, editorBox } = mount("regular", { agents: false, label: "PBO-21" });
+    // Another extension wraps Pi's editor container after Fabric did.
+    const fabricRender = editorBox.render;
+    editorBox.render = (width: number) => fabricRender(width).map((line, index) => index === 1 ? "> other" : line);
+    const otherRender = editorBox.render;
+    controller.stop();
+    expect(editorBox.render).toBe(otherRender);
+    // Fabric's layer passes through: no badge, the other wrapper still applies.
+    expect(editorBox.render(40)).toEqual(["─".repeat(40), "> other", "─".repeat(40)]);
+  });
+
+  it("keeps the list and the border label while agents run", () => {
+    const { controller, editorBox, list } = mount("regular", { label: "PBO-21" });
+    try {
+      // The label always sits on the editor border, list or not.
+      expect(stripVTControlCharacters(editorBox.render(40)[0]!)).toBe(`${"─".repeat(30)} PBO-21 ──`);
+      expect(list().render(120)[1]).toMatch(/^● PBO-21 /);
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("redocks after Pi remounts its containers in another renderer", async () => {
+    const { controller, below, host, footer, editorBox, list } = mount("regular");
+    try {
+      const widget = list();
+      // A renderer switch rebuilds the root with Pi's containers and nothing else.
+      host.children = [host.children[0], editorBox, below, footer];
+      (below.children[0] as { render(width: number): string[] }).render(120);
+      await Promise.resolve();
+      expect(host.children.at(-1)).toBe(widget);
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("moves focus from an empty editor into the list on ↓ and back out on ↑", () => {
+    const { controller, editor, press, list, focused } = mount();
+    try {
+      editor.text = "draft";
+      expect(press("\x1b[B")).toBeUndefined();
+      expect(focused()).toBe(editor);
+      editor.text = "";
+      expect(press("\x1b[B")).toEqual({ consume: true });
+      expect(focused()).toBe(list());
+      // A focused widget owns input: the listener lets its own ↓ through.
+      expect(press("\x1b[B")).toBeUndefined();
+      list().handleInput("\x1b[A");
+      expect(focused()).toBe(editor);
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("falls back to the below-editor slot in an unknown layout and stays last there", async () => {
+    vi.useFakeTimers();
+    const { controller, setWidget, below, list } = mount("unknown");
+    try {
+      const widget = list();
+      expect(setWidget).toHaveBeenCalledTimes(2);
+      expect(below.children).toEqual([widget]);
+      widget.render(120);
+      below.children.push({ render: () => ["status line"] });
+      widget.render(120);
+      widget.render(120);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(setWidget).toHaveBeenCalledTimes(3);
+      expect(below.children.at(-1)).toBe(widget);
+      expect(list()).toBe(widget);
+      // Already last: no further moves.
+      widget.render(120);
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(setWidget).toHaveBeenCalledTimes(3);
+    } finally {
+      controller.stop();
+      vi.useRealTimers();
+    }
+  });
+
+  it("opens the tasks view for a shell row and the conversation for an agent row", async () => {
+    const { controller, editor, press, list } = mount("regular", { shells: true });
+    const openTasks = vi.spyOn(controller, "openTasks").mockResolvedValue();
+    const openConversation = vi.spyOn(controller, "openConversation").mockResolvedValue();
+    try {
+      const lines = list().render(120);
+      expect(lines[2]).toMatch(/^○ reviewer /);
+      expect(lines[3]).toMatch(/^○ job-1 spilled · /);
+      editor.text = "";
+      press("\x1b[B");
+      list().handleInput("\x1b[B");
+      list().handleInput("\r");
+      await Promise.resolve();
+      expect(openTasks).toHaveBeenCalledWith(expect.anything(), "job-1");
+      expect(openConversation).not.toHaveBeenCalled();
+      // Closing the tasks view returns to the list, still on the shell.
+      await Promise.resolve();
+      expect(list().focused).toBe(true);
+      list().handleInput("\x1b[A");
+      list().handleInput("\r");
+      await Promise.resolve();
+      expect(openConversation).toHaveBeenCalledWith(expect.anything(), "agent-1");
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("keeps the opened row filled while its view opens, so the header never flickers", async () => {
+    const { controller, editor, press, list } = mount();
+    let finish!: () => void;
+    vi.spyOn(controller, "openConversation").mockImplementation(() => new Promise<void>((resolve) => { finish = resolve; }));
+    try {
+      editor.text = "";
+      press("\x1b[B");
+      list().handleInput("\r");
+      // Focus is back on the editor while the conversation loads.
+      expect(list().focused).toBe(false);
+      const opening = list().render(120);
+      expect(opening[1]).toMatch(/^○ /);
+      expect(opening[2]).toMatch(/^● reviewer /);
+      finish();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(list().focused).toBe(true);
+      expect(list().render(120)[2]).toMatch(/^● reviewer /);
+    } finally {
+      controller.stop();
+    }
+  });
+
+  it("leaves ↓ to an open overlay", () => {
+    const { controller, press, setOverlay, editor, focused } = mount();
+    try {
+      setOverlay(true);
+      expect(press("\x1b[B")).toBeUndefined();
+      expect(focused()).toBe(editor);
+    } finally {
+      controller.stop();
     }
   });
 });

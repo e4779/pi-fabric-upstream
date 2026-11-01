@@ -201,14 +201,17 @@ export class PeerPresenceNotifier {
       const unsubscribe = (pi.on as (name: string, fn: (...fnArgs: any[]) => unknown) => unknown)(event, handler);
       if (typeof unsubscribe === "function") this.#unsubscribe.push(unsubscribe as () => void);
     };
-    subscribe("before_agent_start", () => {
+    subscribe("before_agent_start", (_event, ctx) => {
+      // A run without a UI has no reader for the notice, and the model's reply to
+      // it would replace the answer in `pi -p` output. Skip before the ledger moves.
+      if (ctx?.hasUI === false) return undefined;
       const message = this.#take();
       return message ? { message } : undefined;
     });
     subscribe("turn_end", (event, ctx) => {
       // Only a turn that goes on to another model call. A final turn waits for
       // the next prompt, which folds every change made while idle into one notice.
-      if (ctx?.signal?.aborted || event?.message?.role !== "assistant" || event.message.stopReason !== "toolUse") {
+      if (ctx?.hasUI === false || ctx?.signal?.aborted || event?.message?.role !== "assistant" || event.message.stopReason !== "toolUse") {
         return undefined;
       }
       const message = this.#take();

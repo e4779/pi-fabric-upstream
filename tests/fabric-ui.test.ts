@@ -235,6 +235,12 @@ const snapshot = (): FabricDashboardSnapshot => {
   };
 };
 
+/** The widget's rows below the blank spacer that separates it from the editor. */
+const body = (lines: string[]): string[] => {
+  expect(lines[0]).toBe("");
+  return lines.slice(1);
+};
+
 describe("Fabric dynamic UI", () => {
   it("projects component lifecycle and dependency nodes into both overview modes", () => {
     const current = snapshot();
@@ -308,7 +314,7 @@ describe("Fabric dynamic UI", () => {
     const worker = current.agents[0]!;
     current.actors = current.actors.slice(0, 1).map(actor => ({ ...actor, worker, status: "idle" }));
     for (const call of run.calls) { call.startedAt = run.startedAt; call.finishedAt = current.now; }
-    const lines = new FabricWidget(theme, () => current, 8).render(400);
+    const lines = body(new FabricWidget(theme, () => current, 8).render(400));
     expect(lines.length).toBeGreaterThan(1);
     for (const line of lines) {
       expect(line).not.toMatch(/(?:^| )0s(?: |$)/);
@@ -414,38 +420,52 @@ describe("Fabric dynamic UI", () => {
     expect(widget.render(72).length).toBeLessThanOrEqual(5);
   });
 
-  it("discloses the chat shortcut only while a child is active", () => {
+  it("drops statistics, then shortens the title, before it drops key hints", () => {
     const current = snapshot();
-    current.runs = [];
-    const agent = current.agents[0]!;
-    const actor = current.actors[0]!;
-    current.agents = [{ ...agent, status: "completed" }];
-    current.actors = [{ ...actor, status: "idle", worker: { ...agent, status: "completed" } }];
-    const widget = new FabricWidget(theme, () => current, 8);
-    const hint = "ctrl+shift+a chat";
-    expect(widget.render(200).join("\n")).not.toContain(hint);
-    current.agents[0]!.status = "running";
-    expect(widget.hasChanged()).toBe(true);
-    expect(widget.render(200).join("\n")).toContain(hint);
-    current.agents[0]!.status = "completed";
-    expect(widget.hasChanged()).toBe(true);
-    expect(widget.render(200).join("\n")).not.toContain(hint);
-    current.actors[0]!.status = "queued";
-    expect(widget.hasChanged()).toBe(true);
-    expect(widget.render(200).join("\n")).toContain(hint);
-    current.actors[0]!.status = "idle";
-    current.actors[0]!.worker!.status = "running";
-    widget.invalidate();
-    expect(widget.render(200).join("\n")).toContain(hint);
     current.actors = [];
-    current.agents[0]!.status = "running";
-    current.agents[0]!.stale = true;
-    widget.invalidate();
-    expect(widget.render(200).join("\n")).not.toContain(hint);
-    current.agents = [];
-    current.runs = snapshot().runs;
-    widget.invalidate();
-    expect(widget.render(200).join("\n")).not.toContain(hint);
+    const run = current.runs[0]!;
+    run.name = "Repository migration across every package in the monorepo";
+    const interaction = { release: () => {}, requestRender: () => {}, open: () => {} };
+    const widget = new FabricWidget(theme, () => current, 8, () => 40, undefined, interaction);
+    const header = (width: number) => {
+      widget.invalidate();
+      return body(widget.render(width))[0]!;
+    };
+    const wide = header(240);
+    expect(wide).toContain("Repository migration across every package in the monorepo");
+    expect(wide).toContain(" tok");
+    expect(wide).toContain("↓ to manage");
+    // Too narrow for every statistic: they go first, the title and the key stay.
+    const medium = header(100);
+    expect(visibleWidth(medium)).toBeLessThanOrEqual(100);
+    expect(medium).not.toContain(" tok");
+    expect(medium).toContain("Repository migration");
+    expect(medium).toMatch(/↓ to manage$/);
+    // Narrower still: the title shortens and the key hint survives.
+    const narrow = header(48);
+    expect(visibleWidth(narrow)).toBeLessThanOrEqual(48);
+    expect(narrow).toContain("…");
+    expect(narrow).toMatch(/↓ to manage$/);
+    // Focused hints keep the most important key, ⏎ open, longest.
+    widget.focused = true;
+    const focused = header(34);
+    expect(visibleWidth(focused)).toBeLessThanOrEqual(34);
+    expect(focused).toContain("⏎ open");
+  });
+
+  it("fits agent rows by dropping statistics before shortening the activity", () => {
+    const current = snapshot();
+    current.actors = [];
+    current.runs = [];
+    current.agents = [{ ...current.agents[0]!, name: "reviewer", status: "running", model: "anthropic/claude-opus-5-5",
+      milestone: "Trace the token refresh path through every service", toolCalls: 12, usage: { input: 9000, output: 1000, cacheRead: 0, cacheWrite: 0, cost: 0 } }];
+    const row = (width: number) => body(new FabricWidget(theme, () => current, 8).render(width))[1]!;
+    expect(row(200)).toContain("claude-opus-5-5 · 12 calls · 10k tok");
+    const narrow = row(60);
+    expect(visibleWidth(narrow)).toBeLessThanOrEqual(60);
+    expect(narrow).toMatch(/^○ reviewer  Trace the token refresh/);
+    expect(narrow).not.toContain("10k tok");
+    expect(narrow).not.toContain("12 calls");
   });
 
   it("renders the widget header title and agent names in muted grey, matching pi core status lines", () => {
@@ -463,7 +483,7 @@ describe("Fabric dynamic UI", () => {
     expect(agentRow).toContain("<muted>security-reviewer</>");
   });
 
-  it("indents agents by recursive depth instead of topology parentage", () => {
+  it("indents agents by tree depth instead of topology parentage", () => {
     const current = snapshot();
     current.actors = [];
     current.runs[0]!.calls = [];
@@ -479,9 +499,9 @@ describe("Fabric dynamic UI", () => {
     const child = lines.find((line) => line.includes("recursive-child"));
     const grandchild = lines.find((line) => line.includes("recursive-grandchild"));
 
-    expect(top).toMatch(/^ {2}\S/);
-    expect(child).toMatch(/^ {4}\S/);
-    expect(grandchild).toMatch(/^ {6}\S/);
+    expect(top).toMatch(/^○ /);
+    expect(child).toMatch(/^ {2}○ /);
+    expect(grandchild).toMatch(/^ {4}○ /);
   });
 
   it("leases actor rows through settle and resets them for the next activation", () => {
@@ -500,14 +520,14 @@ describe("Fabric dynamic UI", () => {
       cwd: "/tmp/project",
     };
     const widget = new FabricWidget(theme, () => current, 8);
-    const active = widget.render(100);
-    expect(active[0]).not.toMatch(/^· Fabric/);
+    const active = body(widget.render(100));
+    expect(active[0]).toMatch(/^● Fabric/);
     expect(active.join("\n")).toContain("advisor");
 
     actor.status = "idle";
     actor.worker.status = "completed";
     widget.invalidate();
-    const settled = widget.render(100);
+    const settled = body(widget.render(100));
     expect(settled).toHaveLength(active.length);
 
     actor.status = "running";
@@ -520,7 +540,7 @@ describe("Fabric dynamic UI", () => {
       cwd: "/tmp/project",
     };
     widget.invalidate();
-    const next = widget.render(100);
+    const next = body(widget.render(100));
     expect(next).toHaveLength(2);
   });
 
@@ -545,7 +565,7 @@ describe("Fabric dynamic UI", () => {
     expect(withAgent).not.toContain("Package A");
 
     current.agents = [];
-    const withoutAgents = new FabricWidget(theme, () => current, 8).render(120);
+    const withoutAgents = body(new FabricWidget(theme, () => current, 8).render(120));
     expect(withoutAgents).toHaveLength(1);
     expect(withoutAgents.join("\n")).not.toContain("Custom index");
     expect(withoutAgents.join("\n")).not.toContain("advisor");
@@ -637,9 +657,9 @@ describe("Fabric dynamic UI", () => {
     // ambient actors keep the widget visible regardless
     current.actors = snapshot().actors;
     expect(shouldShowFabricWidget(current, "auto")).toBe(true);
-    const lines = new FabricWidget(theme, () => current, 5).render(72);
+    const lines = body(new FabricWidget(theme, () => current, 5).render(72));
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toContain("Fabric session");
+    expect(lines[0]).toMatch(/^● Fabric · /);
     expect(lines[0]).toContain("1 actor");
     expect(lines.join("\n")).not.toContain("advisor");
   });
@@ -713,7 +733,7 @@ describe("Fabric dynamic UI", () => {
     current.widgetDismissedAt = 0;
     // A freshly finished non-agent run remains summarized by its header only.
     expect(shouldShowFabricWidget(current, "auto")).toBe(true);
-    const lines = new FabricWidget(theme, () => current, 8).render(72);
+    const lines = body(new FabricWidget(theme, () => current, 8).render(72));
     expect(lines).toHaveLength(1);
     expect(lines.join("\n")).not.toContain("pi.bash");
     // An explicit dismissal hides retained history.
@@ -739,12 +759,12 @@ describe("Fabric dynamic UI", () => {
       { ...snapshot().agents[0]!, id: "agent-2", name: "beta", status: "running" },
     ];
     const widget = new FabricWidget(theme, () => current, 8);
-    const first = widget.render(72);
+    const first = body(widget.render(72));
     expect(first.length).toBe(3); // header + alpha + beta
 
     current.agents[1]!.status = "completed";
     widget.invalidate();
-    const second = widget.render(72);
+    const second = body(widget.render(72));
     expect(second).toHaveLength(first.length);
     expect(second.join("\n")).toContain("alpha");
     expect(second.join("\n")).toContain("beta");
@@ -752,7 +772,7 @@ describe("Fabric dynamic UI", () => {
 
     current.agents[0]!.status = "completed";
     widget.invalidate();
-    const third = widget.render(72);
+    const third = body(widget.render(72));
     expect(third).toHaveLength(first.length);
     expect(third.join("\n")).toContain("alpha");
     expect(third.join("\n")).toContain("beta");
@@ -770,17 +790,17 @@ describe("Fabric dynamic UI", () => {
       { ...base, id: "agent-2", name: "beta" },
     ];
     const widget = new FabricWidget(theme, () => current, 8);
-    expect(widget.render(72)).toHaveLength(3);
+    expect(body(widget.render(72))).toHaveLength(3);
 
     current.agents = [current.agents[0]!];
     widget.invalidate();
-    const withOneAgent = widget.render(72);
+    const withOneAgent = body(widget.render(72));
     expect(withOneAgent).toHaveLength(2);
     expect(withOneAgent.every((line) => visibleWidth(line) > 0)).toBe(true);
 
     current.agents = [];
     widget.invalidate();
-    const withoutAgents = widget.render(72);
+    const withoutAgents = body(widget.render(72));
     expect(withoutAgents).toHaveLength(1);
     expect(withoutAgents[0]).toContain("Fabric");
   });
@@ -795,8 +815,10 @@ describe("Fabric dynamic UI", () => {
       { ...current.agents[0]!, id: "agent-one", name: "a very long active agent name", status: "running" },
       { ...current.agents[0]!, id: "agent-two", name: "second", status: "running" },
     ];
-    const lines = new FabricWidget(theme, () => current, 2).render(24);
-    expect(lines[1]).toContain("+1");
+    // Three rows: the spacer, the header with the overflow count, and one agent.
+    const lines = new FabricWidget(theme, () => current, 3).render(24);
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toContain("↓ 1 more");
     expect(lines.every((line) => visibleWidth(line) <= 24)).toBe(true);
   });
 
@@ -2092,7 +2114,12 @@ describe("Fabric dynamic UI", () => {
         "continue remotely",
         "steer",
       );
+      expect(dashboard.render(120).join("\n")).toContain(
+        "Remote participant actions: s steer over mesh · u queue follow-up over mesh · x stop",
+      );
       dashboard.handleInput("x");
+      expect(onAgentStop).not.toHaveBeenCalled();
+      expect(dashboard.render(120).join("\n")).toContain("x again to confirm stop");
       dashboard.handleInput("x");
       expect(onAgentStop).toHaveBeenCalledWith("remote-agent");
     } finally {
@@ -2152,6 +2179,9 @@ describe("Fabric dynamic UI", () => {
       dashboard.handleInput("?");
       const help = dashboard.render(100).join("\n");
       expect(help).toContain("Fabric dashboard help");
+      expect(dashboard.render(200).join("\n")).toContain(
+        "M reduced motion (pins the model on an editable actor row)",
+      );
       expect(help).not.toContain("s steer now");
       expect(help).not.toContain("m model");
       dashboard.handleInput("\x1b");

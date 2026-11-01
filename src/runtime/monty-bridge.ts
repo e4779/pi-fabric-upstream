@@ -1,16 +1,23 @@
 import { randomUUID } from "node:crypto";
 import type * as MontyNative from "@pydantic/monty/node";
+import { providerGlobalNames } from "../provider-globals.js";
 import { pythonArgumentsFor } from "./python-arguments.js";
 
 const ROOTS = ["pi", "tools", "mcp", "extensions", "memory", "state", "schema", "components", "compact", "cache", "thinking", "decisions", "programs", "prewalk", "agents", "mesh"];
 const DISCOVERY = new Set(["providers", "catalog", "list", "search", "describe", "call", "models", "progress"]);
 const FORBIDDEN = new Set(["constructor", "prototype", "__proto__", "arguments", "caller"]);
-/** Explicit capability wrappers, not arbitrary host objects or guest magic methods. */
+/**
+ * Explicit capability wrappers, not arbitrary host objects or guest magic methods.
+ * `providerGlobals` adds one root per registered provider the host lists; its
+ * calls are tools.call host calls (`fabric.$call`), never a new path.
+ */
 export function montyBindings(
   native: typeof MontyNative,
   call: (ref: string, args: Record<string, unknown>) => Promise<unknown>,
+  providerGlobals: readonly string[] = [],
 ): Record<string, unknown> {
   const wrappers = new Map<string, MontyNative.ClassType>();
+  const providerRoots = new Set(providerGlobalNames(providerGlobals).filter((name) => !ROOTS.includes(name)));
   class Capability {}
   class CapabilityWrapper extends native.ClassType {
     constructor(readonly ref: string) {
@@ -28,6 +35,11 @@ export function montyBindings(
     override callMethod(name: string, positional: unknown[], kwargs: Record<string, unknown>): unknown {
       let ref = name === "__call__" ? this.ref : this.child(name);
       const args = pythonArgumentsFor(ref, positional, kwargs);
+      const root = ref.split(".", 1)[0]!;
+      if (providerRoots.has(root)) {
+        if (!ref.includes(".")) throw new TypeError("Call a Fabric provider action, not a namespace");
+        return call("fabric.$call", { ref, args });
+      }
       if (ref.startsWith("tools.")) {
         const action = ref.slice(6);
         if (!DISCOVERY.has(action)) throw new TypeError("tools is discovery/generic calls only; use pi for core tools");
@@ -46,5 +58,5 @@ export function montyBindings(
     }
     return value;
   };
-  return Object.fromEntries(ROOTS.map((name) => [name, wrapper(name)]));
+  return Object.fromEntries([...ROOTS, ...providerRoots].map((name) => [name, wrapper(name)]));
 }

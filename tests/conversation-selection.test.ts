@@ -44,6 +44,20 @@ describe("preview-owned transcript selection", () => {
     expect(selection.highlight(image, 0, theme)).toBe(image);
   });
 
+  it("selects whole words, model IDs and lines with double/triple clicks", () => {
+    const selection = new ConversationTextSelection();
+    const rows = ["alpha openai/gpt-6.1-sol omega", "another line"];
+    selection.start(rows, 0, 10, 2);
+    selection.finish(0, 10);
+    expect(selection.text()).toBe("openai/gpt-6.1-sol");
+    selection.start(rows, 0, 8, 3);
+    selection.finish(0, 8);
+    expect(selection.text()).toBe(rows[0]);
+    selection.start(rows, 1, 2, 2);
+    selection.finish(0, 2);
+    expect(selection.text()).toBe(`${rows[0]}\nanother`);
+  });
+
   it("retains a reference instead of iterating the full history on drag", () => {
     const rows = new Proxy(Array.from({ length: 100_000 }, () => "line"), {
       get(target, property, receiver) {

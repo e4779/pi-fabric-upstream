@@ -315,6 +315,21 @@ describe("durable public SDK host", () => {
     expect(noBuiltin.session.getActiveToolNames()).toEqual(["effect"]);
   });
 
+  it("expands native relative selectors and cannot reactivate an excluded recursive tool", async () => {
+    const f = await fixture();
+    const recursive = { ...tool(async () => ({ content: [], details: {} })), name: "fabric_exec" };
+    const host = await f.create({
+      tools: ["+fabric_exec", "-write"], excludeTools: ["fabric_exec"], customTools: [recursive],
+      settingsManager: SettingsManager.inMemory({ defaultTools: ["read", "write"] }),
+    });
+    expect(host.session.getActiveToolNames()).toEqual(["read"]);
+    host.session.setActiveToolsByName(["read", "fabric_exec"]);
+    expect(host.session.getActiveToolNames()).toEqual(["read"]);
+    const wildcard = await f.create({ tools: ["*"], excludeTools: ["fabric_exec"], customTools: [recursive] });
+    expect(wildcard.session.getActiveToolNames()).toContain("read");
+    expect(wildcard.session.getActiveToolNames()).not.toContain("fabric_exec");
+  });
+
   it("routes virtual models through public AgentSession hooks and restores the virtual selection", async () => {
     const f = await fixture();
     const route = vi.fn(() => ({ model: f.faux.getModel(), thinkingLevel: "off" as const, state: { routed: true } }));

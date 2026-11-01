@@ -82,6 +82,70 @@ describe("CapturedToolsProvider", () => {
     expect(failedOutput.content.filter((part) => part.type === "image")).toEqual([finalImage]);
   });
 
+  describe("terminate from a nested call", () => {
+    const runProgram = async (code: string, toolResult: { terminate?: boolean; isError?: boolean }, codemodeProfile: "additive" | "native" = "additive") => {
+      const definition = defineTool({
+        name: "compact_session", label: "Compact session", description: "Compact and end the turn",
+        parameters: Type.Object({}),
+        async execute() {
+          return { content: [{ type: "text" as const, text: "compacted" }], details: {}, ...toolResult };
+        },
+      });
+      const runner = {
+        createContext: () => ({ cwd: process.cwd() }), getActiveTools: () => ["compact_session"],
+        emit: vi.fn(async () => {}), emitToolCall: vi.fn(async () => undefined),
+        emitToolResult: vi.fn(async () => undefined),
+      } as unknown as ExtensionRunner;
+      const catalog = new CapturedToolCatalog();
+      catalog.replace([{ definition, sourceInfo: createSyntheticSourceInfo("/extensions/compact.ts", { source: "test" }) }], runner, DEFAULT_FABRIC_CONFIG.capture, "/extensions/pi-fabric/index.ts");
+      const registry = new ActionRegistry();
+      registry.register(new CapturedToolsProvider(catalog));
+      const config = structuredClone(DEFAULT_FABRIC_CONFIG);
+      config.approvals.execute = "allow";
+      config.executor.codemodeProfile = codemodeProfile;
+      const state = {
+        config, ensure: async () => {}, claimHandoff: async () => undefined,
+        prewalk: new PrewalkController(),
+        execution: new FabricExecutionService(registry, config),
+      } as unknown as FabricState;
+      const tool = createFabricExecTool(state, defaultCodePreviewSettings(), new Map(), (tool) => tool);
+      return tool.execute(`terminate-${Math.random()}`, { code }, undefined, undefined, {
+        cwd: process.cwd(), hasUI: false, sessionManager: { getSessionId: () => "fixture", getBranch: () => [] },
+        tools: [], executeTool: async () => { throw new Error("unexpected nested host call"); },
+      } as unknown as import("@earendil-works/pi-coding-agent").ExtensionToolContext);
+    };
+
+    it("ends the turn after the program when a nested tool returns terminate: true", async () => {
+      const output = await runProgram('await extensions.compact_session({}); return "after";', { terminate: true });
+      expect(output).not.toMatchObject({ isError: true });
+      expect(output.content).toEqual([{ type: "text", text: "after" }]);
+      expect(output.terminate).toBe(true);
+    });
+
+    it("ends the turn when a native-profile call returns terminate: true", async () => {
+      const output = await runProgram('await tools.compact_session({}); return "after";', { terminate: true }, "native");
+      expect(output).not.toMatchObject({ isError: true });
+      expect(output.terminate).toBe(true);
+    });
+
+    it("keeps the turn going when no nested tool asks to terminate", async () => {
+      const output = await runProgram('await extensions.compact_session({}); return "after";', {});
+      expect(output.terminate).toBeUndefined();
+    });
+
+    it("keeps the turn going when the program fails after the request", async () => {
+      const output = await runProgram('await extensions.compact_session({}); throw new Error("later failure");', { terminate: true });
+      expect(output).toMatchObject({ isError: true });
+      expect(output.terminate).toBeUndefined();
+    });
+
+    it("ignores terminate on a failed nested result", async () => {
+      const output = await runProgram('try { await extensions.compact_session({}); } catch {} return "after";', { terminate: true, isError: true });
+      expect(output).not.toMatchObject({ isError: true });
+      expect(output.terminate).toBeUndefined();
+    });
+  });
+
   it("prepares, validates, intercepts, and executes a captured tool lazily", async () => {
     const execute = vi.fn(async (_id, params: { value: string }, _signal, onUpdate, ctx) => {
       onUpdate?.({
@@ -167,6 +231,7 @@ describe("CapturedToolsProvider", () => {
       expect.objectContaining({ ref: "extensions.compat_tool", risk: "execute" }),
       // The trusted interceptor changes its private invocation copy, not the approval record.
       { value: "hello" },
+      expect.any(AbortSignal),
     );
     expect(context.update).toHaveBeenCalledWith("compat_tool: halfway");
     expect(lifecycleEvents).toEqual([

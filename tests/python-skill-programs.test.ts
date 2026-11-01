@@ -61,7 +61,7 @@ describe.skipIf(!availablePythonBackends.monty)("Python-native skill behavior in
 
   it.each([false, true])("council preserves failed roles and synthesis fallback=%s", async (synthesisFails) => {
     let calls = 0;
-    const result = await skill("fabric-council", { task: "decide", roles: JSON.stringify(["correctness", "security", "operations"]) }, async (_ref, args) => {
+    const result = await skill("fabric-council", { task: "decide", roles: JSON.stringify(["correctness", "security", "operations"]), synthesis: "" }, async (_ref, args) => {
       calls++;
       if (args.name === "security" || (args.name === "council synthesis" && synthesisFails)) return failed;
       return completed(args.name === "council synthesis" ? "decision" : "report");
@@ -74,9 +74,71 @@ describe.skipIf(!availablePythonBackends.monty)("Python-native skill behavior in
 
   it.each([0, 1])("council skips synthesis with %s surviving roles", async (survivors) => {
     let calls = 0;
-    const result = await skill("fabric-council", { task: "decide", roles: '["a","b","c"]' }, async () => calls++ < survivors ? completed() : failed);
+    const result = await skill("fabric-council", { task: "decide", roles: '["a","b","c"]', synthesis: "" }, async () => calls++ < survivors ? completed() : failed);
     expect(calls).toBe(3);
     expect(result.status).toBe(survivors ? "partial" : "failed");
+  });
+
+  it("council pins seat and synthesis models to exact registry keys", async () => {
+    const runs: Array<Record<string, unknown>> = [];
+    const result = await skill("fabric-council", {
+      task: "decide",
+      roles: JSON.stringify([{ role: "architect", model: "TEST/One", thinking: "high" }, "researcher", { role: "adversary", model: "test/two" }]),
+      synthesis: "test/three",
+    }, async (ref, args) => {
+      if (ref === "fabric.$models") return models;
+      runs.push({ name: args.name, model: args.model, thinking: args.thinking });
+      return completed(args.name === "council synthesis" ? "decision" : "report");
+    });
+    expect(Object.fromEntries(runs.map((run) => [run.name, run]))).toEqual({
+      architect: { name: "architect", model: "test/one", thinking: "high" },
+      researcher: { name: "researcher" },
+      adversary: { name: "adversary", model: "test/two" },
+      "council synthesis": { name: "council synthesis", model: "test/three" },
+    });
+    expect(result).toMatchObject({
+      status: "success",
+      result: "decision",
+      synthesisModel: "test/three",
+      seats: [
+        { role: "architect", model: "test/one", thinking: "high", status: "completed" },
+        { role: "researcher", status: "completed" },
+        { role: "adversary", model: "test/two", status: "completed" },
+      ],
+    });
+    expect(result.seats[1]).not.toHaveProperty("model");
+  });
+
+  it("council rejects unknown models and malformed seats before any agent runs", async () => {
+    const program = programs("fabric-council/SKILL.md")[0]!;
+    let runs = 0;
+    const host: SkillHost = async (ref) => {
+      if (ref === "fabric.$models") return models;
+      runs++;
+      return completed();
+    };
+    const reject = async (roles: unknown[], synthesis = "") => {
+      const result = await new MontyRuntime().execute(program, host, {
+        timeoutMs: 5000, memoryLimitBytes: 64 * 1024 * 1024, strings: { task: "decide", roles: JSON.stringify(roles), synthesis },
+      });
+      expect(result.terminationReason).not.toBe("completed");
+      return String(result.error);
+    };
+    expect(await reject([{ role: "a", model: "other/two" }, "b", "c"])).toContain("Council: model other/two for role a is not in the model registry. Did you mean: test/two?");
+    expect(await reject(["a", "b", "c"], "test/none")).toContain("model test/none for synthesis is not in the model registry");
+    expect(await reject([{ role: "a", thinking: "extreme" }, "b", "c"])).toContain("Council role a has unknown thinking extreme.");
+    expect(await reject([{ model: "test/two" }, "b", "c"])).toContain("A council role object needs a non-empty role.");
+    expect(await reject([{ role: "a", thinking: 3 }, "b", "c"])).toContain("Council role a has a non-string model or thinking.");
+    expect(await reject([{ role: "a", model: "test/two" }, { role: "a" }, "b", "c"])).toContain("Council role a appears twice with different settings.");
+    expect(await reject(["a", "b", "c", "d", "e", "f", "g", "h", "i"])).toContain("3–8 distinct");
+    expect(runs).toBe(0);
+  });
+
+  it("council runs six seats", async () => {
+    let calls = 0;
+    const result = await skill("fabric-council", { task: "decide", roles: '["a","b","c","d","e","f"]', synthesis: "" }, async () => { calls++; return completed(); });
+    expect(calls).toBe(7);
+    expect(result).toMatchObject({ status: "success", coverage: { requested: 6, completed: 6 } });
   });
 
   it("workflow stops after an all-failed batch and records unstarted items", async () => {

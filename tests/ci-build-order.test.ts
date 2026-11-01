@@ -15,11 +15,14 @@ describe("CI build prerequisites", () => {
     for (const index of tests) expect(build, `build must precede ${steps[index]!.name}`).toBeLessThan(index);
   });
 
-  it("installs the artifact's pinned Bend release with a checksum", () => {
-    const { bend } = JSON.parse(fs.readFileSync(fileURLToPath(new URL("../src/verified/generated/manifest.json", import.meta.url)), "utf8")) as { bend: string };
-    const install = steps.find((step) => step.name === "Install pinned Bend proof compiler")?.run ?? "";
-    expect(install).toContain(`https://github.com/bendlang/bend/releases/download/v${bend}/bend-${bend}-linux-x64.tar.gz`);
-    expect(install).toMatch(/echo "[a-f0-9]{64}  \$RUNNER_TEMP\/bend\.tar\.gz" \| sha256sum -c -/);
+  it("proves the kernels with the receipt's pinned gdp-wired before building", () => {
+    const { prover } = JSON.parse(fs.readFileSync(fileURLToPath(new URL("../src/verified/generated/manifest.json", import.meta.url)), "utf8")) as { prover: string };
+    const pkg = JSON.parse(fs.readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8")) as { devDependencies: Record<string, string> };
+    expect(prover).toBe(`gdp-wired@${pkg.devDependencies["gdp-wired"]}`);
+    const proof = steps.findIndex((step) => step.run === "bun run proof:check");
+    expect(proof).toBeGreaterThanOrEqual(0);
+    expect(proof).toBeLessThan(steps.findIndex((step) => step.run === "bun run build"));
+    expect(steps.some((step) => /bendlang|bend\.tar/.test(step.run ?? ""))).toBe(false);
   });
 
   it("refreshes apt metadata before installing Linux runtime prerequisites", () => {
