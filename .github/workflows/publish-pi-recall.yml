@@ -1,0 +1,36 @@
+name: Publish pi-recall
+
+# Publishes packages/pi-recall (@e4779/pi-recall) from any branch via
+# manual dispatch. Same NPM_TOKEN secret as the root fork publish.
+on:
+  workflow_dispatch: {}
+
+env:
+  NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish packages/pi-recall
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          echo "//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}" > ~/.npmrc
+          cd packages/pi-recall
+          npm publish --access public --tag latest
+      - name: Verify the version landed in the registry
+        run: |
+          V=$(node -e "console.log(JSON.parse(require('fs').readFileSync('packages/pi-recall/package.json','utf8')).version)")
+          for i in $(seq 1 12); do
+            if npm view "@e4779/pi-recall@$V" version --prefer-online 2>/dev/null | grep -q .; then
+              echo "verified: @e4779/pi-recall@$V is in the registry"; exit 0
+            fi
+            echo "attempt $i: not visible yet; retrying in 60s"; sleep 60
+          done
+          echo "::error::@e4779/pi-recall@$V not visible after 12 minutes"; exit 1
