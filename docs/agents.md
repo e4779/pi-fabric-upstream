@@ -32,6 +32,20 @@ You can give `fabric_exec` optional `agentBudget` and `tokenBudget` limits. Conf
 
 `agents.wait`/`join`, terminal `agents.status`, and cleanup acknowledge the result and retract any pending notification, including completion that arrived before the wait. Running status and UI/list polling do not acknowledge results. Acknowledgment means the Fabric program received the result: return the relevant outcome to Main when it needs to reason about it. Prefer `wait` over a polling loop.
 
+### Observe an existing run
+
+`agents.observe({id, delivery: "ui" | "wake", ...})` attaches bounded operational
+observation to an existing local run or `provider:` participant. It returns an
+observation task handle; use `tasks.get/watch/stop` with that handle's id. Events
+default to progress, blocked and terminal; quiet detection is opt-in and never
+proves failure. No agent is launched, and stopping or expiring the observation
+never stops the observed run. Transcript/thinking output is not exposed.
+
+`tasks.observe` provides the same contract for an existing shell or background
+program's output. There is no separate `monitors` provider. Ordinary completion
+notifications and `agents.subscribe` lifecycle routing are unchanged. See
+[attached observation](background-tasks.md#attached-task-and-participant-monitors).
+
 ### Queued spawns
 
 By default `agents.spawn` waits inside the call for a free `agents.maxConcurrent` slot. A program that spawns more children than the limit blocks there, and if its deadline passes first, the waiting spawns never launch and the program cannot return the ids of the runs that did.
@@ -638,6 +652,8 @@ Fabric uses one participant directory for each project. Every live entity has a 
 
 `agents.self()` returns the participant record for the caller. `agents.sessions()` lists every live root Pi session, including the caller's root and peers, as symmetric participant records for session-to-session coordination. Call `agents.members({ scope?, kinds?, includeStale? })` to list all kinds. `agents.list({ scope? })` lists agents and uses `scope: "local"` by default. Set the scope to `"lineage"` for descendants of the same root across recursive runtimes. Use `"project"` for all live project agents. `agents.main()` and `agents.peers()` remain convenient compatibility projections. Standard discovery hides participants with expired execution-host leases. Shared summaries include operational metadata. They exclude agent prompts, results, and errors.
 
+A child's Main is its owning lineage root, not the Main of whichever peer is viewing it. Launch instructions name that root explicitly. In a Fabric-enabled child, use `agents.self()` for the child identity, `agents.main()` for its root, and `agents.steer({ id: "main", message })` to report back. `rootId` identifies the lineage; `ownerHostId` identifies the process that controls a participant and is not a substitute for its participant ID. Cross-peer messages to one-shot agents route through that execution owner just like messages to roots and actors. Children without Fabric tools report through their ordinary response, which the host delivers.
+
 Live discovery never returns a session that has left. To see recent departures, call `agents.departed({ limit? })`. It lists other root Pi sessions that are no longer live, newest first, each with `status`, `sessionId`, `cwd`, `label`, `startedAt`, and `lastSeenAt`. `status: "stopped"` means the session closed cleanly and left a tombstone. `status: "lost"` means its host lease expired without a clean close, so `lastSeenAt` is its last heartbeat. A session that is live again drops out of the list. Tombstones live under their own mesh prefix, so `agents.sessions()`, `agents.peers()`, and `agents.members()` never read them. Only roots get tombstones; child agents and actors simply leave. `mesh.departedLimit` and `mesh.departedRetentionMs` bound how many tombstones are kept and for how long.
 
 ```ts
@@ -690,6 +706,7 @@ File or git changes you did not make may be theirs: do not revert or overwrite t
 </fabric-peers>
 ```
 
+- **Display.** The full notice stays in the model context as a hidden transcript entry. The human sees a compact Pi notification, such as `Fabric peers: joined FAB-2; 1 active`. The transcript card is hidden. Notification failures do not discard the model advice.
 - **When.** At the start of a prompt, and at the end of any turn that continues into another model call, so a peer that joins during a long run is noticed before the next request. A final turn adds nothing; the next prompt folds every change made while idle into one notice.
 - **Cache safety.** The notice is a persistent transcript message appended at a turn boundary. The system prompt, tool declarations, and every earlier message stay byte-identical, so the provider's cached prefix remains valid and only the notice itself is new input. The mid-run notice is a native `turn_end` boundary entry: it rides the request the run was about to make and never triggers an extra one. The text is deterministic for a given change. It carries labels, participant ids, and a working directory when that differs from the caller's, and no clock, run status, or model.
 - **Once per change.** Fabric rebuilds what the model was told from the notices on the active branch, so resuming or navigating a session does not repeat one. A compaction may drop earlier notices from the context, so the current peers are stated again at the next boundary.
