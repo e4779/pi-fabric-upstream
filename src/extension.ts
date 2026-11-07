@@ -1,6 +1,11 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerJevAuth } from "./jev/auth.js";
-import { startExternalBridge, type ExternalBridgeHandle } from "./external/bridge.js";
+import {
+  composeCommands,
+  startExternalBridge,
+  type ExternalBridgeHandle,
+} from "./external/bridge.js";
+import { createAgentCommand } from "./external/agent.js";
 import { createRecallCommand } from "./external/recall.js";
 import type { MemoryProviderContext } from "./memory/request-context.js";
 import type {
@@ -584,7 +589,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         version: FABRIC_MANAGED_HOST_VERSION,
         stateView: () => ({ bootstrapped: state.bootstrapped, surface: state.config.surface }),
         socketDir: state.config.external.socketDir,
-        commands: createRecallCommand(externalMemoryContext),
+        commands: composeCommands(
+          createAgentCommand(),
+          createRecallCommand(externalMemoryContext),
+        ),
       });
       return;
     }
