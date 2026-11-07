@@ -1,0 +1,31 @@
+#!/bin/sh
+# fab — thin client for the pi-fabric external bridge (surface: "external").
+# Line protocol over a unix socket: argv in as lines, text out.
+# Discovery: $FABRIC_SOCK (inherited from a pi host process) or --socket PATH.
+# Needs netcat with unix-socket support (nc -U; FreeBSD base, openbsd nc).
+
+log() { printf 'fab: %s\n' "$*" >&2; }
+die() { log "error: $*"; exit 1; }
+
+sock=${FABRIC_SOCK:-}
+while :; do
+    case $1 in
+    -s|--socket) [ "$#" -ge 2 ] || die "--socket needs a path"; sock=$2; shift 2 ;;
+    -h|--help) printf 'usage: fab [-s socket] command [args...]\n'; exit 0 ;;
+    *) break ;;
+    esac
+done
+
+[ -n "$sock" ] || die "no bridge socket: set FABRIC_SOCK or pass --socket"
+[ -S "$sock" ] || die "not a socket: $sock"
+
+# argv as lines, then half-close; the bridge replies and closes.
+{ for a; do printf '%s\n' "$a"; done; } | nc -U "$sock" | {
+    IFS= read -r status
+    case $status in
+    OK) ;;
+    ERR*) printf '%s\n' "$status" >&2; exit 1 ;;
+    *) printf 'fab: malformed reply: %s\n' "$status" >&2; exit 1 ;;
+    esac
+    while IFS= read -r line || [ "$line" ]; do printf '%s\n' "$line"; done
+}
