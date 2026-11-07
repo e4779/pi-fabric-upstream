@@ -176,6 +176,10 @@ for (const source of Object.keys(receipt.outputs)) {
   copyFileSync(source, source.replace(/^src\//, `${outdir}/`));
 }
 copyFileSync(receiptPath, `${outdir}/verified/generated/manifest.json`);
+// The fab bridge client ships as a dist artifact: public bin targets must
+// live under ./dist (assert-build-artifacts), and copyFileSync keeps its mode.
+mkdirSync(`${outdir}/bin`, { recursive: true });
+copyFileSync("bin/fab", `${outdir}/bin/fab`);
 
 const bundledPackages = Object.keys(result.metafile.inputs).filter((input) =>
   input.includes("node_modules/"),
