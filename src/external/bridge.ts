@@ -66,7 +66,8 @@ const helpLines = (hasCommands: boolean): string[] => [
   "  status          engine state summary",
   ...(hasCommands
     ? [
-        "  agent           bounded worker over the host SDK (promptFile=…)",
+        "  agent           worker: promptFile=… blocks; submit/status/wait/",
+        "                  result/stop/steer/follow/list run it detached",
         "  recall          search session memory (query=<terms> …)",
       ]
     : []),
