@@ -6,6 +6,7 @@ import {
   type ExternalBridgeHandle,
 } from "./external/bridge.js";
 import { createAgentCommand } from "./external/agent.js";
+import { AgentJobs, createAgentJobsCommand } from "./external/agent-jobs.js";
 import { createRecallCommand } from "./external/recall.js";
 import type { MemoryProviderContext } from "./memory/request-context.js";
 import type {
@@ -545,6 +546,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   });
   registerHandoffCompletionRenderer(pi);
   pi.registerTool(fabricTool);
+  // Detached worker jobs; bridge-scope lifetime, aborted with the session.
+  const externalAgentJobs = new AgentJobs();
 
   // The bridge outlives session switches, so recall reads through the latest
   // activation context instead of a captured one: cwd/sessionId move with it.
@@ -594,6 +597,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         stateView: () => ({ bootstrapped: state.bootstrapped, surface: state.config.surface }),
         socketDir: state.config.external.socketDir,
         commands: composeCommands(
+          createAgentJobsCommand(externalAgentJobs),
           createAgentCommand(),
           createRecallCommand(externalMemoryContext),
         ),
@@ -689,6 +693,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   const cleanupActivationSideEffects = (): void => {
     uninstallHaltOnEscape();
     uninstallShellHangKeys();
+    externalAgentJobs.close();
     fabricUi.stop();
   };
   state.setActivationHook(async (context) => {
