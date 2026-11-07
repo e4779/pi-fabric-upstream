@@ -20,7 +20,13 @@ done
 [ -S "$sock" ] || die "not a socket: $sock"
 
 # argv as lines, then half-close; the bridge replies and closes.
-{ for a; do printf '%s\n' "$a"; done; } | nc -U "$sock" | {
+# -N shuts the socket down after stdin EOF — without it both sides wait for
+# the other to close first (deadlock, seen live). Hosts whose nc lacks -N
+# override the whole client via FAB_NETCAT (e.g. FAB_NETCAT='ncat -U').
+# the client is a word list by design
+# shellcheck disable=SC2086
+client=${FAB_NETCAT:-nc -N -U}
+{ for a; do printf '%s\n' "$a"; done; } | $client "$sock" | {
     IFS= read -r status
     case $status in
     OK) ;;
