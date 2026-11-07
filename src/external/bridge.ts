@@ -47,11 +47,29 @@ export interface ExternalCommandResult {
  */
 export type ExternalCommandHandler = (argv: string[]) => Promise<ExternalCommandResult | undefined>;
 
+/** First handler to claim the argv wins; undefined falls through to the next. */
+export const composeCommands = (
+  ...handlers: ExternalCommandHandler[]
+): ExternalCommandHandler => {
+  return async (argv: string[]) => {
+    for (const handler of handlers) {
+      const result = await handler(argv);
+      if (result !== undefined) return result;
+    }
+    return undefined;
+  };
+};
+
 const helpLines = (hasCommands: boolean): string[] => [
   "commands:",
   "  ping            liveness + version + surface",
   "  status          engine state summary",
-  ...(hasCommands ? ["  recall          search session memory (query=<terms> …)"] : []),
+  ...(hasCommands
+    ? [
+        "  agent           bounded worker over the host SDK (promptFile=…)",
+        "  recall          search session memory (query=<terms> …)",
+      ]
+    : []),
   "  help            this list",
 ];
 
