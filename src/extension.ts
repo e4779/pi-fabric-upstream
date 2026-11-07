@@ -1,5 +1,6 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerJevAuth } from "./jev/auth.js";
+import { startExternalBridge, type ExternalBridgeHandle } from "./external/bridge.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -300,6 +301,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // nothing: the engine (compaction, memory, agents, mesh) runs behind
   // the external bridge for whatever surface tool the host provides.
   const externalSurface = (): boolean => state.config.surface === "external";
+  let externalBridge: ExternalBridgeHandle | undefined;
   const fabricOwnsModelTools = (): boolean =>
     !externalSurface() &&
     (state.config.fullCodeMode || state.config.schema.mode === "enforce");
@@ -796,6 +798,19 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (_event, context) => {
+    // External surface: open the bridge before anything else — a surface
+    // tool's children may need FABRIC_SOCK the moment the session runs.
+    if (externalSurface()) {
+      externalBridge?.close();
+      externalBridge = startExternalBridge({
+        version: FABRIC_MANAGED_HOST_VERSION,
+        stateView: () => ({
+          bootstrapped: state.bootstrapped,
+          surface: state.config.surface,
+        }),
+        socketDir: state.config.external.socketDir,
+      });
+    }
     stopHistoryPaging();
     await sealScope();
     clearEntropyRetry();
@@ -1408,6 +1423,8 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // A claim never outlives the runtime it was made in: reload, session
     // replacement and quit all shut this instance down. Cleared before any
     // await, so a later step that throws cannot leave the old handle active.
+    externalBridge?.close();
+    externalBridge = undefined;
     unsubscribeOwner();
     ownerSlot.closed = true;
     ownerSlot.host?.clear();
