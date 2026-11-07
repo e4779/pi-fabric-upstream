@@ -1,6 +1,8 @@
 import type { Usage } from "@earendil-works/pi-ai";
 import { registerJevAuth } from "./jev/auth.js";
 import { startExternalBridge, type ExternalBridgeHandle } from "./external/bridge.js";
+import { createRecallCommand } from "./external/recall.js";
+import type { MemoryProviderContext } from "./memory/request-context.js";
 import type {
   ExtensionAPI,
   ExtensionContext,
@@ -539,7 +541,35 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   registerHandoffCompletionRenderer(pi);
   pi.registerTool(fabricTool);
 
-  const applyFabricMode = (): void => {
+  // The bridge outlives session switches, so recall reads through the latest
+  // activation context instead of a captured one: cwd/sessionId move with it.
+  let externalRecallContext: ExtensionContext | undefined;
+  const externalMemoryContext = async (): Promise<MemoryProviderContext | undefined> => {
+    const context = externalRecallContext;
+    if (!context || !state.config.memory.enabled) return undefined;
+    const sessionFile = context.sessionManager?.getSessionFile?.();
+    const sources =
+      state.config.memory.sources && state.config.memory.sources.length > 0
+        ? (await import("./memory/fs-source.js")).createConfiguredMemorySourceRegistry(
+            state.config.memory.sources,
+          )
+        : undefined;
+    return {
+      agentDir: resolveAgentDir(),
+      cwd: context.cwd,
+      config: state.config.memory,
+      sessionId: context.sessionManager.getSessionId(),
+      ...(sessionFile ? { sessionFile } : {}),
+      ...(sources ? { sources } : {}),
+      getLiveBranch: () => ({
+        entries: context.sessionManager.getBranch(),
+        leafId: context.sessionManager.getLeafId(),
+      }),
+    };
+  };
+
+  const applyFabricMode = (context: ExtensionContext): void => {
+    externalRecallContext = context;
     if (externalSurface()) {
       // No model tool of ours: capture stays inert forever, nothing hides,
       // fabric_exec leaves the active set via the canonical API, and the
@@ -558,6 +588,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         version: FABRIC_MANAGED_HOST_VERSION,
         stateView: () => ({ bootstrapped: state.bootstrapped, surface: state.config.surface }),
         socketDir: state.config.external.socketDir,
+        commands: createRecallCommand(externalMemoryContext),
       });
       return;
     }
@@ -655,7 +686,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   state.setActivationHook(async (context) => {
     refreshCodePreviewSettings();
     await autoArmPrewalk(context);
-    applyFabricMode();
+    applyFabricMode(context);
     fabricUi.start(context);
     installHaltOnEscape(context);
     installShellHangKeys(context);
@@ -854,7 +885,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     // new session that inherited the in-place executor can snap back.
     await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
     refreshCodePreviewSettings();
-    applyFabricMode();
+    applyFabricMode(context);
     if (state.shouldEagerlyActivate(context)) await state.ensure(context);
   });
 
@@ -1543,7 +1574,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     state,
     fabricUi,
     capturedTools,
-    applyFabricMode,
+    // Zero-arg adapter: settings re-applies the mode with the latest
+    // activation context (applyFabricMode itself wants one).
+    applyFabricMode: () => {
+      if (externalRecallContext) applyFabricMode(externalRecallContext);
+    },
     suspendToolCapture,
     refreshCodePreviewSettings,
     refreshToolDisplay: () => toolDisplay.refresh(),

@@ -35,20 +35,44 @@ interface BridgeStateView {
   surface: string;
 }
 
-const HELP = ["commands:", "  ping            liveness + version + surface", "  status          engine state summary", "  help            this list"].join("\n");
+export interface ExternalCommandResult {
+  ok: boolean;
+  lines: string[];
+}
+
+/**
+ * Optional async command extension, tried before the builtins. Return
+ * undefined to fall through; the first line of a failed result is what the
+ * client sees after `ERR`.
+ */
+export type ExternalCommandHandler = (argv: string[]) => Promise<ExternalCommandResult | undefined>;
+
+const helpLines = (hasCommands: boolean): string[] => [
+  "commands:",
+  "  ping            liveness + version + surface",
+  "  status          engine state summary",
+  ...(hasCommands ? ["  recall          search session memory (query=<terms> …)"] : []),
+  "  help            this list",
+];
 
 export function startExternalBridge(options: {
   version: number;
   stateView: () => BridgeStateView;
   socketDir?: string;
   log?: (message: string) => void;
+  /** Async commands beyond the builtins; see ExternalCommandHandler. */
+  commands?: ExternalCommandHandler;
 }): ExternalBridgeHandle {
   const dir = options.socketDir?.trim() || join(homedir(), ".pi", "agent", "sock");
   mkdirSync(dir, { recursive: true });
   const socketPath = join(dir, `fabric-${process.pid}.sock`);
   rmSync(socketPath, { force: true });
 
-  const dispatch = (argv: string[]): { ok: boolean; lines: string[] } => {
+  const dispatch = async (argv: string[]): Promise<{ ok: boolean; lines: string[] }> => {
+    if (options.commands) {
+      const handled = await options.commands(argv);
+      if (handled) return handled;
+    }
     const view = options.stateView();
     switch (argv[0] ?? "") {
       case "ping":
@@ -70,13 +94,17 @@ export function startExternalBridge(options: {
           ],
         };
       case "help":
-        return { ok: true, lines: HELP.split("\n") };
+        return { ok: true, lines: helpLines(options.commands !== undefined) };
       default:
         return { ok: false, lines: [`unknown command ${JSON.stringify(argv[0] ?? "")} — try help`] };
     }
   };
 
-  const server = createServer((socket: Socket): void => {
+  // allowHalfOpen: the reply may be computed asynchronously; with the
+  // default false, bun (and node's auto-FIN window) can close the writable
+  // side before a microtask gets to write — seen live as empty replies.
+  // We half-close explicitly once the reply is out.
+  const server = createServer({ allowHalfOpen: true }, (socket: Socket): void => {
     const lines: string[] = [];
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {
@@ -84,9 +112,16 @@ export function startExternalBridge(options: {
     });
     socket.on("end", () => {
       while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-      const head = dispatch(lines);
-      const first = head.ok ? "OK" : `ERR ${head.lines.shift() ?? ""}`;
-      socket.end([first, ...head.lines, ""].join("\n"));
+      void dispatch(lines).then(
+        (head) => {
+          const first = head.ok ? "OK" : `ERR ${head.lines.shift() ?? ""}`;
+          socket.end([first, ...head.lines, ""].join("\n"));
+        },
+        (error: unknown) => {
+          const message = error instanceof Error ? error.message : String(error);
+          socket.end(`ERR ${message}\n`);
+        },
+      );
     });
     socket.on("error", () => {
       /* client vanished mid-request: nothing to answer */
