@@ -543,7 +543,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // reads throw ("has not bootstrapped"; seen live).
       suspendToolCapture();
       toolOwnership.apply(false, undefined);
-      pi.setActiveTools(pi.getActiveTools().filter((name) => name !== fabricTool.name));
+      // Withdraw the tool without touching the active set: re-registering
+      // with exposure "hidden" is pi's documented withdrawal path. A
+      // setActiveTools() snapshot here froze (and poisoned into the session
+      // file) the active set, cutting later-registered project tools —
+      // seen live: box/llm without shell survived every resume.
+      Object.assign(fabricTool, { exposure: "hidden" as const });
+      pi.registerTool(fabricTool);
       externalBridge ??= startExternalBridge({
         version: FABRIC_MANAGED_HOST_VERSION,
         stateView: () => ({ bootstrapped: state.bootstrapped, surface: state.config.surface }),
