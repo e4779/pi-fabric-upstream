@@ -66,6 +66,11 @@ const lazyEntryPoints = [
   "src/native-tool-catalog.ts",
   "src/native-image-artifacts.ts",
   "src/memory/extractive-history.ts",
+  // External-bridge recall engine; loaded at the first recall command.
+  "src/memory/recall-service.ts",
+  "src/memory/request-cache.ts",
+  "src/memory/fs-source.ts",
+  "src/providers/memory-provider.ts",
   "src/cli/mesh.ts",
   "src/cli/decisions.ts",
   "src/thinking-control.ts",
