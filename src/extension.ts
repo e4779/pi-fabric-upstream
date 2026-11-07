@@ -272,8 +272,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   const toolDisplay = new FabricToolDisplayController();
 
   const capturePolicy = () => effectiveToolCaptureConfig(state.config);
+  // surface: "external" — fabric registers no model tool and captures
+  // nothing: the engine (compaction, memory, agents, mesh) runs behind
+  // the external bridge for whatever surface tool the host provides.
+  const externalSurface = (): boolean => state.config.surface === "external";
   const fabricOwnsModelTools = (): boolean =>
-    state.config.fullCodeMode || state.config.schema.mode === "enforce";
+    !externalSurface() &&
+    (state.config.fullCodeMode || state.config.schema.mode === "enforce");
   // Legacy capture preferences still describe the catalog, but native loadout
   // hiding is unconditional in full-code/enforce mode, including keepVisible.
   const hiddenCapturedToolNames = (): Set<string> => {
@@ -526,9 +531,15 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       },
     }),
   );
-  pi.registerTool(fabricTool);
+  if (!externalSurface()) pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {
+    if (externalSurface()) {
+      // No model tool of ours: capture stays inert forever, nothing hides.
+      suspendToolCapture();
+      toolOwnership.apply(false, undefined);
+      return;
+    }
     // Re-applying the persistent policy ends any suspension window; do it
     // before setPolicy so a config-disabled policy recomputes derived
     // surfaces against the (now stable) empty catalog.

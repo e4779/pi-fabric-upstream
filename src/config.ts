@@ -479,8 +479,23 @@ export interface FabricSessionsConfig {
   ownerLock: boolean;
 }
 
+export interface FabricExternalConfig {
+  /** Warn when this tool is not registered — a hint, not a coupling. */
+  expectTool: string;
+  /** Directory for the per-session bridge socket; empty = ~/.pi/agent/sock. */
+  socketDir: string;
+}
+
 export interface FabricConfig {
   fullCodeMode: boolean;
+  /**
+   * Model-facing surface. "fabric-exec" (default) registers fabric_exec as
+   * the model tool. "external" registers no model tool and skips capture:
+   * fabric runs as an engine (compaction, memory, agents, mesh, mcp) behind
+   * a bridge for whatever surface tool the host provides.
+   */
+  surface: "fabric-exec" | "external";
+  external: FabricExternalConfig;
   executor: FabricExecutorConfig;
   approvals: FabricApprovalConfig;
   mcp: FabricMcpConfig;
@@ -535,6 +550,8 @@ export const maxExecutorMemoryLimitBytes = (
 
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
+  surface: "fabric-exec",
+  external: { expectTool: "", socketDir: "" },
   executor: {
     kernel: "typescript",
     pythonRuntime: "monty",
@@ -888,6 +905,9 @@ const compactionEngineValue = (
 ): FabricCompactionEngine =>
   value === "pi" || value === "fabric" ? value : fallback;
 
+const surfaceValue = (value: unknown): "fabric-exec" | "external" =>
+  value === "external" ? "external" : "fabric-exec";
+
 // Bands are validated as a pair: any non-finite value or an ordering other
 // than 0 < warn < urgent < 1 falls back to the defaults as a whole.
 const compactionPressureBandsValue = (
@@ -986,6 +1006,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   );
   const approvals = objectValue(input.approvals);
   const mcp = objectValue(input.mcp);
+  const external = objectValue(input.external);
   const mcpCache = objectValue(mcp.cache);
   const mcpJev = objectValue(mcp.jev);
   const prewalk = objectValue(input.prewalk);
@@ -1112,6 +1133,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
 
   return {
     fullCodeMode: booleanValue(input.fullCodeMode, DEFAULT_FABRIC_CONFIG.fullCodeMode),
+    surface: surfaceValue(input.surface),
+    external: {
+      expectTool: stringValue(external.expectTool)?.trim() ?? "",
+      socketDir: stringValue(external.socketDir)?.trim() ?? "",
+    },
     executor: {
       kernel: executorKernel,
       pythonRuntime: executor.pythonRuntime === "cpython" ? "cpython" : "monty",
