@@ -537,13 +537,22 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     },
   });
   registerHandoffCompletionRenderer(pi);
-  if (!externalSurface()) pi.registerTool(fabricTool);
+  pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {
     if (externalSurface()) {
-      // No model tool of ours: capture stays inert forever, nothing hides.
+      // No model tool of ours: capture stays inert forever, nothing hides,
+      // fabric_exec leaves the active set via the canonical API, and the
+      // external bridge opens. Runs post-bootstrap — factory-time config
+      // reads throw ("has not bootstrapped"; seen live).
       suspendToolCapture();
       toolOwnership.apply(false, undefined);
+      pi.setActiveTools(pi.getActiveTools().filter((name) => name !== fabricTool.name));
+      externalBridge ??= startExternalBridge({
+        version: FABRIC_MANAGED_HOST_VERSION,
+        stateView: () => ({ bootstrapped: state.bootstrapped, surface: state.config.surface }),
+        socketDir: state.config.external.socketDir,
+      });
       return;
     }
     // Re-applying the persistent policy ends any suspension window; do it
@@ -798,19 +807,6 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   };
 
   pi.on("session_start", async (_event, context) => {
-    // External surface: open the bridge before anything else — a surface
-    // tool's children may need FABRIC_SOCK the moment the session runs.
-    if (externalSurface()) {
-      externalBridge?.close();
-      externalBridge = startExternalBridge({
-        version: FABRIC_MANAGED_HOST_VERSION,
-        stateView: () => ({
-          bootstrapped: state.bootstrapped,
-          surface: state.config.surface,
-        }),
-        socketDir: state.config.external.socketDir,
-      });
-    }
     stopHistoryPaging();
     await sealScope();
     clearEntropyRetry();
