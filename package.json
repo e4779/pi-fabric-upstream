@@ -6,7 +6,7 @@
   "main": "./dist/index.js",
   "bin": {
     "pi-fabric": "./dist/cli/index.js",
-    "fab": "./bin/fab"
+    "fab": "./dist/bin/fab"
   },
   "types": "./dist/index.d.ts",
   "exports": {
@@ -64,7 +64,6 @@
     }
   },
   "files": [
-    "bin/",
     "dist/",
     "skillsets/",
     "docs/",

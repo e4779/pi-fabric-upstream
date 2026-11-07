@@ -301,6 +301,11 @@ const cliEntry = join(dist, "cli/index.js");
 if (!readFileSync(cliEntry, "utf8").startsWith("#!/usr/bin/env node\n")) {
   throw new Error("pi-fabric CLI entry lost its node shebang");
 }
+// The `fab` bridge client is a plain sh script riding along in dist/.
+const fabEntry = join(dist, "bin/fab");
+if (!readFileSync(fabEntry, "utf8").startsWith("#!/bin/sh\n")) {
+  throw new Error("fab bridge client lost its sh shebang");
+}
 for (const file of [...staticClosure([cliEntry]), ...staticClosure([join(dist, "cli/mesh.js")]), ...staticClosure([join(dist, "cli/decisions.js")])]) {
   if (file === join(dist, "index.js") || readFileSync(file, "utf8").includes("src/fabric-runtime-state.ts")) {
     throw new Error(`pi-fabric CLI statically reaches the extension graph: ${file}`);
