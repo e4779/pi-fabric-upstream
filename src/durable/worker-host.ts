@@ -11,6 +11,7 @@ import {
   type ProjectTrustContext, type ProjectTrustHandler,
 } from "@earendil-works/pi-coding-agent";
 import { nativeFabricExecExclusions } from "../core/child-tool-allowlist.js";
+import { claimWorkerSessionOwnerLock, type SessionOwnerClaim } from "../core/session-owner-lock.js";
 import { durableExtensionLoadError } from "./extension-load-error.js";
 import { createDurableAgentSession } from "./session.js";
 import { openDurableWorkerStorage } from "./storage.js";
@@ -102,7 +103,23 @@ export async function createDurableWorkerRuntime(options: DurableWorkerOptions):
   advertiseHostExtensionRunner();
   const cwd = process.cwd();
   const agentDir = getAgentDir();
-  const manager = options.sessionFile ? SessionManager.open(options.sessionFile, undefined, cwd) : SessionManager.inMemory(cwd);
+  // Single-writer guard (sessions.ownerLock, opt-in): this worker is the
+  // process that writes the session file, so the claim must live here, not
+  // in the parent — a detached worker outlives its spawner, and a parent-held
+  // claim would go stale while the writer lives on. A live foreign owner
+  // refuses the open (the run fails with the owner dump); an unusable
+  // registry fails open with a warning. A crash mid-run leaves the claim to
+  // the pid-liveness sweep: the sidecar's pid is dead, so it is stale.
+  // Sessions opened later by the host runtime (/new, /fork, /resume switches)
+  // are outside this guard: the host has no pre-open hook for them.
+  const sessionOwnerLock = claimWorkerSessionOwnerLock(options.sessionFile);
+  let manager: SessionManager;
+  try {
+    manager = options.sessionFile ? SessionManager.open(options.sessionFile, undefined, cwd) : SessionManager.inMemory(cwd);
+  } catch (error) {
+    sessionOwnerLock?.release();
+    throw error;
+  }
   let current: { close(): Promise<void> } | undefined;
   const initialSessionId = manager.getSessionId();
   let first = true;
@@ -193,7 +210,10 @@ export async function createDurableWorkerRuntime(options: DurableWorkerOptions):
   const initial = await factory({ cwd, agentDir, sessionManager: manager });
   class DurableRuntime extends AgentSessionRuntime {
     override async dispose(): Promise<void> {
-      try { await super.dispose(); } finally { await closeCurrent(); }
+      try { await super.dispose(); } finally {
+        await closeCurrent();
+        sessionOwnerLock?.release();
+      }
     }
   }
   return new DurableRuntime(initial.session, initial.services, factory, initial.diagnostics);
