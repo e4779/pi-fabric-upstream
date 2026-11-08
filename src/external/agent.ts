@@ -17,7 +17,8 @@ export const AGENT_ARGV_HELP = [
   "  promptFile=<path>   required; file with the full worker prompt",
   "  tools=a,b,c         tool names; empty line pair (tools=) means none",
   "  cwd=<path>          working directory (default: host cwd)",
-  "  model=<provider/id> override the configured default model",
+  "  model=<provider/id> override the configured default model; any key",
+  "                      listed by `agent models` works, custom providers included",
   "  thinking=<level>    off|minimal|low|medium|high|xhigh|max (default: medium)",
   "  timeoutMs=<n>       abort bound (default 600000)",
   "  json=on             reply must be a JSON value; extracted and re-emitted compact",
@@ -134,6 +135,126 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
   };
 };
 
+/** One servable model: `agent models` prints it, `model=` pins it by `key`. */
+export interface HostModelInfo {
+  key: string;
+  context: number;
+  thinking: boolean;
+}
+
+/** Read-only view of the host model registry; seams for tests. */
+export interface ModelRegistryView {
+  model: (provider: string, modelId: string) => unknown;
+  list: () => HostModelInfo[];
+}
+
+let registryCache: Promise<ModelRegistryView> | undefined;
+
+/**
+ * The running host's model registry. `ModelRuntime.create()` is the same
+ * canonical runtime `createAgentSession` builds by default (agentDir
+ * models.json + auth.json), so user-configured providers — deepseek/* and
+ * friends — resolve here while the static pi-ai catalog misses them.
+ * models.json composition happens in the constructor; `refreshOnCreate:
+ * false` only skips the local catalog/availability refresh pass.
+ */
+export const hostModelRegistry = (): Promise<ModelRegistryView> => {
+  if (registryCache !== undefined) return registryCache;
+  registryCache = (async (): Promise<ModelRegistryView> => {
+    try {
+      const { loadHostSdk } = await import("../core/host-sdk.js");
+      const sdk = await loadHostSdk();
+      const runtime = await sdk.ModelRuntime.create({ refreshOnCreate: false });
+      return {
+        model: (provider: string, modelId: string): unknown => runtime.getModel(provider, modelId),
+        list: (): HostModelInfo[] =>
+          runtime
+            .getModels()
+            .map((model) => ({
+              key: `${model.provider}/${model.id}`,
+              context: model.contextWindow,
+              thinking: model.reasoning,
+            }))
+            .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0)),
+      };
+    } catch (error) {
+      registryCache = undefined; // a later command may retry; the host may come up
+      throw error;
+    }
+  })();
+  return registryCache;
+};
+
+/** Default `agent models` lister: the host's own runtime registry. */
+export const listHostModels = async (): Promise<HostModelInfo[]> => (await hostModelRegistry()).list();
+
+/** `agent models` payload lines: `key  context=NNN  thinking=yes|no`. */
+export const formatModelLines = (models: readonly HostModelInfo[]): string[] =>
+  models.map((model) => `${model.key}  context=${model.context}  thinking=${model.thinking ? "yes" : "no"}`);
+
+const editDistance = (a: string, b: string): number => {
+  const row: number[] = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = row[0]!;
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = row[j]!;
+      row[j] = Math.min(above + 1, row[j - 1]! + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return row[b.length]!;
+};
+
+/** The `count` registry keys closest to a missed pin, nearest first. */
+export const nearestKeys = (pin: string, keys: readonly string[], count = 8): string[] =>
+  keys
+    .map((key) => ({ key, distance: editDistance(pin.toLowerCase(), key.toLowerCase()) }))
+    .sort((a, b) => a.distance - b.distance || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
+    .slice(0, count)
+    .map((entry) => entry.key);
+
+/** Injection seam over the two catalogs `model=` resolves through. */
+export interface ModelPinLookup {
+  /** Static builtin catalog read (@earendil-works/pi-ai/compat getModel). */
+  staticModel: (provider: string, modelId: string) => Promise<unknown>;
+  /** The host runtime registry, built lazily so plain runs never touch it. */
+  runtime: () => Promise<ModelRegistryView>;
+}
+
+const defaultModelPinLookup: ModelPinLookup = {
+  staticModel: async (provider, modelId) => {
+    const { getModel } = await import("@earendil-works/pi-ai/compat");
+    // Static catalog read: provider names are a typed union, our input is a
+    // runtime string — narrow through an untyped view of the same function.
+    return (getModel as unknown as (p: string, id: string) => unknown)(provider, modelId);
+  },
+  runtime: hostModelRegistry,
+};
+
+/**
+ * Resolve a `provider/id` pin: static catalog first (cheap, typed), then the
+ * host runtime registry (user models.json, extension providers, virtual
+ * models). The error lists the 8 nearest servable keys — on a 900-key
+ * catalog a bare "unknown model" gives nothing to correct with.
+ */
+export const resolveModelPin = async (pin: string, lookup: ModelPinLookup = defaultModelPinLookup): Promise<unknown> => {
+  const separator = pin.indexOf("/");
+  if (separator <= 0 || separator === pin.length - 1) {
+    throw new Error(`model must be provider/id, got: ${pin}`);
+  }
+  const provider = pin.slice(0, separator);
+  const modelId = pin.slice(separator + 1);
+  const staticHit = await lookup.staticModel(provider, modelId);
+  if (staticHit !== undefined && staticHit !== null) return staticHit;
+  const registry = await lookup.runtime();
+  const runtimeHit = registry.model(provider, modelId);
+  if (runtimeHit !== undefined && runtimeHit !== null) return runtimeHit;
+  const nearest = nearestKeys(pin, registry.list().map((model) => model.key));
+  const hint = nearest.length > 0 ? ` — nearest keys: ${nearest.join(", ")}` : " (model registry is empty)";
+  throw new Error(`unknown model: ${pin}${hint}`);
+};
+
 /** The session surface the worker paths drive; the SDK session fits structurally. */
 export interface WorkerSession {
   prompt(text: string): Promise<void>;
@@ -167,18 +288,7 @@ export const createWorkerSession = async (args: {
     reload: async () => undefined,
   };
   let model: unknown;
-  if (args.model !== undefined) {
-    const separator = args.model.indexOf("/");
-    if (separator <= 0 || separator === args.model.length - 1) {
-      throw new Error(`model must be provider/id, got: ${args.model}`);
-    }
-    const { getModel } = await import("@earendil-works/pi-ai/compat");
-    // Static catalog read: provider names are a typed union, our input is a
-    // runtime string — narrow through an untyped view of the same function.
-    const lookup = getModel as unknown as (provider: string, modelId: string) => unknown;
-    model = lookup(args.model.slice(0, separator), args.model.slice(separator + 1));
-    if (model === undefined || model === null) throw new Error(`unknown model: ${args.model}`);
-  }
+  if (args.model !== undefined) model = await resolveModelPin(args.model);
   const { session } = await sdk.createAgentSession({
     cwd,
     ...(model === undefined ? {} : { model: model as never }),

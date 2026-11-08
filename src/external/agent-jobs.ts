@@ -2,9 +2,12 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import {
   createWorkerSession,
+  formatModelLines,
+  listHostModels,
   parseAgentArgv,
   workerResultLines,
   type AgentCommandArgs,
+  type HostModelInfo,
   type WorkerSession,
 } from "./agent.js";
 import type { ExternalCommandHandler } from "./bridge.js";
@@ -27,6 +30,7 @@ export const AGENT_JOBS_HELP = [
   "  agent steer <id> textFile=<path>       inject after the current turn",
   "  agent follow <id> textFile=<path>      queue after the whole run",
   "  agent list                             one line per job",
+  "  agent models                           one line per servable model",
 ].join("\n");
 
 type JobState = "running" | "done" | "failed" | "stopped";
@@ -271,10 +275,16 @@ const jobIdArg = (argv: string[], command: string): string => {
 };
 
 /** Bridge command: `agent <subcommand>` job forms; anything else falls through. */
-export const createAgentJobsCommand = (jobs: AgentJobs): ExternalCommandHandler => {
+export const createAgentJobsCommand = (
+  jobs: AgentJobs,
+  /** Model lister for `agent models`; defaults to the host runtime registry. */
+  listModels: () => Promise<readonly HostModelInfo[]> = listHostModels,
+): ExternalCommandHandler => {
   return async (argv: string[]) => {
     if (argv[0] !== "agent") return undefined;
     switch (argv[1]) {
+      case "models":
+        return { ok: true, lines: formatModelLines(await listModels()) };
       case "submit": {
         const id = jobs.submit(parseAgentArgv(argv.slice(2)));
         return { ok: true, lines: [`id=${id}`] };

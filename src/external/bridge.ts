@@ -67,7 +67,7 @@ const helpLines = (hasCommands: boolean): string[] => [
   ...(hasCommands
     ? [
         "  agent           worker: promptFile=… blocks; submit/status/wait/",
-        "                  result/stop/steer/follow/list run it detached",
+        "                  result/stop/steer/follow/list/models run it detached",
         "  recall          search session memory (query=<terms> …)",
         "  vcc             session file views: summary/branch/entries/entry",
       ]
