@@ -252,6 +252,13 @@ export class FabricState {
       process.env.PI_FABRIC_CAPABILITY_REQUIREMENTS !== undefined &&
       Boolean(process.env.PI_FABRIC_CAPABILITY_DIGEST)
     ) return true;
+    // The external surface exists to run the engine behind somebody else's
+    // tool: mesh heartbeat, participant labels, and peer presence notices
+    // ARE the product there, not a side effect. Without this the runtime
+    // never initializes (no prewalk, no actors to find) and peers go dark.
+    if (this.config.surface === "external") {
+      return context.isProjectTrusted() && this.config.mesh.enabled;
+    }
     if (this.config.prewalk.alwaysRearm) return true;
     if (this.config.components.some((component) => component.disabled !== true)) return true;
     if (!context.isProjectTrusted() || !this.config.mesh.enabled || this.config.schema.mode === "enforce") {

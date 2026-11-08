@@ -70,6 +70,7 @@ const helpLines = (hasCommands: boolean): string[] => [
         "                  result/stop/steer/follow/list/models run it detached",
         "  recall          search session memory (query=<terms> …)",
         "  vcc             session file views: summary/branch/entries/entry",
+        "  peers           parallel sessions in this project (label, status)",
       ]
     : []),
   "  help            this list",
