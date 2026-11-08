@@ -144,6 +144,23 @@ describe("AgentJobs state machine", () => {
     expect(jobs.status(id).some((line) => line.includes("spawn failed"))).toBe(true);
   });
 
+  it("completion inbox: one settlement per terminal job, none on close", async () => {
+    const settlements: import("../src/external/agent-jobs.js").JobSettlement[] = [];
+    const fake = fakeSession();
+    const jobs = new AgentJobs(async () => fake.session, 64, (settlement) => settlements.push(settlement));
+    const id = jobs.submit(args({ name: "inbox" }));
+    await settled();
+    fake.controller.resolvePrompt([{ role: "assistant", content: [{ type: "text", text: "ok" }] }]);
+    await jobs.wait(id);
+    const failed = jobs.submit(args());
+    await settled();
+    fake.controller.rejectPrompt(new Error("boom"));
+    await jobs.wait(failed);
+    jobs.close();
+    expect(settlements.map((entry) => `${entry.name}:${entry.state}`)).toEqual(["inbox:done", `${failed.slice(0, 8)}:failed`]);
+    expect(settlements[1]?.error).toContain("boom");
+  });
+
   it("the job cap bounds concurrent running jobs", () => {
     const second = new AgentJobs(async () => fakeSession().session, 1);
     const first = second.submit(args());
