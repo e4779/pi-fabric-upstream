@@ -1136,6 +1136,10 @@ export class FabricRuntimeState {
       agents.subscribeUi(() => { if (agents.activity().length > 0) this.#wantLabel(); }),
     ];
     this.#labelUseStop = () => { for (const stop of labelUse.splice(0)) stop?.(); };
+    // The external surface's product is presence itself: a session that will
+    // never run fabric_exec still mints its label at once, or peers see an
+    // anonymous "Peer <id>" and the operator's input indicator stays empty.
+    if (this.#config.surface === "external") this.#wantLabel();
     // Herdr reports this pane idle when the root turn ends; tell it about the
     // agents still running. Only a root shows them, and the presenter loads on
     // the first run so sessions outside Herdr never pay for it.
