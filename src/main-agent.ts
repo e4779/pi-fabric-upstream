@@ -182,6 +182,14 @@ export class MainAgentController implements FabricMainAgentTarget {
     const message = request.message.trim();
     if (!message) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();
+    // The reply channel must be obvious at the receiving end: a peer label is
+    // peer-controlled data, so strip it to identifier characters before it
+    // becomes part of a suggested command line.
+    const replyLabel = (request.from.name || "").replace(/[^A-Za-z0-9._-]/g, "").slice(0, 32);
+    const replyHint =
+      replyLabel === ""
+        ? undefined
+        : `Reply to this peer: fab peer steer ${replyLabel} textFile=<path> (external bridge command; fab lives in PATH or ~/projects/pi-fabric/bin/fab).`;
     const data = request.data === undefined ? undefined : serializableFeedbackData(request.data);
     // Wake semantics match background-task wakes: an idle recipient starts a
     // run at once, and a recipient with an in-flight turn never has that work
@@ -198,6 +206,7 @@ export class MainAgentController implements FabricMainAgentTarget {
         content: [
           `<fabric-agent-message from_name=${JSON.stringify(escapeXmlText(request.from.name))} from_id=${JSON.stringify(escapeXmlText(request.from.id))} from_kind=${JSON.stringify(escapeXmlText(request.from.kind))}>`,
           escapeXmlText(message),
+          replyHint,
           data === undefined ? undefined : `<data>${escapeXmlText(JSON.stringify(data))}</data>`,
           "</fabric-agent-message>",
         ]
