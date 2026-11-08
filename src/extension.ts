@@ -8,6 +8,8 @@ import {
 import { createAgentCommand } from "./external/agent.js";
 import { AgentJobs, createAgentJobsCommand } from "./external/agent-jobs.js";
 import { createRecallCommand } from "./external/recall.js";
+import { readFileSync } from "node:fs";
+import { createVccCommand, parseVccSession, type VccLiveSource } from "./external/vcc.js";
 import type { MemoryProviderContext } from "./memory/request-context.js";
 import type {
   ExtensionAPI,
@@ -592,7 +594,17 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       // seen live: box/llm without shell survived every resume.
       Object.assign(fabricTool, { exposure: "hidden" as const });
       pi.registerTool(fabricTool);
-      externalBridge ??= startExternalBridge({
+        const vccSource = (): VccLiveSource | undefined => {
+          const context = externalRecallContext;
+          const file = context?.sessionManager?.getSessionFile?.();
+          if (file === undefined) return undefined;
+          return {
+            file: () => file,
+            entries: () => parseVccSession(readFileSync(file, "utf8")).entries,
+            leafId: () => context?.sessionManager.getLeafId() ?? null,
+          };
+        };
+        externalBridge ??= startExternalBridge({
         version: FABRIC_MANAGED_HOST_VERSION,
         stateView: () => ({ bootstrapped: state.bootstrapped, surface: state.config.surface }),
         socketDir: state.config.external.socketDir,
@@ -600,6 +612,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           createAgentJobsCommand(externalAgentJobs),
           createAgentCommand(),
           createRecallCommand(externalMemoryContext),
+          createVccCommand(vccSource),
         ),
       });
       return;
