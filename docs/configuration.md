@@ -253,6 +253,9 @@ where absent values do not participate, and time spent inside a `humanWaitRefs` 
   },
   "trace": {
     "assessment": false
+  },
+  "sessions": {
+    "ownerLock": false
   }
 }
 ```
@@ -692,6 +695,25 @@ Fabric attributes each file through a `session_info` marker (`fabricagent-<name>
 `agents.transport` accepts `process` (default), `auto`, `tmux`, `screen`, `localterm`, `herdr`, and `herdr-core`; per-call `transport` uses the same values. Herdr Core requires the existing parent terminal’s `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` plus a reachable generation-1 service. It never starts a server. `auto` tries Core before legacy Herdr and falls back when unavailable.
 
 See [agents, actors & mesh](agents.md) for the runner and transport details.
+
+## Session ownership (opt-in)
+
+Pi's `SessionManager` has no locking: two processes can open one session file, and the second open is silent. An unfinished automation then runs in a window the operator believes is idle, and both processes write the same file. `sessions.ownerLock` (default `false`) adds a cross-process single-writer guard beside the file:
+
+```json
+{ "sessions": { "ownerLock": true } }
+```
+
+- A sidecar registry at `${XDG_RUNTIME_DIR:-tmpdir}/pi-fabric/session-owners/` (or `PI_FABRIC_SESSION_OWNERS_DIR`) records one `pid`/`session`/`ts` claim per writer, keyed by the SHA-256 of the session file's absolute path (basenames collide across directories).
+- A clean open claims the sidecar atomically. A **live** foreign owner (`process.kill(pid, 0)` proves the pid exists) refuses the open with every recorded owner dumped into the error; `PI_FABRIC_ALLOW_LIVE_SESSION=1` (or a `force` option in the API) registers the caller as a visible second writer instead. A **stale** claim (dead pid, e.g. after a crash) is taken over behind an exclusive claim barrier, so two takers cannot both win.
+- Release removes only the caller's own record; a forced duplicate never erases the original owner's registration. A sweep prunes sidecars whose pids are all dead once they are older than 24 h.
+
+What the guard covers with the flag on:
+
+- The host extension claims the interactive session file at `session_start` (release on `session_shutdown`) and vetoes in-session switches to a file a live writer owns, through the sanctioned `session_before_switch` `cancel`. A live owner detected at startup warns on stderr and shuts the session down gracefully; extensions never `process.exit`.
+- `pi-durable` workers claim the session file they are about to open and release it at runtime dispose. A conflict fails the run with the owner dump; a worker crash leaves a stale claim that the next open takes over.
+
+Limits (host gaps, by design of this opt-in): the host fires `session_start` after the boot open, so a second window that resumes a live session at the CLI is refused loudly (stderr plus graceful shutdown), with no pre-open prompt available. In print/json modes, where Pi binds no shutdown handler, the warning is printed and the run proceeds unlocked. Sessions the host runtime opens later (`/new`, `/fork`, `/resume` inside a worker) and extension-less processes sit outside the guard. A registry that cannot be created fails **open** with a warning (a broken lock must not kill every session); a detected live owner always fails **closed**.
 
 ## MCP
 

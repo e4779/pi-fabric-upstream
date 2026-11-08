@@ -474,6 +474,11 @@ export interface FabricThinkingConfig {
   bounds: FabricThinkingBounds;
 }
 
+export interface FabricSessionsConfig {
+  /** Opt-in single-writer guard for session files (cross-process owner registry). */
+  ownerLock: boolean;
+}
+
 export interface FabricConfig {
   fullCodeMode: boolean;
   executor: FabricExecutorConfig;
@@ -498,6 +503,7 @@ export interface FabricConfig {
   schema: FabricSchemaConfig;
   speculation: FabricSpeculationConfig;
   thinking: FabricThinkingConfig;
+  sessions: FabricSessionsConfig;
   codePreview: CodePreviewSettings;
 }
 
@@ -714,6 +720,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     mcpAllowlist: [],
   },
   thinking: { bounds: {} },
+  sessions: { ownerLock: false },
   foreground: { tools: [], maxTools: 4 },
   codePreview: defaultCodePreviewSettings(),
 };
@@ -1000,6 +1007,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
   const schema = objectValue(input.schema);
   const schemaMode = schemaModeValue(schema.mode, DEFAULT_FABRIC_CONFIG.schema.mode);
   const speculation = objectValue(input.speculation);
+  const sessions = objectValue(input.sessions);
   const configuredExecutorRuntime = executorRuntimeValue(
     executor.runtime,
     DEFAULT_FABRIC_CONFIG.executor.runtime,
@@ -1699,6 +1707,11 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
       // Bounds are a ceiling policy: malformed values fail closed.
       bounds: normalizeThinkingBounds(objectValue(input.thinking).bounds, "thinking.bounds"),
     },
+    sessions: {
+      // Off by default: the guard changes what a second open of a live
+      // session file does, so it ships as a documented opt-in.
+      ownerLock: booleanValue(sessions.ownerLock, DEFAULT_FABRIC_CONFIG.sessions.ownerLock),
+    },
     // Malformed entries fail config loading; semantic refusals report at runtime.
     foreground: foregroundConfigValue(input.foreground),
     codePreview: normalizeCodePreviewSettings(input.codePreview),
@@ -1895,6 +1908,16 @@ export const loadFabricConfig = (options: {
     process.env.PI_FABRIC_COMPACTION_ENGINE = "fabric";
   } else {
     delete process.env.PI_FABRIC_COMPACTION_ENGINE;
+  }
+  // Children inherit the session-ownership guard through the environment
+  // (durable worker hosts read it in claimWorkerSessionOwnerLock). The name is
+  // the contract exported as SESSION_OWNER_LOCK_ENV from
+  // ./core/session-owner-lock.js; the literal keeps that module out of the
+  // eager startup graph (it loads lazily behind the opt-in).
+  if (config.sessions.ownerLock) {
+    process.env.PI_FABRIC_SESSION_OWNER_LOCK = "1";
+  } else {
+    delete process.env.PI_FABRIC_SESSION_OWNER_LOCK;
   }
   return config;
 };

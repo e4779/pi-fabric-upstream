@@ -1138,6 +1138,67 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     invalidateExtractive(true);
     unsubscribeExtractiveConfig();
   });
+  // Opt-in (sessions.ownerLock): register this process as the session file's
+  // single writer, and veto in-session switches to a file a live writer owns
+  // (the sanctioned { cancel: true } on session_before_switch). The host has
+  // no boot-time veto (session_start fires after the open but before the
+  // first write), so a live foreign owner detected at startup warns on stderr
+  // and shuts down gracefully — never process.exit from an extension. The
+  // lock module loads lazily: with the default (off) the startup graph never
+  // pays for it (same opt-in boundary as the extractive module above).
+  let ownerLockSessionFile: string | undefined;
+  const ownerLockEnabled = (): boolean =>
+    state.bootstrapped && state.config.sessions.ownerLock;
+  pi.on("session_start", async (_event, context) => {
+    if (!ownerLockEnabled()) return;
+    const lock = await import("./core/session-owner-lock.js");
+    if (ownerLockSessionFile) {
+      // Defensive: a start without a shutdown (reload edge) must not leak the
+      // previous claim.
+      lock.releaseSessionOwnerLock({ sessionFile: ownerLockSessionFile });
+      ownerLockSessionFile = undefined;
+    }
+    const sessionFile = context.sessionManager?.getSessionFile?.();
+    if (!sessionFile) return;
+    const sessionId = context.sessionManager.getSessionId?.();
+    try {
+      lock.acquireSessionOwnerLock({
+        sessionFile,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        force: process.env[lock.SESSION_OWNER_FORCE_ENV] === "1",
+      });
+      ownerLockSessionFile = sessionFile;
+    } catch (error) {
+      if (error instanceof lock.SessionOwnerConflictError) {
+        console.error(`[pi-fabric] ${error.message}`);
+        if (context.hasUI) context.ui.notify(error.message, "error");
+        context.shutdown();
+        return;
+      }
+      console.warn(`[pi-fabric] session owner lock unavailable (${error instanceof Error ? error.message : String(error)}) — continuing WITHOUT single-writer protection`);
+    }
+  });
+  pi.on("session_shutdown", async () => {
+    if (!ownerLockSessionFile) return;
+    const sessionFile = ownerLockSessionFile;
+    ownerLockSessionFile = undefined;
+    const lock = await import("./core/session-owner-lock.js");
+    lock.releaseSessionOwnerLock({ sessionFile });
+    lock.sweepSessionOwnerRegistry();
+  });
+  pi.on("session_before_switch", async (event) => {
+    if (!ownerLockEnabled() || !event.targetSessionFile) return;
+    const lock = await import("./core/session-owner-lock.js");
+    const liveOwners = lock.readSessionOwners(event.targetSessionFile)
+      .filter((owner) => owner.alive && owner.pid !== process.pid);
+    if (liveOwners.length === 0) return;
+    const owner = liveOwners[0]!;
+    const message = `Session file ${event.targetSessionFile} is live in pid ${owner.pid}`
+      + `${owner.session !== undefined ? ` (session ${owner.session})` : ""}`
+      + ` — switch cancelled (${lock.SESSION_OWNER_FORCE_ENV}=1 to force)`;
+    console.error(`[pi-fabric] ${message}`);
+    return { cancel: true };
+  });
   pi.on("before_agent_start", async (event, context) => {
     if (!extractiveConfig()?.enabled) { invalidateExtractive(true); return; }
     // A custom message has no prompt to rank against, and the view anchors
