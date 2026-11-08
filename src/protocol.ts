@@ -18,6 +18,49 @@ export interface FabricBashMiddlewareV1 {
   wrapOperations: (operations: BashOperations) => BashOperations;
 }
 
+/** One linter finding, as emitted by shellcheck's JSON format (SC code + position). */
+export interface FabricShellLintFindingV1 {
+  code: number | string;
+  level: string;
+  line: number;
+  column: number;
+  message: string;
+}
+
+/** Pre-exec policy verdict; `gate()` returning null means the command may run. */
+export interface FabricExecutionPolicyBlockV1 {
+  version: 1;
+  /** Model-facing diagnostics: what failed and how to allow an intentional command. */
+  message: string;
+  /** Machine-readable findings when the block came from the linter. */
+  findings?: FabricShellLintFindingV1[];
+}
+
+/** The finished execution a post-policy observes; kernel-agnostic on purpose. */
+export interface FabricExecutionPolicyOutcomeV1 {
+  ok: boolean;
+  exitCode: number | null;
+  output: string;
+}
+
+export interface FabricExecutionPolicyPostResultV1 {
+  /** Visible pointers and hints; they ride after the output, never instead of it. */
+  notes: string[];
+  output: string;
+}
+
+/** Gate + context guard as policy middleware, applicable by ANY execution tool
+ * (Fabric's own pi.bash arm and external-surface tools alike): one pre-exec
+ * validation contract and one output-budget contract, so "everything executed
+ * passed the gate" can hold no matter which surface ran the command. */
+export interface FabricExecutionPolicyMiddlewareV1 {
+  version: 1;
+  /** Pre-exec gate. Fail-open: a broken check never blocks a command. */
+  gate(command: string): FabricExecutionPolicyBlockV1 | null;
+  /** Post-exec context guard: budget the output, point at the whole artifact. */
+  post(command: string, outcome: FabricExecutionPolicyOutcomeV1): FabricExecutionPolicyPostResultV1;
+}
+
 export type {
   FabricCacheHoldOptions, FabricCacheHoldResult, FabricCacheLease,
   FabricCacheSample, FabricCacheObservation, FabricCacheStatus,

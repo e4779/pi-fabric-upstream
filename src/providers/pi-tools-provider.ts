@@ -27,7 +27,9 @@ import {
   trackShellOperations,
 } from "../core/shell-jobs.js";
 import { parseShellMonitor, shellMonitorSchema } from "../core/shell-monitor.js";
+import { FabricShellPolicyMiddleware } from "../core/shell-policy-middleware.js";
 import { expandSkillDirMarkersForRead } from "../core/skill-dir.js";
+import type { FabricShellPolicyConfig } from "../config.js";
 import type {
   FabricActionDescriptor,
   FabricBashMiddlewareV1,
@@ -125,6 +127,10 @@ interface PiToolsProviderHostCapabilities {
   powerShellToolDefinitionFactory: ShellDefinitionFactory | undefined;
   getShellHangMs?: () => number;
   shellJobs?: FabricShellJobStore;
+  /** Gate + output-budget policy applied to Fabric-owned bash execution
+   * (executor.shellPolicy; one seam for nested fabric_exec calls and top-level
+   * shell calls alike — the contract any execution tool can adopt). */
+  shellPolicy?: FabricShellPolicyConfig;
 }
 
 const DEFAULT_HOST_CAPABILITIES: PiToolsProviderHostCapabilities = {
@@ -203,6 +209,20 @@ const textContent = (content: ToolContent): string =>
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
     .map((part) => part.text)
     .join("\n");
+
+// Pi reports ordinary exits through structuredContent.exit_code; a policy
+// observing the outcome wants the code, not the display text.
+const piBashExitCode = (result: {
+  isError?: boolean;
+  structuredContent?: unknown;
+}): number | null => {
+  const structured = result.structuredContent;
+  if (typeof structured === "object" && structured !== null && "exit_code" in structured) {
+    const code = (structured as { exit_code?: unknown }).exit_code;
+    if (typeof code === "number" && Number.isSafeInteger(code)) return code;
+  }
+  return result.isError === true ? null : 0;
+};
 
 const imageBlocks = (content: unknown): FabricMediaBlock[] => {
   if (!Array.isArray(content)) return [];
@@ -312,6 +332,7 @@ export class PiToolsProvider implements FabricProvider {
   readonly #ownsShellJobs: boolean;
   readonly #getShellHangMs: (() => number) | undefined;
   readonly #requireToolHooks: (() => boolean) | undefined;
+  readonly #shellPolicy: FabricShellPolicyMiddleware | undefined;
 
   constructor(
     cwd: string,
@@ -341,6 +362,9 @@ export class PiToolsProvider implements FabricProvider {
     this.#ownsShellJobs = hostCapabilities.shellJobs === undefined;
     this.#shellJobs = hostCapabilities.shellJobs ?? new FabricShellJobStore();
     this.#getShellHangMs = hostCapabilities.getShellHangMs;
+    this.#shellPolicy = hostCapabilities.shellPolicy === undefined
+      ? undefined
+      : new FabricShellPolicyMiddleware(hostCapabilities.shellPolicy);
   }
 
   get shellJobs(): FabricShellJobStore {
@@ -599,6 +623,20 @@ export class PiToolsProvider implements FabricProvider {
     const notify = parseDurableNotify(args.notify);
     if (notify && !durable) throw new Error("notify requires durable:true");
     const background = args.background === true || monitor !== undefined || durable;
+    // Policy gate before any job exists: a blocked command never spawns, never
+    // registers a task, and never reaches a log. Bash only — the checks are
+    // bash syntax + shellcheck; powershell keeps its own execution semantics.
+    // Fail-open by contract, so a broken check can never wedge execution.
+    const policyBlock = name === "bash" ? this.#shellPolicy?.gate(command) : undefined;
+    if (policyBlock) {
+      return {
+        content: [
+          { type: "text", text: `[blocked by shell-gate, command not run]\n${policyBlock.message}` },
+        ],
+        isError: true,
+        details: { policy: "shell-gate", blocked: true },
+      };
+    }
     const { background: _background, monitor: _monitor, description: _description, durable: _durable, notify: _notify, ...executeArgs } = args;
     const job = this.#shellJobs.begin(name, command, {
       ...(durable ? { durable: { home: this.#shellJobs.durable!.home } } : {}),
@@ -638,8 +676,9 @@ export class PiToolsProvider implements FabricProvider {
         ),
     });
     if (outcome.status === "done") {
-      await job.finish((outcome.value as PiToolResult & { isError?: boolean }).isError ? null : 0);
-      return outcome.value as PiToolResult;
+      const value = outcome.value as PiToolResult & { isError?: boolean };
+      await job.finish(value.isError ? null : 0);
+      return this.#applyShellPolicyPost(name, command, value);
     }
     if (outcome.status === "error") {
       await job.finish(null);
@@ -679,6 +718,29 @@ export class PiToolsProvider implements FabricProvider {
         ...(pid !== undefined ? { pid } : {}),
       },
     };
+  }
+
+  // Post-exec context guard (fail-open): a visible pointer to the whole
+  // artifact beats a rerun. Applies to the finished foreground result only —
+  // a spilled/background hand-off already carries its own live-output path.
+  #applyShellPolicyPost(name: PiCoreToolName, command: string, result: PiToolResult): PiToolResult {
+    const policy = this.#shellPolicy;
+    if (!policy || name !== "bash") return result;
+    const textParts = result.content.filter(
+      (part): part is { type: "text"; text: string } => part.type === "text",
+    );
+    if (textParts.length !== 1) return result;
+    const text = textParts[0]!.text;
+    const posted = policy.post(command, {
+      ok: result.isError !== true,
+      exitCode: piBashExitCode(result),
+      output: text,
+    });
+    if (posted.notes.length === 0 && posted.output === text) return result;
+    const content = result.content.map((part) =>
+      part.type === "text" ? { type: "text" as const, text: posted.notes.length > 0 ? `${posted.output}\n${posted.notes.join("\n")}` : posted.output } : part,
+    );
+    return { ...result, content };
   }
 
   async invoke(

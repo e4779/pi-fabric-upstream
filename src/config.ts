@@ -96,10 +96,26 @@ interface FabricExecutorConfig {
    * live output path while the process keeps running. `background: true`
    * detaches immediately. Explicit shell timeout remains a hard cap. */
   shellHangMs: number;
+  /** Execution policy middleware (gate + output budget) for Fabric-owned
+   * shell execution; see docs/configuration.md "executor.shellPolicy". */
+  shellPolicy: FabricShellPolicyConfig;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
   resultFormat: FabricResultFormat;
+}
+
+/** Per-session shell execution policy, applied by any execution surface that
+ * runs shell commands through Fabric (pi.bash today; external-surface tools
+ * can adopt the same `FabricExecutionPolicyMiddlewareV1` contract). */
+export interface FabricShellPolicyConfig {
+  /** Pre-exec gate: bash -n syntax check + shellcheck lint, fail-open, with a
+   * retry valve, a `# shellcheck disable=SCxxxx` escape, and the
+   * PI_FABRIC_SHELL_GATE=off kill switch. */
+  gate: boolean;
+  /** Post-exec output budget: offload past-budget output to a dump file with
+   * a visible pointer, a JSON shape hint, and the `# full` opt-out. */
+  outputBudget: boolean;
 }
 
 export interface FabricApprovalConfig {
@@ -524,6 +540,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     hostCallTimeouts: {},
     humanWaitRefs: ["extensions.ask", "decisions.wait"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
+    shellPolicy: { gate: true, outputBudget: true },
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -947,6 +964,7 @@ const memorySourcesValue = (value: unknown): FabricMemorySourceConfig[] | undefi
 
 export const normalizeFabricConfig = (input: Record<string, unknown>): FabricConfig => {
   const executor = objectValue(input.executor);
+  const shellPolicy = objectValue(executor.shellPolicy);
   const cpython = objectValue(executor.cpython);
   const jevFabric = objectValue(executor.jevFabric);
   const executorKernel = executorKernelValue(executor.kernel, DEFAULT_FABRIC_CONFIG.executor.kernel);
@@ -1132,6 +1150,13 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         0,
         Math.min(executorMaxTimeoutMs, SHELL_HANG_MAX_MS),
       ),
+      shellPolicy: {
+        gate: booleanValue(shellPolicy.gate, DEFAULT_FABRIC_CONFIG.executor.shellPolicy.gate),
+        outputBudget: booleanValue(
+          shellPolicy.outputBudget,
+          DEFAULT_FABRIC_CONFIG.executor.shellPolicy.outputBudget,
+        ),
+      },
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,
