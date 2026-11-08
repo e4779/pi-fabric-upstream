@@ -7,6 +7,7 @@ import {
   DEFAULT_AGENT_TIMEOUT_MS,
   finalAssistantText,
   parseAgentArgv,
+  workerResultLines,
 } from "../src/external/agent.js";
 import { composeCommands, startExternalBridge, type ExternalBridgeHandle } from "../src/external/bridge.js";
 import { createRecallCommand } from "../src/external/recall.js";
@@ -75,6 +76,115 @@ describe("final assistant text extraction", () => {
   it("returns null without an assistant message", () => {
     expect(finalAssistantText([{ role: "user", content: [] }])).toBeNull();
     expect(finalAssistantText([])).toBeNull();
+  });
+});
+
+describe("external agent schemaFile and maxTokens arguments", () => {
+  const promptFile = (): string => {
+    const directory = temporaryDirectory("prompt");
+    const file = path.join(directory, "prompt.txt");
+    fs.writeFileSync(file, "count to three");
+    return file;
+  };
+  const schemaFile = (contents: string): string => {
+    const directory = temporaryDirectory("schema");
+    const file = path.join(directory, "schema.json");
+    fs.writeFileSync(file, contents);
+    return file;
+  };
+  const tinySchema = {
+    type: "object",
+    properties: { count: { type: "number" } },
+    required: ["count"],
+    additionalProperties: false,
+  };
+
+  it("parses a valid schemaFile into args.schema alongside json=on", () => {
+    const args = parseAgentArgv([
+      `promptFile=${promptFile()}`,
+      "json=on",
+      `schemaFile=${schemaFile(JSON.stringify(tinySchema))}`,
+    ]);
+    expect(args.json).toBe(true);
+    expect(args.schema).toEqual(tinySchema);
+  });
+
+  it("schemaFile requires json=on", () => {
+    expect(() => parseAgentArgv([`promptFile=${promptFile()}`, `schemaFile=${schemaFile("{}")}`])).toThrow(
+      /schemaFile requires json=on/,
+    );
+  });
+
+  it("missing schema file errors like a missing promptFile", () => {
+    expect(() =>
+      parseAgentArgv([`promptFile=${promptFile()}`, "json=on", "schemaFile=/nonexistent/schema.json"]),
+    ).toThrow(/cannot read schemaFile/);
+  });
+
+  it("non-JSON schema file errors with the parse problem", () => {
+    expect(() =>
+      parseAgentArgv([`promptFile=${promptFile()}`, "json=on", `schemaFile=${schemaFile("{not json")}`]),
+    ).toThrow(/schemaFile is not JSON/);
+  });
+
+  it("JSON values that are not objects are not schemas", () => {
+    expect(() =>
+      parseAgentArgv([`promptFile=${promptFile()}`, "json=on", `schemaFile=${schemaFile("[1,2]")}`]),
+    ).toThrow(/schemaFile must contain a JSON object/);
+  });
+
+  it("maxTokens must be a positive integer", () => {
+    expect(() => parseAgentArgv([`promptFile=${promptFile()}`, "maxTokens=soon"])).toThrow(
+      /maxTokens must be a positive integer/,
+    );
+    expect(() => parseAgentArgv([`promptFile=${promptFile()}`, "maxTokens=0"])).toThrow(
+      /maxTokens must be a positive integer/,
+    );
+    expect(() => parseAgentArgv([`promptFile=${promptFile()}`, "maxTokens=1.5"])).toThrow(
+      /maxTokens must be a positive integer/,
+    );
+  });
+
+  it("a well-formed maxTokens is still rejected: the SDK exposes no per-session knob", () => {
+    expect(() => parseAgentArgv([`promptFile=${promptFile()}`, "maxTokens=512"])).toThrow(
+      /maxTokens unsupported by SDK/,
+    );
+  });
+});
+
+describe("worker result lines with a schema", () => {
+  const assistant = (text: string): readonly unknown[] => [
+    { role: "assistant", content: [{ type: "text", text }] },
+  ];
+  const tinySchema = {
+    type: "object",
+    properties: { count: { type: "number" } },
+    required: ["count"],
+    additionalProperties: false,
+  };
+
+  it("throws with the validator's message head when the reply violates the schema", async () => {
+    const error = await workerResultLines(true, assistant('{"count":"two"}'), tinySchema).catch(
+      (caught: unknown) => caught,
+    );
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toMatch(/^reply does not match schema \(must be number\): \{"count":"two"\}$/);
+  });
+
+  it("returns a compact line when the reply satisfies the schema", async () => {
+    await expect(workerResultLines(true, assistant('done. {"count":2}'), tinySchema)).resolves.toEqual([
+      '{"count":2}',
+    ]);
+  });
+
+  it("json=on without a schema keeps the old lenient behavior", async () => {
+    await expect(workerResultLines(true, assistant('{"count":"two"}'))).resolves.toEqual(['{"count":"two"}']);
+  });
+
+  it("a reply that is not JSON at all still fails as before", async () => {
+    await expect(workerResultLines(true, assistant("plain prose, no payload"), tinySchema)).rejects.toThrow(
+      /^reply is not JSON \(/,
+    );
   });
 });
 
