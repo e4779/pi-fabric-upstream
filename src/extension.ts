@@ -635,6 +635,20 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           createAgentCommand(),
           createRecallCommand(externalMemoryContext),
           createVccCommand(vccSource),
+          async (argv) =>
+            argv[0] === "peers"
+              ? {
+                  ok: true,
+                  lines:
+                    state.peerInfos().length === 0
+                      ? ["(no peers)"]
+                      : state.peerInfos().map(
+                          (peer) =>
+                            `${peer.label ?? peer.name} ${peer.status}${peer.model ? ` model=${peer.model}` : ""}` +
+                            `${peer.pendingMessages ? " pending" : ""} id=${peer.id.slice(0, 8)}`,
+                        ),
+                }
+              : undefined,
         ),
       });
       return;
