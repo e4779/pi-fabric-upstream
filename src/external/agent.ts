@@ -17,6 +17,7 @@ export const AGENT_ARGV_HELP = [
   "  tools=a,b,c         tool names; empty line pair (tools=) means none",
   "  cwd=<path>          working directory (default: host cwd)",
   "  model=<provider/id> override the configured default model",
+  "  thinking=<level>    off|minimal|low|medium|high|xhigh|max (default: medium)",
   "  timeoutMs=<n>       abort bound (default 600000)",
   "  json=on             reply must be a JSON value; extracted and re-emitted compact",
   "  name=<label>        job label for lists (job form only)",
@@ -36,6 +37,7 @@ export interface AgentCommandArgs {
   tools: string[];
   cwd?: string;
   model?: string;
+  thinking?: string;
   timeoutMs: number;
   json: boolean;
   name?: string;
@@ -50,8 +52,16 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
     }
     const key = line.slice(0, separator);
     const value = line.slice(separator + 1);
-    if (!["promptFile", "tools", "cwd", "model", "timeoutMs", "json", "name"].includes(key)) {
+    if (
+      !["promptFile", "tools", "cwd", "model", "thinking", "timeoutMs", "json", "name"].includes(key)
+    ) {
       throw new Error(`unknown agent argument: ${key}\n${AGENT_ARGV_HELP}`);
+    }
+    if (
+      key === "thinking" &&
+      !["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(value)
+    ) {
+      throw new Error(`thinking must be one of off|minimal|low|medium|high|xhigh|max, got: ${value}`);
     }
     raw[key] = value;
   }
@@ -74,6 +84,7 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
     tools: raw.tools === undefined ? [] : raw.tools.split(",").map(t => t.trim()).filter(Boolean),
     ...(raw.cwd ? { cwd: raw.cwd } : {}),
     ...(raw.model ? { model: raw.model } : {}),
+    ...(raw.thinking ? { thinking: raw.thinking } : {}),
     timeoutMs: timeoutRaw ?? DEFAULT_AGENT_TIMEOUT_MS,
     json: raw.json === "on",
     ...(raw.name ? { name: raw.name } : {}),
@@ -93,6 +104,7 @@ export interface WorkerSession {
 export const createWorkerSession = async (args: {
   cwd?: string;
   model?: string;
+  thinking?: string;
   tools: string[];
 }): Promise<WorkerSession> => {
   const { loadHostSdk } = await import("../core/host-sdk.js");
@@ -127,6 +139,7 @@ export const createWorkerSession = async (args: {
   const { session } = await sdk.createAgentSession({
     cwd,
     ...(model === undefined ? {} : { model: model as never }),
+    ...(args.thinking === undefined ? {} : { thinkingLevel: args.thinking as never }),
     tools: args.tools,
     resourceLoader,
     sessionManager: sdk.SessionManager.inMemory(cwd),
