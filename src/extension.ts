@@ -669,6 +669,33 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // (full results stay behind `agent result <id>` - the wake is a pointer,
   // never the payload).
   const AGENT_JOB_EVENT_TYPE = "pi-fabric-agent-job-event";
+  const JOBS_STATUS_KEY = "pi-fabric-jobs";
+  let jobsFooter: (() => void) | undefined;
+  const refreshJobsFooter = (): void => {
+    jobsFooter?.();
+  };
+  const drawJobsFooter = (): void => {
+    const running = externalAgentJobs
+      .list()
+      .filter((line) => line.includes(" running "))
+      .map((line) => (line.split(" name=")[1] ?? "").split(" ")[0])
+      .filter((name) => name !== "");
+    const context = externalRecallContext;
+    if (running.length === 0) {
+      try {
+        context?.ui?.setStatus?.(JOBS_STATUS_KEY, undefined);
+      } catch {
+        /* UI optional */
+      }
+      return;
+    }
+    const names = running.slice(0, 3).join(",") + (running.length > 3 ? ` +${running.length - 3}` : "");
+    try {
+      context?.ui?.setStatus?.(JOBS_STATUS_KEY, `workers: ${running.length} (${names})`);
+    } catch {
+      /* UI optional */
+    }
+  };
   const externalAgentJobs = new AgentJobs(
     undefined,
     undefined,
@@ -687,7 +714,9 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
         /* session gone: `agent list` still serves from the registry */
       }
     },
+    refreshJobsFooter,
   );
+  jobsFooter = drawJobsFooter;
 
   // The bridge outlives session switches, so recall reads through the latest
   // activation context instead of a captured one: cwd/sessionId move with it.
