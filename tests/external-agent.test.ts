@@ -6,9 +6,15 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_AGENT_TIMEOUT_MS,
   finalAssistantText,
+  formatModelLines,
+  nearestKeys,
   parseAgentArgv,
   workerResultLines,
+  resolveModelPin,
+  type HostModelInfo,
+  type ModelPinLookup,
 } from "../src/external/agent.js";
+import { createAgentJobsCommand, AgentJobs } from "../src/external/agent-jobs.js";
 import { composeCommands, startExternalBridge, type ExternalBridgeHandle } from "../src/external/bridge.js";
 import { createRecallCommand } from "../src/external/recall.js";
 import { createAgentCommand } from "../src/external/agent.js";
@@ -286,6 +292,150 @@ describe("external bridge agent command", () => {
     expect(bad.status).toContain("promptFile");
     const good = await speak(["ping"]);
     expect(good.status).toBe("OK");
+  });
+});
+
+describe("agent models registry command", () => {
+  const fakeModels: HostModelInfo[] = [
+    { key: "anthropic/claude-opus-4-5", context: 200000, thinking: true },
+    { key: "deepseek/deepseek-chat", context: 65536, thinking: false },
+    { key: "openai/gpt-5.1", context: 400000, thinking: true },
+  ];
+  const fakeLister = async (): Promise<readonly HostModelInfo[]> => fakeModels;
+
+  it("prints one `key  context=NNN  thinking=yes|no` line per model", async () => {
+    const jobs = new AgentJobs(async () => {
+      throw new Error("models must not spawn a worker");
+    });
+    const reply = await createAgentJobsCommand(jobs, fakeLister)(["agent", "models"]);
+    expect(reply?.ok).toBe(true);
+    expect(reply?.lines).toEqual([
+      "anthropic/claude-opus-4-5  context=200000  thinking=yes",
+      "deepseek/deepseek-chat  context=65536  thinking=no",
+      "openai/gpt-5.1  context=400000  thinking=yes",
+    ]);
+    for (const line of reply!.lines) expect(line).toMatch(/^\S+\/\S+  context=\d+  thinking=(?:yes|no)$/);
+  });
+
+  it("formatModelLines matches the pin syntax --model parses", () => {
+    const lines = formatModelLines([{ key: "deepseek/deepseek-reasoner", context: 128000, thinking: true }]);
+    expect(lines).toEqual(["deepseek/deepseek-reasoner  context=128000  thinking=yes"]);
+  });
+
+  it("is claimed by the jobs command before the blocking form over the bridge", async () => {
+    const bridge = startExternalBridge({
+      version: 2,
+      stateView: () => ({ bootstrapped: true, surface: "external" }),
+      socketDir: temporaryDirectory("sock"),
+      commands: composeCommands(
+        createAgentJobsCommand(new AgentJobs(), fakeLister),
+        createAgentCommand(async () => {
+          throw new Error("blocking form must not claim agent models");
+        }),
+      ),
+    });
+    const reply = await new Promise<{ status: string; lines: string[] }>((resolve, reject) => {
+      const socket = net.createConnection(bridge.socketPath);
+      socket.setEncoding("utf8");
+      let buffer = "";
+      socket.on("error", reject);
+      socket.on("connect", () => {
+        socket.write("agent\nmodels\n");
+        socket.end();
+      });
+      socket.on("data", (chunk: string) => {
+        buffer += chunk;
+      });
+      socket.on("close", () => {
+        const parts = buffer.replace(/\n$/, "").split("\n");
+        const status = parts.shift() ?? "";
+        resolve({ status, lines: parts });
+      });
+    });
+    bridge.close();
+    expect(reply.status).toBe("OK");
+    expect(reply.lines).toEqual(formatModelLines(fakeModels));
+  });
+});
+
+describe("model pin resolution", () => {
+  const staticMiss = async (): Promise<unknown> => undefined;
+  const registryWith =
+    (models: readonly HostModelInfo[]): ModelPinLookup["runtime"] =>
+    async () => ({
+      model: (provider: string, modelId: string): unknown => {
+        const hit = models.find((model) => model.key === `${provider}/${modelId}`);
+        return hit === undefined ? undefined : { provider, id: modelId, source: "runtime" };
+      },
+      list: () => [...models],
+    });
+
+  it("falls back to the runtime registry when the static catalog misses", async () => {
+    const resolved = await resolveModelPin("deepseek/deepseek-chat", {
+      staticModel: staticMiss,
+      runtime: registryWith([{ key: "deepseek/deepseek-chat", context: 65536, thinking: false }]),
+    });
+    expect(resolved).toEqual({ provider: "deepseek", id: "deepseek-chat", source: "runtime" });
+  });
+
+  it("a static catalog hit short-circuits before the runtime registry builds", async () => {
+    const sentinel = { source: "static" };
+    const resolved = await resolveModelPin("anthropic/claude-opus-4-5", {
+      staticModel: async () => sentinel,
+      runtime: async () => {
+        throw new Error("runtime registry must not build for static hits");
+      },
+    });
+    expect(resolved).toBe(sentinel);
+  });
+
+  it("reports a miss with the 8 nearest keys, closest first", async () => {
+    // x/y1 is distance 1 from the pin, x/y2..x/y9 are distance 2, and the
+    // last key is deliberately unrelated — so exactly x/y1..x/y8 rank first.
+    const keys = ["x/y1", "x/y2", "x/y3", "x/y4", "x/y5", "x/y6", "x/y7", "x/y8", "x/y9", "zzz/unrelated"];
+    let message = "";
+    try {
+      await resolveModelPin("x/y1a", {
+        staticModel: staticMiss,
+        runtime: registryWith(keys.map((key) => ({ key, context: 1, thinking: false }))),
+      });
+      expect.unreachable("miss must throw");
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message.startsWith("unknown model: x/y1a — nearest keys: ")).toBe(true);
+    const listed = message.slice("unknown model: x/y1a — nearest keys: ".length).split(", ");
+    expect(listed).toEqual(["x/y1", "x/y2", "x/y3", "x/y4", "x/y5", "x/y6", "x/y7", "x/y8"]);
+  });
+
+  it("a realistic typo surfaces the intended custom key first", async () => {
+    const keys = ["deepseek/deepseek-chat", "deepseek/deepseek-reasoner", "anthropic/claude-opus-4-5"];
+    await expect(
+      resolveModelPin("deepseek/deepseek-cht", {
+        staticModel: staticMiss,
+        runtime: registryWith(keys.map((key) => ({ key, context: 1, thinking: false }))),
+      }),
+    ).rejects.toThrow(/^unknown model: deepseek\/deepseek-cht — nearest keys: deepseek\/deepseek-chat, /);
+  });
+
+  it("a miss against an empty registry says so instead of listing nothing", async () => {
+    await expect(
+      resolveModelPin("deepseek/deepseek-chat", { staticModel: staticMiss, runtime: registryWith([]) }),
+    ).rejects.toThrow(/unknown model: deepseek\/deepseek-chat \(model registry is empty\)/);
+  });
+
+  it("still rejects pins without a provider/id shape", async () => {
+    await expect(
+      resolveModelPin("deepseek", { staticModel: staticMiss, runtime: registryWith([]) }),
+    ).rejects.toThrow(/model must be provider\/id/);
+  });
+});
+
+describe("nearestKeys ranking", () => {
+  it("ranks by edit distance then key, and caps the list", () => {
+    const keys = ["a/b", "a/b2", "a/bb", "a/bcd", "a/bcde", "a/bcdef", "a/bcdefg", "a/bcdefgh", "a/zz"];
+    expect(nearestKeys("a/b", keys, 3)).toEqual(["a/b", "a/b2", "a/bb"]);
+    expect(nearestKeys("a/b", keys)).toHaveLength(8);
   });
 });
 
