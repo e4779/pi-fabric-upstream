@@ -4,6 +4,7 @@ import {
   composeCommands,
   startExternalBridge,
   type ExternalBridgeHandle,
+  type ExternalCommandHandler,
 } from "./external/bridge.js";
 import { createAgentCommand } from "./external/agent.js";
 import { AgentJobs, createAgentJobsCommand } from "./external/agent-jobs.js";
@@ -128,6 +129,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { captureLoadedFileIdentity } from "./build-identity.js";
 
+// Type-only: the runtime module itself stays lazily loaded through FabricState.
+import type { FabricPeerControl } from "./fabric-runtime-state.js";
+import type { FabricPeerInfo } from "./topology/types.js";
+
 export const FABRIC_MANAGED_HOST_VERSION = 2;
 export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
@@ -141,6 +146,110 @@ const userPromptText = (
   event: { readonly messageType?: unknown; readonly prompt?: unknown },
 ): string | undefined =>
   event.messageType === "custom" || typeof event.prompt !== "string" ? undefined : event.prompt;
+
+/** What the peer bridge command needs; the runtime state satisfies both. */
+export interface FabricPeerCommandSource {
+  /** Live peer snapshot for label/id resolution (the `peers` listing source). */
+  peerInfos(): FabricPeerInfo[];
+  /**
+   * The runtime's control-plane accessor. May be async (the runtime module
+   * loads lazily) and returns undefined while the engine is down.
+   */
+  peerControl(): FabricPeerControl | undefined | Promise<FabricPeerControl | undefined>;
+}
+
+export const PEER_COMMAND_HELP = [
+  "peer subcommands:",
+  "  peer steer <label|id> textFile=<path>   inject text into the peer's current turn",
+  "  peer follow <label|id> textFile=<path>  queue text for the peer's next turn",
+  "  peer stop <label|id>                    halt the peer session",
+].join("\n");
+
+/** One `peers` listing line; shared by the peers command and peer errors. */
+export const peerLine = (peer: FabricPeerInfo): string =>
+  `${peer.label ?? peer.name} ${peer.status}${peer.model ? ` model=${peer.model}` : ""}` +
+  `${peer.pendingMessages ? " pending" : ""} id=${peer.id.slice(0, 8)}`;
+
+/** Label exact match, else id prefix; ambiguous ids report every candidate. */
+const resolvePeerRef = (
+  peers: readonly FabricPeerInfo[],
+  ref: string,
+): { peer?: FabricPeerInfo; ambiguous?: FabricPeerInfo[] } => {
+  const byLabel = peers.filter((candidate) => (candidate.label ?? candidate.name) === ref);
+  const labelMatch = byLabel[0];
+  if (byLabel.length > 1) return { ambiguous: byLabel };
+  if (byLabel.length === 1 && labelMatch) return { peer: labelMatch };
+  const byId = peers.filter((candidate) => candidate.id.startsWith(ref));
+  const idMatch = byId[0];
+  if (byId.length > 1) return { ambiguous: byId };
+  if (byId.length === 1 && idMatch) return { peer: idMatch };
+  return {};
+};
+
+/**
+ * Bridge command: `peer steer|follow|stop <label|id>` drives a live peer
+ * session through the fabric control plane. Anything not namespaced by
+ * `peer` falls through to the next handler.
+ */
+export const createPeerControlCommand = (
+  source: FabricPeerCommandSource,
+): ExternalCommandHandler => {
+  return async (argv) => {
+    if (argv[0] !== "peer") return undefined;
+    const verb = argv[1];
+    const operation = verb === "steer" ? "steer" : verb === "follow" ? "followUp" : verb === "stop" ? "stop" : undefined;
+    if (operation === undefined) {
+      throw new Error(`usage: peer steer|follow <label|id> textFile=<path> | peer stop <label|id>\n${PEER_COMMAND_HELP}`);
+    }
+    const control = await source.peerControl();
+    if (!control) {
+      throw new Error("peer control is unavailable: the fabric engine is down");
+    }
+    const ref = argv[2]?.trim() ?? "";
+    if (ref === "") {
+      throw new Error(`peer ${verb} needs a peer label or id — peers lists both`);
+    }
+    const peers = source.peerInfos();
+    const resolved = resolvePeerRef(peers, ref);
+    if (resolved.ambiguous) {
+      return {
+        ok: false,
+        lines: [
+          `ambiguous peer ${ref}: ${resolved.ambiguous.map((peer) => peer.label ?? peer.name).join(", ")}`,
+        ],
+      };
+    }
+    const target = resolved.peer;
+    if (!target) {
+      return {
+        ok: false,
+        lines: [`unknown peer ${ref}`, ...(peers.length === 0 ? ["(no peers)"] : peers.map(peerLine))],
+      };
+    }
+    let message: string | undefined;
+    if (operation !== "stop") {
+      const fileArg = argv[3];
+      if (fileArg === undefined || !fileArg.startsWith("textFile=")) {
+        throw new Error(`peer ${verb} needs textFile=<path>\n${PEER_COMMAND_HELP}`);
+      }
+      const file = fileArg.slice("textFile=".length);
+      if (file.trim() === "") throw new Error(`peer ${verb} needs a non-empty textFile path\n${PEER_COMMAND_HELP}`);
+      try {
+        message = readFileSync(file, "utf8");
+      } catch (error) {
+        throw new Error(`cannot read textFile ${file}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    const result = await control.request(target.id, operation, message);
+    return {
+      ok: true,
+      lines: [
+        `messageId=${result.messageId}`,
+        `peer=${target.label ?? target.name} id=${target.id.slice(0, 8)}`,
+      ],
+    };
+  };
+};
 
 export function createFabricExtension(entryUrl: string) {
 // Absolute path to the Fabric skills bundled with this extension. Resolved
@@ -288,6 +397,13 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // the external bridge for whatever surface tool the host provides.
   const externalSurface = (): boolean => state.config.surface === "external";
   let externalBridge: ExternalBridgeHandle | undefined;
+  // FabricRuntimeState loads lazily (FabricState imports it on first use), so
+  // the bridge reaches its peer-control seam through a cached dynamic import;
+  // the module-level accessor resolves live at command time, which is also
+  // what makes engine-down visible per command.
+  let peerControlModule: Promise<typeof import("./fabric-runtime-state.js")> | undefined;
+  const activePeerControl = async (): Promise<FabricPeerControl | undefined> =>
+    (await (peerControlModule ??= import("./fabric-runtime-state.js"))).getActivePeerControl();
   const fabricOwnsModelTools = (): boolean =>
     !externalSurface() &&
     (state.config.fullCodeMode || state.config.schema.mode === "enforce");
@@ -631,6 +747,10 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           createAgentCommand(),
           createRecallCommand(externalMemoryContext),
           createVccCommand(vccSource),
+          createPeerControlCommand({
+            peerInfos: () => state.peerInfos(),
+            peerControl: () => activePeerControl(),
+          }),
           async (argv) =>
             argv[0] === "peers"
               ? {
@@ -638,11 +758,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
                   lines:
                     state.peerInfos().length === 0
                       ? ["(no peers)"]
-                      : state.peerInfos().map(
-                          (peer) =>
-                            `${peer.label ?? peer.name} ${peer.status}${peer.model ? ` model=${peer.model}` : ""}` +
-                            `${peer.pendingMessages ? " pending" : ""} id=${peer.id.slice(0, 8)}`,
-                        ),
+                      : state.peerInfos().map(peerLine),
                 }
               : undefined,
         ),

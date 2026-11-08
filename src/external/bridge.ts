@@ -71,6 +71,7 @@ const helpLines = (hasCommands: boolean): string[] => [
         "  recall          search session memory (query=<terms> …)",
         "  vcc             session file views: summary/branch/entries/entry",
         "  peers           parallel sessions in this project (label, status)",
+        "  peer            steer/follow <label|id> textFile=<path>, stop",
       ]
     : []),
   "  help            this list",

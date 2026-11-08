@@ -233,6 +233,30 @@ export interface FabricRuntimeStateOptions {
   hostPolicy?: FabricHostPolicy;
 }
 
+/** Peer-facing control operations; `ask`/`cancel` stay inside the agent plane. */
+export type FabricPeerControlOperation = "steer" | "followUp" | "stop";
+
+/**
+ * Peer control handle: the fabric control plane aimed at other root sessions.
+ * Exposed so surfaces that must not hold a runtime reference (the external
+ * bridge composes its command list before the runtime activates) can steer,
+ * follow, and stop peers through the same channel agentsProvider uses.
+ */
+export interface FabricPeerControl {
+  /**
+   * Send `operation` to participant `targetId` (a participant id; label
+   * resolution happens above this seam). `message` carries the steer/followUp
+   * text; `stop` takes none. Resolves with the owner's acknowledgement id;
+   * rejects when the target is unknown, runs the legacy protocol, or its
+   * owner does not acknowledge in time.
+   */
+  request(
+    targetId: string,
+    operation: FabricPeerControlOperation,
+    message?: string,
+  ): Promise<{ messageId: string }>;
+}
+
 export class FabricRuntimeState {
   #registry: ActionRegistry | undefined;
   readonly #actionPolicyHooks: FabricActionPolicyHooks | undefined;
@@ -396,6 +420,40 @@ export class FabricRuntimeState {
 
   peerInfos(): FabricPeerInfo[] {
     return this.#participants?.peers() ?? [];
+  }
+
+  /**
+   * Control-plane handle for peer participants, or undefined while the engine
+   * is down. `request` resolves the target's execution owner from the
+   * participant directory (ownerHostId/ownerIdentityId/ownerIncarnation, the
+   * same fields agentsProvider copies onto control commands) and publishes
+   * the command through the fabric control plane, so peers owned by another
+   * host process are reachable exactly like agentsProvider reaches them.
+   */
+  peerControl(): FabricPeerControl | undefined {
+    const control = this.#control;
+    const participants = this.#participants;
+    if (!control) return undefined;
+    return {
+      request: async (targetId, operation, message) => {
+        const participant = participants?.get(targetId);
+        if (!participant) throw new Error(`Unknown Fabric participant: ${targetId}`);
+        if (participant.controlProtocol !== "v1") {
+          throw new Error(`Fabric peer ${participant.id} has no control channel`);
+        }
+        const result = await control.request(
+          participant.ownerHostId,
+          participant.id,
+          operation,
+          {
+            ...(message !== undefined ? { message } : {}),
+            ...(participant.ownerIncarnation ? { ownerIncarnation: participant.ownerIncarnation } : {}),
+          },
+          participant.ownerIdentityId,
+        );
+        return { messageId: result.messageId };
+      },
+    };
   }
 
   /** Publish agent activity to Herdr, or withdraw it when ui.herdrStatus is off. */
@@ -1251,6 +1309,7 @@ export class FabricRuntimeState {
     // A damaged artifact disables normalization and surfaces on demand.
     const compiled = this.#config.entropy.compile ? loadCompiledSurface(resolveAgentDir()) : {};
     setActiveCompiledSurface(compiled.file, this.#config.entropy.compile && !compiled.error);
+    publishActivePeerControl(this);
   }
 
   async #mountExecution(context: ExtensionContext, enforceSchema: boolean): Promise<void> {
@@ -1687,6 +1746,7 @@ export class FabricRuntimeState {
   }
 
   async shutdown(): Promise<void> {
+    clearActivePeerControl(this);
     this.#labelUseStop?.();
     this.#labelUseStop = undefined;
     await this.#closeHerdr();
@@ -1820,6 +1880,7 @@ export class FabricRuntimeState {
   }
 
   async #closeInternal(): Promise<void> {
+    clearActivePeerControl(this);
     this.#completionInbox?.close();
     this.#completionInbox = undefined;
     this.#labelUseStop?.();
@@ -1887,6 +1948,29 @@ export class FabricRuntimeState {
     }
   }
 }
+
+// Late-bound seam for surfaces that compose before the runtime activates: the
+// external bridge is built once at bootstrap while the runtime (and its
+// control plane) may come up later, reload, or go down. The runtime publishes
+// itself at the end of initialize and retracts at teardown; readers resolve
+// through peerControl() at command time, so engine-down is answered live.
+// Mirrors repairs/active.ts.
+let activePeerControlRuntime: FabricRuntimeState | undefined;
+
+/** Publish `runtime` as the peer-control source (end of initialize). */
+export const publishActivePeerControl = (runtime: FabricRuntimeState): void => {
+  activePeerControlRuntime = runtime;
+};
+
+/** Retract `runtime` from the peer-control seam (shutdown), identity-checked. */
+export const clearActivePeerControl = (runtime: FabricRuntimeState): void => {
+  if (activePeerControlRuntime === runtime) activePeerControlRuntime = undefined;
+};
+
+/** The live runtime's peerControl(); undefined before activation or when the engine is down. */
+export const getActivePeerControl = (): FabricPeerControl | undefined =>
+  activePeerControlRuntime?.peerControl();
+
 
 const scalarMetadata = (
   value: unknown,
