@@ -1,5 +1,5 @@
 import { createServer, type Socket } from "node:net";
-import { chmodSync, mkdirSync, rmSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -75,6 +75,37 @@ const helpLines = (hasCommands: boolean): string[] => [
   "  help            this list",
 ];
 
+/** Per-connection argv budget: a runaway client must not grow host memory. */
+const MAX_MESSAGE_BYTES = 1 << 20;
+
+/** Remove fabric-<pid>.sock leftovers whose process is gone (ESRCH only:
+ * EPERM means alive under another uid). Never touches live sessions. */
+const reapStaleSockets = (dir: string, log?: (message: string) => void): void => {
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    const match = /^fabric-(\d+)\.sock$/.exec(name);
+    if (match === null) continue;
+    const pid = Number(match[1]);
+    try {
+      if (Number.isInteger(pid) && pid > 0) process.kill(pid, 0);
+      else throw new Error("not a pid");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") continue;
+      try {
+        rmSync(join(dir, name));
+        log?.(`reaped stale socket ${name} (pid ${pid} gone)`);
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+};
+
 export function startExternalBridge(options: {
   version: number;
   stateView: () => BridgeStateView;
@@ -84,7 +115,13 @@ export function startExternalBridge(options: {
   commands?: ExternalCommandHandler;
 }): ExternalBridgeHandle {
   const dir = options.socketDir?.trim() || join(homedir(), ".pi", "agent", "sock");
-  mkdirSync(dir, { recursive: true });
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try {
+    chmodSync(dir, 0o700);
+  } catch {
+    /* best effort: platforms ignoring dir modes */
+  }
+  reapStaleSockets(dir, options.log);
   const socketPath = join(dir, `fabric-${process.pid}.sock`);
   rmSync(socketPath, { force: true });
 
@@ -126,11 +163,26 @@ export function startExternalBridge(options: {
   // We half-close explicitly once the reply is out.
   const server = createServer({ allowHalfOpen: true }, (socket: Socket): void => {
     const lines: string[] = [];
+    let buffer = "";
     socket.setEncoding("utf8");
     socket.on("data", (chunk: string) => {
-      lines.push(...chunk.split("\n"));
+      // Accumulate and split on complete lines only: a TCP/socket write can
+      // be split anywhere, and a naive per-chunk split turns one argv
+      // element into two silently wrong ones (council finding #1).
+      buffer += chunk;
+      if (Buffer.byteLength(buffer, "utf8") > MAX_MESSAGE_BYTES) {
+        socket.end(`ERR message exceeds ${MAX_MESSAGE_BYTES} bytes\n`, () => socket.destroy());
+        return;
+      }
+      let newline = buffer.indexOf("\n");
+      while (newline >= 0) {
+        lines.push(buffer.slice(0, newline));
+        buffer = buffer.slice(newline + 1);
+        newline = buffer.indexOf("\n");
+      }
     });
     socket.on("end", () => {
+      if (buffer !== "") lines.push(buffer); // final unterminated line
       while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
       void dispatch(lines).then(
         (head) => {
@@ -165,6 +217,20 @@ export function startExternalBridge(options: {
       }
     },
   };
+
+  // An unhandled 'error' (EADDRINUSE, EMFILE, EACCES) takes down the whole
+  // host process, not just the bridge (council finding #2): degrade to a
+  // logged, closed bridge instead.
+  server.on("error", (error) => {
+    options.log?.(`fabric external bridge error: ${error.message}`);
+    try {
+      server.close();
+    } catch {
+      /* already closed */
+    }
+    rmSync(socketPath, { force: true });
+    if (process.env.FABRIC_SOCK === socketPath) delete process.env.FABRIC_SOCK;
+  });
 
   server.listen(socketPath, () => {
     // 0600 after the fact: the socket can drive the engine — same user only.
