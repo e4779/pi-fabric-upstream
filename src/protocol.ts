@@ -1772,3 +1772,201 @@ export {
   MAX_FABRIC_MODEL_GUIDANCE_SNAPSHOT_CHARS,
   MAX_FABRIC_MODEL_GUIDANCE_TOTAL_CHARS,
 } from "./components/model-guidance.js";
+
+// ---- Typed tool-result details: the shared render card (v1) -----------------
+
+/**
+ * `schemaVersion` of the typed tool_result render contract. A tool that fills
+ * its result `details` with a {@link FabricToolResultCardV1} payload gets the
+ * host's shared result card — semantic tones, blended background, collapsed
+ * preview with an expand hint — through the normal `renderResult` pipeline,
+ * without encoding a single ANSI sequence of its own. Unversioned or future
+ * payloads are refused, never guessed at.
+ */
+export const FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION = 1;
+
+/** Discriminants of the v1 card union; each doubles as the outcome semantics. */
+export type FabricToolResultCardKind =
+  | "ok"
+  | "error"
+  | "timeout"
+  | "blocked"
+  | "backgrounded";
+
+/** Fields every v1 card may carry; the `kind` member decides the required ones. */
+export interface FabricToolResultCardBaseV1 {
+  schemaVersion: typeof FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION;
+  /** Card headline rendered above the command line. */
+  title?: string;
+  /** Full command, multi-line allowed; only the first line shows collapsed. */
+  cmd?: string;
+  /** Wall-clock runtime in milliseconds. */
+  ms?: number;
+  /** Log file backing the output (detached or backgrounded work). */
+  logPath?: string;
+  /** Last lines of the bounded output; the collapsed card previews these. */
+  tail?: string[];
+  /** Full bounded output; the expanded card renders this. */
+  output?: string;
+  /** Total output lines; drives the collapsed `… +N lines` hint. */
+  totalLines?: number;
+}
+
+/** Completed successfully (exit 0, or the tool's own success criterion). */
+export interface FabricToolResultOkV1 extends FabricToolResultCardBaseV1 {
+  kind: "ok";
+  /** Process exit status; conventionally 0. */
+  exitCode?: number;
+}
+
+/** Failed: non-zero exit or a tool-level error. */
+export interface FabricToolResultErrorV1 extends FabricToolResultCardBaseV1 {
+  kind: "error";
+  /** Non-zero process exit status, or null when no status exists. */
+  exitCode?: number | null;
+  /** One-line error summary; shown when the output carries none. */
+  error?: string;
+}
+
+/** Ran past its deadline and was stopped. */
+export interface FabricToolResultTimeoutV1 extends FabricToolResultCardBaseV1 {
+  kind: "timeout";
+  /** Exit status observed at the kill, when one was reaped. */
+  exitCode?: number | null;
+}
+
+/** Refused before execution (pre-exec gate, policy veto). */
+export interface FabricToolResultBlockedV1 extends FabricToolResultCardBaseV1 {
+  kind: "blocked";
+  /** Why the call was refused; the first lines render on the card. */
+  reason: string;
+}
+
+/** Detached to the background; the card is a handle, not an outcome. */
+export interface FabricToolResultBackgroundedV1 extends FabricToolResultCardBaseV1 {
+  kind: "backgrounded";
+  /** Host job id the wake channel reports against. */
+  taskId: string;
+  /** Detached process id, when known. */
+  pid?: number;
+  /** Output that reached the pipes before the detach. */
+  output?: string;
+}
+
+/** The v1 card union: one discriminated object per outcome. */
+export type FabricToolResultCardV1 =
+  | FabricToolResultOkV1
+  | FabricToolResultErrorV1
+  | FabricToolResultTimeoutV1
+  | FabricToolResultBlockedV1
+  | FabricToolResultBackgroundedV1;
+
+const FABRIC_TOOL_RESULT_CARD_KINDS: ReadonlySet<string> = new Set<FabricToolResultCardKind>([
+  "ok",
+  "error",
+  "timeout",
+  "blocked",
+  "backgrounded",
+]);
+
+const optionalCardString = (value: unknown): string | undefined =>
+  typeof value === "string" ? value : undefined;
+
+const optionalCardNumber = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isFinite(value) ? value : undefined;
+
+const optionalCardInteger = (value: unknown): number | undefined =>
+  typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+
+const optionalCardStringArray = (value: unknown): string[] | undefined =>
+  Array.isArray(value) && value.every((line) => typeof line === "string")
+    ? (value as string[])
+    : undefined;
+
+const optionalCardExitCode = (
+  value: unknown,
+): number | null | undefined =>
+  value === null ? null : optionalCardInteger(value);
+
+/**
+ * Strict v1 reader for tool_result `details`: accepts only a complete,
+ * well-formed card and returns a defensive copy. Anything else — a missing or
+ * newer `schemaVersion`, an unknown `kind`, malformed fields — is `undefined`.
+ * The render contract refuses what it does not understand instead of guessing.
+ */
+export const readFabricToolResultCardV1 = (
+  value: unknown,
+): FabricToolResultCardV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.schemaVersion !== FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION) return undefined;
+  const kind = record.kind;
+  if (typeof kind !== "string" || !FABRIC_TOOL_RESULT_CARD_KINDS.has(kind)) return undefined;
+
+  // Every optional field must be well-formed when present; anything else refuses the card.
+  let valid = true;
+  const take = <T>(key: string, read: (value: unknown) => T | undefined): T | undefined => {
+    if (record[key] === undefined) return undefined;
+    const parsed = read(record[key]);
+    if (parsed === undefined) valid = false;
+    return parsed;
+  };
+  const title = take("title", optionalCardString);
+  const cmd = take("cmd", optionalCardString);
+  const ms = take("ms", optionalCardNumber);
+  const logPath = take("logPath", optionalCardString);
+  const tail = take("tail", optionalCardStringArray);
+  const output = take("output", optionalCardString);
+  const totalLines = take("totalLines", optionalCardInteger);
+  if (!valid) return undefined;
+
+  const base: FabricToolResultCardBaseV1 = {
+    schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
+    ...(title !== undefined ? { title } : {}),
+    ...(cmd !== undefined ? { cmd } : {}),
+    ...(ms !== undefined ? { ms } : {}),
+    ...(logPath !== undefined ? { logPath } : {}),
+    ...(tail !== undefined ? { tail } : {}),
+    ...(output !== undefined ? { output } : {}),
+    ...(totalLines !== undefined ? { totalLines } : {}),
+  };
+
+  switch (kind as FabricToolResultCardKind) {
+    case "ok": {
+      const exitCode = take("exitCode", optionalCardInteger);
+      if (!valid) return undefined;
+      return { ...base, kind: "ok" as const, ...(exitCode !== undefined ? { exitCode } : {}) };
+    }
+    case "error": {
+      const exitCode = take("exitCode", optionalCardExitCode);
+      const error = take("error", optionalCardString);
+      if (!valid) return undefined;
+      return {
+        ...base,
+        kind: "error" as const,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(error !== undefined ? { error } : {}),
+      };
+    }
+    case "timeout": {
+      const exitCode = take("exitCode", optionalCardExitCode);
+      if (!valid) return undefined;
+      return { ...base, kind: "timeout" as const, ...(exitCode !== undefined ? { exitCode } : {}) };
+    }
+    case "blocked":
+      if (typeof record.reason !== "string") return undefined;
+      return { ...base, kind: "blocked" as const, reason: record.reason };
+    case "backgrounded": {
+      const pid = take("pid", optionalCardInteger);
+      if (!valid) return undefined;
+      if (typeof record.taskId !== "string") return undefined;
+      return {
+        ...base,
+        kind: "backgrounded" as const,
+        taskId: record.taskId,
+        ...(pid !== undefined ? { pid } : {}),
+      };
+    }
+  }
+  return undefined;
+};

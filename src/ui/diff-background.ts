@@ -1,7 +1,8 @@
 // Adapted from pi-code-previews; see THIRD_PARTY_NOTICES.md.
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
-import { ansi256ToRgb, observedThemeVariant } from "./highlight.js";
+import { observedThemeVariant } from "./highlight.js";
+import { blendThemeBackground } from "./blend-background.js";
 
 export type DiffBackgroundIntensity = "off" | "subtle" | "medium";
 export type DiffLineKind = "add" | "remove";
@@ -72,23 +73,15 @@ const fallbackDiffBg = (
   return intensity === "medium" ? "\x1b[48;2;78;36;40m" : "\x1b[48;2;50;24;30m";
 };
 
+const DIFF_ADD_BLEND = { fg: "toolDiffAdded", bg: "toolSuccessBg", bgFallbacks: ["toolSuccessBg"] };
+const DIFF_REMOVE_BLEND = { fg: "toolDiffRemoved", bg: "toolErrorBg", bgFallbacks: ["toolSuccessBg"] };
+
 const deriveDiffBg = (
   kind: DiffLineKind,
   theme: Theme | undefined,
   intensity: number,
-): string | undefined => {
-  const themed = theme as
-    | (Theme & { getFgAnsi?: (key: string) => string; getBgAnsi?: (key: string) => string })
-    | undefined;
-  const fg = themed?.getFgAnsi?.(kind === "add" ? "toolDiffAdded" : "toolDiffRemoved");
-  const fgRgb = parseAnsiRgb(fg ?? "");
-  if (!fgRgb) return undefined;
-  const base =
-    parseAnsiRgb(themed?.getBgAnsi?.(kind === "add" ? "toolSuccessBg" : "toolErrorBg") ?? "") ??
-    parseAnsiRgb(themed?.getBgAnsi?.("toolSuccessBg") ?? "") ??
-    (observedThemeVariant() === "light" ? { r: 255, g: 255, b: 255 } : { r: 0, g: 0, b: 0 });
-  return `\x1b[48;2;${Math.round(base.r + (fgRgb.r - base.r) * intensity)};${Math.round(base.g + (fgRgb.g - base.g) * intensity)};${Math.round(base.b + (fgRgb.b - base.b) * intensity)}m`;
-};
+): string | undefined =>
+  blendThemeBackground(theme, kind === "add" ? DIFF_ADD_BLEND : DIFF_REMOVE_BLEND, intensity);
 
 const PRINTABLE_ASCII_RE = /^[\x20-\x7e]*$/;
 const TRUNCATION_SAFE_RE = /^(?:[\x20-\x7e\t]|\x1b\[[0-9;]*m)*$/;
@@ -207,11 +200,3 @@ const updateAnsiState = (current: string, sequence: string): string => {
 
 const replaceAnsi = (current: string, pattern: RegExp, replacement: string): string =>
   current.replace(pattern, "") + replacement;
-
-const parseAnsiRgb = (ansi: string): { r: number; g: number; b: number } | undefined => {
-  const match = ansi.match(/\x1b\[(?:38|48);2;(\d+);(\d+);(\d+)m/);
-  if (match) return { r: Number(match[1]), g: Number(match[2]), b: Number(match[3]) };
-  const indexed = ansi.match(/\x1b\[(?:38|48);5;(\d+)m/);
-  if (indexed) return ansi256ToRgb(Number(indexed[1]));
-  return undefined;
-};

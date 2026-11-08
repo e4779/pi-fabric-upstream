@@ -1,0 +1,27 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`renderFabricToolResultCard > matches the reference snapshots (semantic theme, width 40) > error-expanded 1`] = `
+[
+  "[48;2;50;24;30m<dim>❯ </dim><bold>cargo build</bold>   [0m",
+  "[48;2;50;24;30m                                        [0m",
+  "[48;2;50;24;30m<toolOutput>error[E0308]: mismatched    [0m",
+  "[48;2;50;24;30mtypes</toolOutput>                      [0m",
+  "[48;2;50;24;30m<toolOutput> -->                        [0m",
+  "[48;2;50;24;30msrc/main.rs:2:3</toolOutput>            [0m",
+  "[48;2;50;24;30m<error>✗ exit 101 · 45.0s</error>       [0m",
+]
+`;
+
+exports[`renderFabricToolResultCard > matches the reference snapshots (semantic theme, width 40) > ok-collapsed 1`] = `
+[
+  "[48;2;10;42;26m<accent>suite</accent>                  [0m",
+  "[48;2;10;42;26m<dim>❯ </dim><bold>make test</bold>     [0m",
+  "[48;2;10;42;26m                                        [0m",
+  "[48;2;10;42;26m<toolOutput>ok 1</toolOutput>           [0m",
+  "[48;2;10;42;26m<toolOutput>ok 2</toolOutput>           [0m",
+  "[48;2;10;42;26m<toolOutput>ok 3</toolOutput>           [0m",
+  "[48;2;10;42;26m<dim>… 6 lines · </dim><dim>ctrl-o to   [0m",
+  "[48;2;10;42;26mexpand</dim>                            [0m",
+  "[48;2;10;42;26m<success>✓ exit 0 · 1.2s</success>      [0m",
+]
+`;
