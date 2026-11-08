@@ -138,7 +138,7 @@ export class AgentJobs {
       try {
         await live.prompt(args.prompt);
         if (job.state === "running") {
-          job.lines = await workerResultLines(job.json, live.state.messages);
+          job.lines = await workerResultLines(job.json, live.state.messages, args.schema);
           job.state = "done";
         }
       } catch (error) {
