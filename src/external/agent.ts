@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { Value } from "typebox/value";
 import type { ExternalCommandHandler } from "./bridge.js";
 
 /**
@@ -20,6 +21,10 @@ export const AGENT_ARGV_HELP = [
   "  thinking=<level>    off|minimal|low|medium|high|xhigh|max (default: medium)",
   "  timeoutMs=<n>       abort bound (default 600000)",
   "  json=on             reply must be a JSON value; extracted and re-emitted compact",
+  "  schemaFile=<path>   JSON Schema (typebox-compatible) the json=on reply must match;",
+  "                      requires json=on",
+  "  maxTokens=<n>       positive integer; accepted syntactically but rejected: the SDK",
+  "                      exposes no per-session max-tokens option (models.json only)",
   "  name=<label>        job label for lists (job form only)",
 ].join("\n");
 
@@ -40,6 +45,7 @@ export interface AgentCommandArgs {
   thinking?: string;
   timeoutMs: number;
   json: boolean;
+  schema?: Record<string, unknown>;
   name?: string;
 }
 
@@ -53,7 +59,7 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
     const key = line.slice(0, separator);
     const value = line.slice(separator + 1);
     if (
-      !["promptFile", "tools", "cwd", "model", "thinking", "timeoutMs", "json", "name"].includes(key)
+      !["promptFile", "tools", "cwd", "model", "thinking", "timeoutMs", "json", "schemaFile", "maxTokens", "name"].includes(key)
     ) {
       throw new Error(`unknown agent argument: ${key}\n${AGENT_ARGV_HELP}`);
     }
@@ -79,6 +85,42 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
   if (timeoutRaw !== undefined && (!Number.isInteger(timeoutRaw) || timeoutRaw <= 0)) {
     throw new Error(`timeoutMs must be a positive integer, got: ${raw.timeoutMs}`);
   }
+  if (raw.maxTokens !== undefined) {
+    const maxTokens = Number(raw.maxTokens);
+    if (!Number.isInteger(maxTokens) || maxTokens <= 0) {
+      throw new Error(`maxTokens must be a positive integer, got: ${raw.maxTokens}`);
+    }
+    // Researched: CreateAgentSessionOptions has no maxTokens field, Settings has no
+    // maxTokens key (so SettingsManager.inMemory({ maxTokens }) is not a path), and
+    // AgentSession.prompt() does not expose pi-ai's per-request maxTokens. Only the
+    // models.json model definitions carry one — a catalog property, not per-session.
+    throw new Error(
+      "maxTokens unsupported by SDK: pi-coding-agent's createAgentSession has no per-session "
+      + "max-tokens option (configure maxTokens in models.json model definitions instead)",
+    );
+  }
+  let schema: Record<string, unknown> | undefined;
+  if (raw.schemaFile !== undefined && raw.schemaFile !== "") {
+    if (raw.json !== "on") {
+      throw new Error(`schemaFile requires json=on (there is nothing to validate otherwise)\n${AGENT_ARGV_HELP}`);
+    }
+    let schemaText: string;
+    try {
+      schemaText = readFileSync(raw.schemaFile, "utf8");
+    } catch (error) {
+      throw new Error(`cannot read schemaFile ${raw.schemaFile}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    let parsedSchema: unknown;
+    try {
+      parsedSchema = JSON.parse(schemaText);
+    } catch (error) {
+      throw new Error(`schemaFile is not JSON (${error instanceof Error ? error.message : String(error)}): ${raw.schemaFile}`);
+    }
+    if (parsedSchema === null || typeof parsedSchema !== "object" || Array.isArray(parsedSchema)) {
+      throw new Error(`schemaFile must contain a JSON object, got: ${JSON.stringify(parsedSchema)}`);
+    }
+    schema = parsedSchema as Record<string, unknown>;
+  }
   return {
     prompt,
     tools: raw.tools === undefined ? [] : raw.tools.split(",").map(t => t.trim()).filter(Boolean),
@@ -87,6 +129,7 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
     ...(raw.thinking ? { thinking: raw.thinking } : {}),
     timeoutMs: timeoutRaw ?? DEFAULT_AGENT_TIMEOUT_MS,
     json: raw.json === "on",
+    ...(schema ? { schema } : {}),
     ...(raw.name ? { name: raw.name } : {}),
   };
 };
@@ -167,17 +210,30 @@ export const finalAssistantText = (messages: readonly unknown[]): string | null 
 };
 
 /** Result lines for a settled worker: text, or the salvaged compact JSON. */
-export const workerResultLines = async (json: boolean, messages: readonly unknown[]): Promise<string[]> => {
+export const workerResultLines = async (
+  json: boolean,
+  messages: readonly unknown[],
+  schema?: Record<string, unknown>,
+): Promise<string[]> => {
   const text = finalAssistantText(messages);
   if (text === null) throw new Error("agent run produced no assistant text");
   if (!json) return text.split("\n");
   const { parseStructuredValue } = await import("../agents/result.js");
+  let value: unknown;
   try {
-    return [JSON.stringify(parseStructuredValue(text))];
+    value = parseStructuredValue(text, schema);
   } catch (error) {
     const head = text.slice(0, 80).replace(/\s+/g, " ");
     throw new Error(`reply is not JSON (${error instanceof Error ? error.message : String(error)}): ${head}`);
   }
+  if (schema !== undefined) {
+    if (!Value.Check(schema, value)) {
+      const errors = [...Value.Errors(schema, value)].slice(0, 5).map((error) => error.message).join("; ");
+      const head = text.slice(0, 80).replace(/\s+/g, " ");
+      throw new Error(`reply does not match schema (${errors || "value does not match schema"}): ${head}`);
+    }
+  }
+  return [JSON.stringify(value)];
 };
 
 export const runAgent = async (args: AgentCommandArgs): Promise<{ ok: boolean; lines: string[] }> => {
@@ -199,7 +255,7 @@ export const runAgent = async (args: AgentCommandArgs): Promise<{ ok: boolean; l
     session.dispose();
   }
   if (timedOut) throw new Error(`agent run aborted: timeout ${args.timeoutMs}ms`);
-  return { ok: true, lines: [`id=${id}`, ...(await workerResultLines(args.json, messages))] };
+  return { ok: true, lines: [`id=${id}`, ...(await workerResultLines(args.json, messages, args.schema))] };
 };
 
 /** Bridge command: `agent` + key=value lines. Everything else falls through. */
