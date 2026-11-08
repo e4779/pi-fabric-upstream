@@ -190,6 +190,7 @@ See the [interface & commands reference](docs/interface.md) for every view, keyb
 - [Jev shell orchestration](docs/jev.md): bounded process supervision, event-driven task wait/watch, optional explicit typed judgments, and foreground/background budgets.
 - [Components & committed capabilities](docs/components.md): supervised effects, exact requirements, external per-model guidance and execution-profile replacement, rolling provider generations, actor commitments, and both formal calculi.
 - [External providers](docs/providers.md): the versioned provider protocol for extensions.
+- [External surface](docs/external-surface.md): Fabric as an engine: the per-session bridge socket, the line protocol, worker/recall/vcc commands, and the `fab` client.
 - [Architecture & security](docs/architecture.md): the host bridge, sandboxing, tool-call robustness, and limits.
 - [Verified policy kernels](docs/verified-kernels.md): gdp-wired laws over the executed rules, production acceptance gates, regeneration, and the trusted boundary.
 - [Provider capabilities](docs/provider-capabilities.md): proved dispatch, authority attenuation, lifecycle transitions, cancellation/cleanup contracts, and trust boundaries.
