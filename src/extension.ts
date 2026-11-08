@@ -105,6 +105,7 @@ import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
+import { createFabricToolResultCardRenderer } from "./ui/tool-result-card.js";
 import { FabricTerminalTitle, installTerminalTitle } from "./ui/terminal-title.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
@@ -501,6 +502,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     },
   });
   registerHandoffCompletionRenderer(pi);
+  // The typed tool_result render contract: schema-bearing details from ANY
+  // tool render through the shared card; everything else keeps its own path.
+  // Optional-call: hosts on older Pi SDKs without tool renderers keep the
+  // native result rendering instead of failing to load Fabric.
+  pi.registerToolRenderer?.(createFabricToolResultCardRenderer());
   pi.registerTool(fabricTool);
 
   const applyFabricMode = (): void => {
