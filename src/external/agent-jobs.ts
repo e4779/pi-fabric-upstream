@@ -74,20 +74,32 @@ export class AgentJobs {
     private readonly cap = 64,
     /** Completion inbox: called once per terminal transition, never for close(). */
     private readonly onSettle?: (settlement: JobSettlement) => void,
+    /** Footer/observer refresh: called after every registry mutation. */
+    private readonly onChange?: () => void,
   ) {}
 
   #terminal(job: Job): void {
     job.settle();
-    if (this.onSettle === undefined) return;
+    if (this.onSettle !== undefined) {
+      try {
+        this.onSettle({
+          id: job.id,
+          name: job.name,
+          state: job.state,
+          ...(job.error === undefined ? {} : { error: job.error }),
+        });
+      } catch {
+        /* the inbox must never break the job machinery */
+      }
+    }
+    this.#changed();
+  }
+
+  #changed(): void {
     try {
-      this.onSettle({
-        id: job.id,
-        name: job.name,
-        state: job.state,
-        ...(job.error === undefined ? {} : { error: job.error }),
-      });
+      this.onChange?.();
     } catch {
-      /* the inbox must never break the job machinery */
+      /* observers must never break the registry */
     }
   }
 
@@ -112,6 +124,7 @@ export class AgentJobs {
       settle,
     };
     this.#jobs.set(id, job);
+    this.#changed();
     const timer = setTimeout(() => {
       if (job.state !== "running") return;
       job.error = `timeout ${args.timeoutMs}ms`;
