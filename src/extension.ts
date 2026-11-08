@@ -137,6 +137,10 @@ import { installFabricCrashGuard } from "./core/crash-guard.js";
 import type { FabricPeerControl } from "./fabric-runtime-state.js";
 import type { FabricPeerInfo } from "./topology/types.js";
 
+// Type-only: the runtime module itself stays lazily loaded through FabricState.
+import type { FabricPeerControl } from "./fabric-runtime-state.js";
+import type { FabricPeerInfo } from "./topology/types.js";
+
 export const FABRIC_MANAGED_HOST_VERSION = 2;
 export type { FabricManagedHostOptions } from "./managed-host.js";
 import type { FabricManagedHostOptions } from "./managed-host.js";
