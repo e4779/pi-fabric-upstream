@@ -9,11 +9,18 @@ export interface FabricProgramRunOptions {
   /** Pi's tool signal. It cancels the program only while the program is in the foreground. */
   parentSignal?: AbortSignal;
   jobs: () => FabricShellJobStore | undefined;
+  /** Owning session id; stamped into the detached task's log for the orphan sweep. */
+  ownerId?: string;
+  /** Zero-action auto-detach: a program still running past this many ms moves itself to the task store and the tool call returns its handle. 0/undefined keeps the program in the foreground until it settles or the user detaches it. */
+  hangMs?: number;
 }
+
+/** Who moved the program to the background: an explicit `background: true` request, the user's chord/command, or the zero-action hang timer. */
+export type FabricProgramDetachReason = "requested" | "user" | "hang";
 
 export type FabricProgramRace<T> =
   | { detached: false; value: T }
-  | { detached: true; job: ProgramJob; elapsedMs: number };
+  | { detached: true; job: ProgramJob; elapsedMs: number; reason: FabricProgramDetachReason };
 
 /**
  * One `fabric_exec` program that can leave its tool call and keep running as a
@@ -28,6 +35,7 @@ export class FabricProgramRun {
   };
   #job: ProgramJob | undefined;
   #settled = false;
+  #detachReason: FabricProgramDetachReason = "user";
   #progress: string | undefined;
   #wake: (() => void) | undefined;
 
@@ -42,8 +50,9 @@ export class FabricProgramRun {
   get waiting(): boolean { return !this.#job && !this.#settled && !this.#relay.signal.aborted; }
 
   /** Moves the program into the session task store; false when it cannot leave. */
-  detach(): boolean {
+  detach(reason: FabricProgramDetachReason = "user"): boolean {
     if (!this.waiting) return false;
+    this.#detachReason = reason;
     const jobs = this.options.jobs();
     if (!jobs) return false;
     let job: ProgramJob;
@@ -51,6 +60,7 @@ export class FabricProgramRun {
       job = jobs.begin("fabric_exec", this.options.code, {
         ...(this.options.description ? { description: this.options.description } : {}),
         ...(this.options.cwd ? { cwd: this.options.cwd } : {}),
+        ...(this.options.ownerId !== undefined ? { ownerId: this.options.ownerId } : {}),
       });
     } catch {
       return false;
@@ -73,17 +83,29 @@ export class FabricProgramRun {
     this.#job?.append(Buffer.from(`${text}\n`));
   }
 
-  /** Settles with the program, or earlier when it is detached. */
+  /** Settles with the program, or earlier when it is detached (by the user, `background: true`, or the zero-action hang timer). */
   async race<T>(work: Promise<T>): Promise<FabricProgramRace<T>> {
     const detached = new Promise<"detached">((resolve) => {
       this.#wake = () => resolve("detached");
       if (this.#job) resolve("detached");
     });
-    const first = await Promise.race([
-      work.then((value) => ({ value }), (error: unknown) => ({ error })),
-      detached,
-    ]);
-    if (first === "detached") return { detached: true, job: this.#job!, elapsedMs: Date.now() - this.#startedAt };
+    // Zero-action contract: past the hang threshold the RUNNING program
+    // detaches itself instead of holding the turn; the caller receives a task
+    // handle and the wake event keeps delivering the result. A timer that
+    // cannot detach (no store, already settled) simply leaves the race to work.
+    const hangMs = this.options.hangMs ?? 0;
+    const hangTimer = hangMs > 0 ? setTimeout(() => { this.detach("hang"); }, hangMs) : undefined;
+    hangTimer?.unref?.();
+    let first: "detached" | { value: T } | { error: unknown };
+    try {
+      first = await Promise.race([
+        work.then((value) => ({ value }), (error: unknown) => ({ error })),
+        detached,
+      ]);
+    } finally {
+      if (hangTimer) clearTimeout(hangTimer);
+    }
+    if (first === "detached") return { detached: true, job: this.#job!, elapsedMs: Date.now() - this.#startedAt, reason: this.#detachReason };
     this.#settled = true;
     this.owner.release(this);
     if ("error" in first) throw first.error;

@@ -114,6 +114,20 @@ export const buildExecutorSection = (
             "Wait budget before a nested shell spills to a live log. 0 disables auto-spill. Max 10m.",
           ),
         }),
+        setting("executor.programHangMs", "Program hang", config.executor.programHangMs === 0 ? "off" : formatMs(config.executor.programHangMs), {
+          description: "Opt-in zero-action auto-detach for whole fabric_exec programs (default off). A program still running past this budget detaches itself to the task store; the call returns its task handle and the completion event wakes the session. 0 keeps programs in the foreground until they settle or are detached manually.",
+          submenu: numericSubmenu(
+            theme,
+            [0, 30_000, 60_000, 120_000, 300_000, 600_000],
+            (ms) => ms === 0 ? "off" : formatMs(ms),
+            "Program hang",
+            "Zero-action auto-detach budget for fabric_exec programs. 0 (default) keeps programs in the foreground.",
+          ),
+        }),
+        setting("executor.shellOrphanSweep", "Orphan sweep", config.executor.shellOrphanSweep ? "true" : "false", {
+          description: "Opt-in (default false): at session start, report this session's orphaned detached-shell logs — ownership-stamped, dead pid, never another session's — so a restarted session learns what ended without delivering its result.",
+          values: BOOLEANS,
+        }),
         setting(
           "executor.maxTimeoutMs",
           "Policy max",

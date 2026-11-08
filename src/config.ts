@@ -99,6 +99,16 @@ interface FabricExecutorConfig {
   /** Execution policy middleware (gate + output budget) for Fabric-owned
    * shell execution; see docs/configuration.md "executor.shellPolicy". */
   shellPolicy: FabricShellPolicyConfig;
+  /** Zero-action auto-detach for `fabric_exec` programs: a program still
+   * running past this many ms detaches itself to the task store and the tool
+   * call returns its handle. 0 (the default) keeps programs in the foreground
+   * until they settle, the user detaches them, or `background: true` is set.
+   * Documented opt-in: upstream default remains foreground-only. */
+  programHangMs: number;
+  /** At session start, report this session's orphaned detached-task logs
+   * (ownership-stamped, dead pid, never another session's). Off by default;
+   * documented opt-in. */
+  shellOrphanSweep: boolean;
   memoryLimitBytes: number;
   maxOutputChars: number;
   maxNestedResultChars: number;
@@ -560,6 +570,8 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     humanWaitRefs: ["extensions.ask", "decisions.wait"],
     shellHangMs: DEFAULT_SHELL_HANG_MS,
     shellPolicy: { gate: true, outputBudget: true },
+    programHangMs: 0,
+    shellOrphanSweep: false,
     memoryLimitBytes: 64 * 1024 * 1024,
     maxOutputChars: 50_000,
     maxNestedResultChars: 2_000_000,
@@ -1186,6 +1198,16 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
           DEFAULT_FABRIC_CONFIG.executor.shellPolicy.outputBudget,
         ),
       },
+      programHangMs: boundedInteger(
+        executor.programHangMs,
+        DEFAULT_FABRIC_CONFIG.executor.programHangMs,
+        0,
+        Math.min(executorMaxTimeoutMs, SHELL_HANG_MAX_MS),
+      ),
+      shellOrphanSweep: booleanValue(
+        executor.shellOrphanSweep,
+        DEFAULT_FABRIC_CONFIG.executor.shellOrphanSweep,
+      ),
       memoryLimitBytes: boundedInteger(
         executor.memoryLimitBytes,
         DEFAULT_FABRIC_CONFIG.executor.memoryLimitBytes,

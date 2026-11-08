@@ -13,6 +13,8 @@ type ScratchKind = "output" | "shell" | "checkpoint";
 const prefixes: Record<ScratchKind, string> = {
   output: "pi-fabric-output-", shell: "pi-fabric-shell-", checkpoint: "pi-native-reader-",
 };
+/** Directory-name prefix of shell job scratch dirs; the orphan sweep scans for it. */
+export const SCRATCH_SHELL_PREFIX = prefixes.shell;
 const contents: Record<ScratchKind, Set<string>> = {
   output: new Set(["output.txt"]), shell: new Set(["output.log", "child.pid"]),
   checkpoint: new Set(["checkpoint", "pending"]),
@@ -100,6 +102,17 @@ export const closeScratch = (directory: string): void => {
     fs.writeFileSync(path.join(directory, SCRATCH_OWNER_FILE), JSON.stringify({ ...owner, closedAt: Date.now() }), { mode: 0o600 });
     scheduleScratchSweep(path.dirname(directory));
   } catch { /* housekeeping must not fail the operation */ }
+};
+
+/** True when the directory's owning process is gone and never closed it; uncertainty reads as alive. */
+export const scratchOwnerDead = (directory: string): boolean => {
+  try {
+    const owner = readOwner(directory);
+    // This process's own directories are never orphans to it, and a cleanly
+    // closed scratch dir finished its lifecycle (its event already went out).
+    if (!owner || owner.pid === process.pid || owner.closedAt !== undefined) return false;
+    return !ownerAlive(owner);
+  } catch { return false; }
 };
 
 export interface ScratchSweepOptions {

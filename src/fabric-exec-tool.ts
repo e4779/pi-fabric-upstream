@@ -147,12 +147,18 @@ const countLabel = (count: number, singular: string): string =>
 /** A detached program's result arrives as a background event, not a tool result. */
 const FABRIC_DETACHED_OUTPUT_CHARS = 6_000;
 
-const fabricDetachedText = (taskId: string, elapsedMs: number, requested: boolean): string =>
-  `[fabric_exec ${requested ? "started in the background" : `moved to the background by the user after ${Math.max(1, Math.round(elapsedMs / 1_000))}s`} as task ${taskId}. ` +
-  "It keeps running with its tools, child agents, and approvals; its result arrives automatically as a background task event when it finishes. " +
-  "Continue independent work, or end this turn if you need the result. Do not start the same program again. " +
-  "The user can now steer you while it runs. Inspect with tools.call({ref:'tasks.get',args:{id}}); stop with tasks.stop. " +
-  "Its child agents stay steerable with agents.steer.]";
+const fabricDetachedText = (taskId: string, elapsedMs: number, mode: "requested" | "user" | "hang"): string => {
+  const origin = mode === "requested"
+    ? "started in the background"
+    : mode === "hang"
+      ? `auto-detached to the background after ${Math.max(1, Math.round(elapsedMs / 1_000))}s of running (executor.programHangMs; zero-action, no flag was needed)`
+      : `moved to the background by the user after ${Math.max(1, Math.round(elapsedMs / 1_000))}s`;
+  return `[fabric_exec ${origin} as task ${taskId}. ` +
+    "It keeps running with its tools, child agents, and approvals; its result arrives automatically as a background task event when it finishes. " +
+    "Continue independent work, or end this turn if you need the result. Do not start the same program again. " +
+    "The user can now steer you while it runs. Inspect with tools.call({ref:'tasks.get',args:{id}}); stop with tasks.stop. " +
+    "Its child agents stay steerable with agents.steer.]";
+};
 
 export const createFabricExecTool = (
   state: FabricState,
@@ -246,7 +252,7 @@ export const createFabricExecTool = (
         }),
       ),
       background: Type.Optional(Type.Boolean({
-        description: "Run this entire program in the background and return its task handle immediately. Use for long workflows, including waits for required shell or agent results: keep dependent awaits inside this program. Main can do independent work or yield for the completion event instead of opening another foreground wait. Backgrounding is not task completion; do not restart the work or claim success while results are pending.",
+        description: "Run this entire program in the background and return its task handle immediately. Use for long workflows, including waits for required shell or agent results: keep dependent awaits inside this program. Main can do independent work or yield for the completion event instead of opening another foreground wait. Backgrounding is not task completion; do not restart the work or claim success while results are pending. When executor.programHangMs is configured, a program still running past that threshold detaches the same way automatically: write the plain program, no flag needed.",
       })),
       timeout_ms: Type.Optional(Type.Integer({ minimum: 1, description: "Hard whole-script deadline in milliseconds; cannot be extended or paused, capped by executor.maxTimeoutMs." })),
       maxOutputTokens: Type.Optional(Type.Integer({ minimum: 1, description: "Optional per-call output token budget (estimated at four characters per token), capped by executor.maxOutputChars. Omit for full contracts to use the host ceiling; larger results still need projection or paging." })),
@@ -892,8 +898,15 @@ export const createFabricExecTool = (
         cwd: context.cwd,
         ...(signal ? { parentSignal: signal } : {}),
         jobs: () => state.shellJobs,
+        // Zero-action auto-detach (opt-in via executor.programHangMs): a
+        // program still running past the threshold detaches itself and the
+        // call returns its task handle; the wake event delivers the result.
+        ...(state.config.executor.programHangMs > 0 && params.background !== true
+          ? { hangMs: state.config.executor.programHangMs }
+          : {}),
+        ownerId: context.sessionManager.getSessionId(),
       });
-      if (params.background === true) program?.detach();
+      if (params.background === true) program?.detach("requested");
       const execution = state.execution.execute({
         code,
         ...(strings ? { strings } : {}),
@@ -1138,7 +1151,7 @@ export const createFabricExecTool = (
           ),
         ).catch(() => undefined);
         return {
-          content: [{ type: "text", text: fabricDetachedText(raced.job.id, raced.elapsedMs, params.background === true) }],
+          content: [{ type: "text", text: fabricDetachedText(raced.job.id, raced.elapsedMs, raced.reason) }],
           details: undefined,
         };
       }

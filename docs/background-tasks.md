@@ -62,6 +62,31 @@ and suspension rules as shell tasks. The live-task reminder lists running
 programs. A background program never claims a Prewalk handoff, and the shell
 timing bridge below does not report programs.
 
+### Zero-action program hang detach
+
+`executor.programHangMs` (default off) extends the same hand-off to whole
+programs without any flag: a `fabric_exec` still running past the budget
+detaches itself, the call returns the task handle, and the completion event
+still wakes the session. The model writes the plain program; the hang
+threshold manages the foreground/background split, exactly like
+`executor.shellHangMs` does for a nested shell await. The race is honest on
+both sides: a program that settles first returns its result in the foreground,
+unchanged.
+
+### Orphan sweep after a restart
+
+A session restart can abandon a detached task: the wake event aimed at a
+session that no longer exists while the task's log kept the truth. Every
+detached task's log starts with an ownership stamp, `pid <P> session <SID>
+cmd <C>`, written at detach time. With `executor.shellOrphanSweep: true`
+(default off), session start re-reads the stamps and reports this session's
+orphans: dead pid (or a scratch directory whose owning Pi process died),
+non-empty log, newest first, at most five per report. Another session's logs
+are never reported (the stamp is the attribution), and each log is reported
+once per process. The report is one bounded sweep message with the
+untrusted-data preamble; its `details` carry typed orphan records, so no
+consumer parses the text.
+
 Main and a background program can edit the same files at the same time. Detach
 only work whose files Main will not touch, or tell Main what it should leave
 alone.
