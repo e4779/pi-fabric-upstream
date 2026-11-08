@@ -55,13 +55,37 @@ const readTextFile = (label: string, path: string): string => {
   }
 };
 
+export interface JobSettlement {
+  id: string;
+  name: string;
+  state: JobState;
+  error?: string;
+}
+
 export class AgentJobs {
   readonly #jobs = new Map<string, Job>();
 
   constructor(
     private readonly spawn: (args: AgentCommandArgs) => Promise<WorkerSession> = createWorkerSession,
     private readonly cap = 64,
+    /** Completion inbox: called once per terminal transition, never for close(). */
+    private readonly onSettle?: (settlement: JobSettlement) => void,
   ) {}
+
+  #terminal(job: Job): void {
+    job.settle();
+    if (this.onSettle === undefined) return;
+    try {
+      this.onSettle({
+        id: job.id,
+        name: job.name,
+        state: job.state,
+        ...(job.error === undefined ? {} : { error: job.error }),
+      });
+    } catch {
+      /* the inbox must never break the job machinery */
+    }
+  }
 
   submit(args: AgentCommandArgs): string {
     let running = 0;
@@ -89,7 +113,7 @@ export class AgentJobs {
       job.error = `timeout ${args.timeoutMs}ms`;
       job.state = "failed";
       if (job.session !== undefined) void Promise.resolve(job.session.abort()).catch(() => undefined);
-      job.settle();
+      this.#terminal(job);
     }, args.timeoutMs);
     void (async () => {
       let live: WorkerSession;
@@ -99,14 +123,14 @@ export class AgentJobs {
         clearTimeout(timer);
         job.state = "failed";
         job.error = `spawn failed: ${error instanceof Error ? error.message : String(error)}`;
-        job.settle();
+        this.#terminal(job);
         return;
       }
       if (job.state !== "running") {
         // stopped while the session was still spawning
         clearTimeout(timer);
         live.dispose();
-        job.settle();
+        this.#terminal(job);
         return;
       }
       job.session = live;
@@ -127,7 +151,7 @@ export class AgentJobs {
         job.endedAt = Date.now();
         job.partial ??= this.#extractPartial(live); // before dispose: state may empty
         live.dispose();
-        job.settle();
+        this.#terminal(job);
       }
     })();
     return id;
