@@ -128,7 +128,9 @@ export const createDashboardSnapshot = (
   const componentGraph = typeof state.componentGraph === "function"
     ? state.componentGraph() : { components: [], edges: [], cycles: [] };
   const meshEntries = state.config.mesh.enabled ? state.mesh.list("", 200) : [];
-  const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor) ?? [];
+  // Extension-registered jobs never spill: their facade registration is the
+  // handoff, so they are dock rows from the moment they are registered.
+  const shells = state.shellJobs?.list().filter(job => job.spilledAt !== undefined || job.monitor || job.external === true) ?? [];
   const sessionLabel = typeof state.sessionLabel === "function" ? state.sessionLabel() : undefined;
   const residentLogs: Record<string, string> = {};
   if (typeof state.residentAgentForUi === "function") {

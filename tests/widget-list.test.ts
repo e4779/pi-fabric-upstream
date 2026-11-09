@@ -398,6 +398,45 @@ describe("Fabric agent list", () => {
     expect(opened.at(-1)).toMatchObject({ id: "shell-1-0000", kind: "shell", name: "sleep 1" });
   });
 
+  it("lists extension-registered agent jobs by name with the registry's state words", () => {
+    const current = snapshot();
+    current.agents = [];
+    current.actors = [];
+    const marking = { ...theme, fg: (color: string, text: string) => `<${color}>${text}</>`, bold: (text: string) => `<b>${text}</b>` } as unknown as Theme;
+    current.shells = [{
+      id: "3f4985ff-0000", tool: "monitor", command: "agent build", label: "build", external: true,
+      description: "Fix the flaky test", status: "running", startedAt: current.now - 34_000,
+      eventCount: 0, unread: false, stopping: false,
+    }] as NonNullable<FabricDashboardSnapshot["shells"]>;
+    const widget = new FabricWidget(marking, () => current, 6, () => 40, undefined, { release: () => {}, requestRender: () => {}, open: () => {} });
+    // Golden row against a fixed theme: name, state, elapsed, description.
+    expect(widget.render(120)[2]).toBe("<accent>○</> <muted>build</> <muted>running</><dim> · 34s · </><muted>Fix the flaky test</>");
+    // The header counts a worker, never a shell or workflow.
+    expect(widget.render(120)[1]).toContain("1 worker");
+    expect(widget.render(120)[1]).not.toContain("shell");
+    widget.focused = true;
+    widget.selectFirst();
+    expect(widget.render(120)[2]).toContain("<b>build</b>");
+  });
+
+  it("maps settled agent jobs to done/failed/stopped rows", () => {
+    const current = snapshot();
+    current.agents = [];
+    current.actors = [];
+    const at = (status: string, finishedAt?: number) => ({
+      id: `agent-${status}`, tool: "monitor", command: "agent x", label: status, external: true,
+      description: "d", status, startedAt: current.now - 60_000, eventCount: 0, unread: false, stopping: false,
+      ...(finishedAt !== undefined ? { finishedAt } : {}),
+    });
+    current.shells = [at("exited", current.now), at("failed", current.now), at("killed", current.now)] as NonNullable<FabricDashboardSnapshot["shells"]>;
+    const { widget, opened } = setup({ current, maxRows: 8 });
+    const rows = widget.render(120).slice(2).map((line) => line.replace(/^○ (\S+) (\S+).*/, "$1:$2"));
+    expect(rows).toEqual(["exited:done", "failed:failed", "killed:stopped"]);
+    widget.focused = true; widget.selectFirst(); widget.handleInput("\r");
+    // Enter opens the task detail for the exact job id, like a shell row.
+    expect(opened.at(-1)).toMatchObject({ id: "agent-exited", kind: "shell", name: "exited" });
+  });
+
   it("emphasises a selected shell's id like an agent's name", () => {
     const current = snapshot();
     current.agents = [];

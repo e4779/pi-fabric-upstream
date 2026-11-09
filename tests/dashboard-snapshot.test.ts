@@ -455,6 +455,28 @@ describe("dashboard snapshot agent ownership", () => {
   });
 });
 
+describe("dashboard snapshot shell rows", () => {
+  it("lists spilled, monitored and extension-registered jobs; never foreground shells", () => {
+    const job = (id: string, extra: Record<string, unknown>) => ({
+      id, tool: "bash", command: id, status: "running", startedAt: 1,
+      eventCount: 0, unread: false, stopping: false, ...extra,
+    });
+    const state = {
+      ...fakeState([], []),
+      shellJobs: {
+        list: () => [
+          job("foreground", {}),
+          job("spilled", { spilledAt: 2 }),
+          job("registered", { external: true, label: "build", tool: "monitor" }),
+        ],
+      },
+    } as unknown as FabricState;
+    const shells = createDashboardSnapshot(state, []).shells ?? [];
+    expect(shells.map((entry) => entry.id)).toEqual(["spilled", "registered"]);
+    expect(shells[1]).toMatchObject({ label: "build", external: true });
+  });
+});
+
 describe("dashboard snapshot global actors", () => {
   it("renders without templates when the global actor registry cannot be read", () => {
     const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fabric-dashboard-global-"));
