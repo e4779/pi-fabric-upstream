@@ -72,7 +72,7 @@ Beside the three doors above, the engine now publishes typed services on
   the host JobStore with typed wake events carrying stopReason (see
   docs/background-tasks.md).
 - Tool-result card contract: a versioned details union any tool can adopt;
-  the renderer refuses rather than guesses and emits
+  the renderer refuses (never guesses) and emits
   `pi-fabric:render:card:v1` telemetry on every refusal/fallback (see
   docs/tool-result-card.md; opt-out: ui.toolResultCards /
   PI_FABRIC_TOOL_RESULT_CARDS=off).
