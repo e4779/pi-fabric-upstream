@@ -685,7 +685,7 @@ An owner keeps its host ID across restarts (a Pi session's Main ID, or a residen
 
 Connected does not mean active: `agents.peers()` keeps idle sessions visible so their work is not accidentally overwritten. For routine updates, choose only relevant peers whose `status` is `"running"` or whose `pendingMessages` is true; do not broadcast every progress update to every open session.
 
-Peer-root `agents.steer` and `agents.followUp` messages **wake an idle peer** (background-task wake semantics): the receiving session starts a run at once instead of waiting for its next natural turn. A peer with a turn in flight queues the message behind that turn and delivers it when the turn completes; in-flight work is never aborted or interrupted. Explicit `triggerTurn: false` keeps delivery passive: it never wakes an idle peer. Child/actor feedback to Main and human messages retain their existing behavior. Avoid acknowledgement-only replies to informational peer updates.
+Peer-root `agents.steer` and `agents.followUp` messages **wake an idle peer** (background-task wake semantics): the receiving session starts a run at once other than waiting for its next natural turn. A peer with a turn in flight queues the message behind that turn and delivers it when the turn completes; in-flight work is never aborted or interrupted. Explicit `triggerTurn: false` keeps delivery passive: it never wakes an idle peer. Child/actor feedback to Main and human messages retain their existing behavior. Avoid acknowledgement-only replies to informational peer updates.
 
 ```ts
 const activePeers = (await agents.peers()).filter(peer =>
