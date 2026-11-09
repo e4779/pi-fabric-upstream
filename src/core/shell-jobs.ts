@@ -338,6 +338,15 @@ export interface FabricShellJobOptions {
   cwd?: string;
   ownerId?: string;
   description?: string;
+  /** Display name for an extension-registered job; the dock lists it as the row's name. */
+  label?: string;
+  /**
+   * Set by the extension-facing registration facade: background work owned
+   * elsewhere, with no local process to spill or kill. It lists in the dock,
+   * its completion delivers through the one wake channel, and the shell hang
+   * keys (background/kill the waiting shell) leave it alone.
+   */
+  external?: true;
   monitor?: ShellMonitorOptions;
   /**
    * The caller's own process timeout. When set, a monitor's expiry ends only the
@@ -372,6 +381,10 @@ export interface FabricShellJobInfo {
   cwd?: string;
   ownerId?: string;
   description?: string;
+  /** Display name for an extension-registered job; see `FabricShellJobOptions.label`. */
+  label?: string;
+  /** Present on jobs registered through the extension-facing facade. */
+  external?: true;
   lastOutputAt?: number;
   monitor?: ShellMonitorOptions;
   /** When the monitor's watch expired while its process kept running. */
@@ -712,7 +725,9 @@ class FabricShellJob implements FabricShellJobHandle {
     if (this.finished) return false;
     if (stopReason !== undefined) this.#stopReason ??= stopReason;
     // A fast exit can beat the provider's persistLog continuation after spill.
-    const persistence = this.spilled && !this.logPath ? this.persistLog() : undefined;
+    // An extension-registered job never spills, but its owner's completion
+    // payload is still the job's retained tail: persist it the same way.
+    const persistence = (this.spilled || this.options.external === true) && !this.logPath ? this.persistLog() : undefined;
     const output = this.snapshotText(this.tool === "fabric_exec" ? PROGRAM_SUMMARY_BYTES : 2000);
     this.finished = true;
     this.#outputObservers.clear();
@@ -918,8 +933,9 @@ export class FabricShellJobStore {
     return [...this.#jobs.values()].map((job) => job.info());
   }
 
+  /** Tasks this session may still background or kill on demand: waiting local shells and programs, never extension-registered work that is already backgrounded where its owner runs. */
   waiting(): FabricShellJob[] {
-    return [...this.#jobs.values()].filter((job) => !job.spilled && !job.finished);
+    return [...this.#jobs.values()].filter((job) => !job.spilled && !job.finished && job.options.external !== true);
   }
 
   live(): FabricShellJob[] {

@@ -53,10 +53,12 @@ describe("fabric bg service facade (registerJob/unregister/subscribe/notifyCompl
     if (!result.ok) return;
     expect(result.info.command).toBe("bun run build");
     expect(result.info.description).toBe("build");
-    // The register channel's contract is background work: the job is spilled
-    // at registration so its completion wakes through the session inbox.
-    expect(result.info.status).toBe("spilled");
-    expect(result.info.spilledAt).toBeDefined();
+    // The register channel's contract is background work owned elsewhere: the
+    // job is marked external at registration (no local process to spill), and
+    // its completion wakes through the session inbox's external delivery.
+    expect(result.info.external).toBe(true);
+    expect(result.info.status).toBe("running");
+    expect(result.info.spilledAt).toBeUndefined();
     expect(store.get(result.jobId)).toBeDefined();
     // The facade wraps the store's own handle: no second registry exists.
     expect(store.list()).toHaveLength(1);
@@ -71,6 +73,36 @@ describe("fabric bg service facade (registerJob/unregister/subscribe/notifyCompl
     if (!result.ok) return;
     expect(result.jobId).toBe("alias-job");
     expect(store.get("alias-job")).toBeDefined();
+  });
+
+  it("registerJob marks the job external and carries the label into the store", () => {
+    const store = new FabricShellJobStore(tempRoot());
+    const service = createFabricBgServiceFacade(() => store);
+    const result = service.registerJob("monitor", "agent build", { id: "agent-1", label: "build", description: "Fix the flaky test" });
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.info.external).toBe(true);
+    expect(result.info.label).toBe("build");
+    expect(store.get("agent-1")?.info().label).toBe("build");
+    // Extension-registered work is background where its owner runs: the shell
+    // hang keys (background/kill the waiting shell) must leave it alone.
+    expect(store.waiting()).toHaveLength(0);
+  });
+
+  it("notifyCompletion lands a typed stopReason on the finished job", async () => {
+    const store = new FabricShellJobStore(tempRoot());
+    const service = createFabricBgServiceFacade(() => store);
+    const job = service.registerJob("monitor", "agent build", { id: "agent-2", label: "build" });
+    if (!job.ok) throw new Error("registration failed");
+    store.get("agent-2")?.stop(); // the dock's double-x stop: a typed user stop on the store handle
+    const events: FabricShellJobEvent[] = [];
+    store.subscribe((event) => events.push(event));
+    await expect(service.notifyCompletion("agent-2", "stopped by operator", { stopReason: "user" }))
+      .resolves.toEqual({ ok: true });
+    const finished = events.find((event) => event.type === "finished");
+    expect(finished?.job.status).toBe("killed");
+    expect(finished?.job.stopReason).toBe("user");
+    expect(finished?.output).toContain("stopped by operator");
   });
 
   it("registerJob reports an existing stable id as ok:false, not a throw", () => {
@@ -349,16 +381,18 @@ describe("fabric bg service protocol readers", () => {
       version: 1,
       tool: "fabric_exec",
       command: "run()",
-      options: { id: "job-1", ownerId: "session-1", description: "desc", cwd: "/tmp" },
+      options: { id: "job-1", ownerId: "session-1", description: "desc", cwd: "/tmp", label: "build" },
       respond,
     });
     expect(registration).toEqual({
       version: 1,
       tool: "fabric_exec",
       command: "run()",
-      options: { id: "job-1", ownerId: "session-1", description: "desc", cwd: "/tmp" },
+      options: { id: "job-1", ownerId: "session-1", description: "desc", cwd: "/tmp", label: "build" },
       respond,
     });
+    expect(readFabricShellJobRegistrationV1({ version: 1, tool: "bash", command: "ls", options: { label: "" } }))
+      .toBeUndefined();
   });
 
   it("rejects malformed registrations", () => {
@@ -391,6 +425,12 @@ describe("fabric bg service protocol readers", () => {
       ...valid,
       exitCode: 1,
     });
+    // Typed stop reasons ride additively; an unknown one refuses the completion.
+    expect(readFabricShellJobCompletionV1({ ...valid, stopReason: "user" })).toEqual({
+      ...valid,
+      stopReason: "user",
+    });
+    expect(readFabricShellJobCompletionV1({ ...valid, stopReason: "vibes" })).toBeUndefined();
     expect(readFabricShellJobCompletionV1({ ...valid, payload: "" })).toBeDefined(); // empty payload is legal
     expect(readFabricShellJobCompletionV1({ ...valid, payload: "x".repeat(MAX_FABRIC_SHELL_JOB_PAYLOAD + 1) }))
       .toBeUndefined();

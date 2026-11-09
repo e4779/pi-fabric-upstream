@@ -1029,6 +1029,8 @@ export type FabricShellJobRegistrationOptionsV1 = {
   /** Owning session or agent id, stamped into the durable log header. */
   ownerId?: string;
   description?: string;
+  /** Short display name; the dock lists it as the job row's name (additive, v1). */
+  label?: string;
 };
 
 export type FabricShellJobRegistrationResultV1 =
@@ -1096,19 +1098,20 @@ const FABRIC_SHELL_COMPLETION_STOP_REASONS: ReadonlySet<string> = new Set([
 const readRegistrationOptionsV1 = (
   record: Record<string, unknown>,
 ): FabricShellJobRegistrationOptionsV1 | undefined => {
-  const { id, cwd, ownerId, description } = record as {
-    id?: unknown; cwd?: unknown; ownerId?: unknown; description?: unknown;
+  const { id, cwd, ownerId, description, label } = record as {
+    id?: unknown; cwd?: unknown; ownerId?: unknown; description?: unknown; label?: unknown;
   };
   const bounded = (value: unknown): value is string | undefined =>
     value === undefined || boundedString(value, MAX_FABRIC_SHELL_JOB_ID);
   const described = (value: unknown): value is string | undefined =>
     value === undefined || boundedString(value, MAX_FABRIC_SHELL_JOB_COMMAND);
-  if (!bounded(id) || !bounded(cwd) || !bounded(ownerId) || !described(description)) return undefined;
+  if (!bounded(id) || !bounded(cwd) || !bounded(ownerId) || !described(description) || !bounded(label)) return undefined;
   return {
     ...(id !== undefined ? { id } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
     ...(ownerId !== undefined ? { ownerId } : {}),
     ...(description !== undefined ? { description } : {}),
+    ...(label !== undefined ? { label } : {}),
   };
 };
 

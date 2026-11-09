@@ -42,13 +42,13 @@ export const createFabricBgServiceFacade = (
     try {
       const store = resolveStore();
       if (!store) throw unavailable();
-      const job = store.begin(tool, command, options);
-      // The register channel's contract is background work: the job runs
-      // outside the current turn and its completion must wake the session.
-      // Spilling is the store's own marker for exactly that; without it the
-      // inbox would drop the finished event and the documented single
-      // sanctioned delivery channel would never fire for facade jobs.
-      job.spill();
+      // Registration through this facade is by definition background work owned
+      // elsewhere: no local process to spill or kill, listed in the dock and
+      // delivered through the one wake channel (see FabricShellJobOptions).
+      // The `external` mark is the store's own marker for exactly that: the
+      // session inbox delivers the job's completion through the one wake
+      // channel without a registration-time spill.
+      const job = store.begin(tool, command, { ...(options ?? {}), external: true });
       return { ok: true, jobId: job.id, info: job.info() };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
