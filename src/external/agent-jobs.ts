@@ -23,6 +23,7 @@ import type { ExternalCommandHandler } from "./bridge.js";
 export const AGENT_JOBS_HELP = [
   "agent job subcommands:",
   "  agent submit <agent key=value lines>   start a worker; replies id=<uuid>",
+  "    optional job keys: name=<label>, jobTool=bash|powershell|fabric_exec|monitor",
   "  agent status <id>                      peek: state, name, elapsed",
   "  agent wait <id> [timeoutMs=<n>]        join (blocks the connection)",
   "  agent result <id>                      final text/JSON; ERR while running",
@@ -46,6 +47,7 @@ interface Job {
   partial?: string | undefined;
   json: boolean;
   prompt: string;
+  jobTool?: import("../protocol.js").FabricBgJobToolV1;
   session?: WorkerSession | undefined;
   timer?: ReturnType<typeof setTimeout>;
   done: Promise<void>;
@@ -75,6 +77,8 @@ export interface AgentJobEntry {
   error?: string;
   /** The submitted prompt; consumers bound it themselves before publishing. */
   prompt: string;
+  /** Caller-chosen JobStore registration kind; absent means the mirror default. */
+  jobTool?: import("../protocol.js").FabricBgJobToolV1;
   submittedAt: number;
   endedAt?: number;
 }
@@ -133,6 +137,7 @@ export class AgentJobs {
       submittedAt: Date.now(),
       json: args.json,
       prompt: args.prompt,
+      ...(args.jobTool !== undefined ? { jobTool: args.jobTool } : {}),
       session: undefined,
       done,
       settle,
@@ -273,6 +278,7 @@ export class AgentJobs {
         state: job.state,
         ...(job.error === undefined ? {} : { error: job.error }),
         prompt: job.prompt,
+        ...(job.jobTool === undefined ? {} : { jobTool: job.jobTool }),
         submittedAt: job.submittedAt,
         ...(job.endedAt === undefined ? {} : { endedAt: job.endedAt }),
       }))
