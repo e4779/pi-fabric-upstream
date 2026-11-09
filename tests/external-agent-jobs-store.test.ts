@@ -261,6 +261,17 @@ describe("agent jobs mirrored into the host JobStore", () => {
     expect(fresh.get(done)?.info().status).toBe("exited");
   });
 
+  it("registers under the caller's optional jobTool, the mirror's optional default, or monitor", async () => {
+    const h = harness();
+    const picked = h.jobs.submit(args({ name: "picked", jobTool: "bash" }));
+    const defaulted = h.jobs.submit(args({ name: "defaulted" }));
+    await settleMicrotasks();
+    h.mirror.sync();
+    const tools = new Map(h.store()!.list().filter((job) => job.external === true).map((job) => [job.id, job.tool]));
+    expect(tools.get(picked)).toBe("bash");
+    expect(tools.get(defaulted)).toBe("monitor");
+  });
+
   it("refuses nothing silently: registration and settle refusals surface as telemetry", async () => {
     const h = harness();
     h.switchStore();

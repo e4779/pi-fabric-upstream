@@ -1,5 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { FabricShellJobInfo } from "../protocol.js";
+import type { FabricBgJobToolV1, FabricShellJobInfo } from "../protocol.js";
 import type { FabricShellJobStore, FabricShellStopReason } from "../core/shell-jobs.js";
 import {
   FABRIC_SHELL_JOB_NOTIFY_EVENT,
@@ -44,6 +44,9 @@ export interface FabricAgentJobsStoreTelemetryV1 {
   error?: string;
 }
 
+/** Conservative default registration kind: external work observed by the host. */
+export const AGENT_JOBS_DEFAULT_TOOL: FabricBgJobToolV1 = "monitor";
+
 /** Display-name bound for registered labels; a name is a handle, not prose. */
 const LABEL_MAX = 64;
 /** Description bound: the registered description is a prompt head, not the prompt. */
@@ -87,6 +90,12 @@ export interface AgentJobsStoreMirrorOptions {
   ownerId: () => string | undefined;
   /** Config gate: false keeps the registry the dock's only view (rollback switch). */
   enabled: () => boolean;
+  /**
+   * JobStore registration kind for jobs that did not pick one (the optional
+   * per-job `jobTool` wins). Optional with the conservative default
+   * `monitor`; the union stays closed — no new kind is minted here.
+   */
+  tool?: FabricBgJobToolV1;
   /** The registry's stop for one job id; wired to the real `AgentJobs.stop`. */
   stop: (id: string) => void;
   /** Fired when a mirror action changed the store (footer/dock redraw). */
@@ -126,9 +135,10 @@ export class AgentJobsStoreMirror {
 
   #register(entry: AgentJobEntry): void {
     const ownerId = this.options.ownerId();
+    const tool = entry.jobTool ?? this.options.tool ?? AGENT_JOBS_DEFAULT_TOOL;
     this.options.pi.events.emit(FABRIC_SHELL_JOB_REGISTER_EVENT, {
       version: 1,
-      tool: "monitor",
+      tool,
       command: `agent ${entry.name}`,
       options: {
         id: entry.id,

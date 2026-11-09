@@ -63,6 +63,14 @@ describe("external agent argv parsing", () => {
     expect(() => parseAgentArgv([`promptFile=${promptFile()}`, "timeoutMs=soon"])).toThrow(/positive integer/);
     expect(() => parseAgentArgv(["promptFile=/nonexistent/nowhere.txt"])).toThrow(/cannot read promptFile/);
   });
+
+  it("accepts an optional jobTool and refuses an unknown kind by name", () => {
+    const args = parseAgentArgv([`promptFile=${promptFile()}`, "name=build", "jobTool=bash"]);
+    expect(args.jobTool).toBe("bash");
+    expect(parseAgentArgv([`promptFile=${promptFile()}`]).jobTool).toBeUndefined();
+    expect(() => parseAgentArgv([`promptFile=${promptFile()}`, "jobTool=agent"]))
+      .toThrow(/jobTool must be one of bash\|powershell\|fabric_exec\|monitor, got: agent/);
+  });
 });
 
 describe("final assistant text extraction", () => {

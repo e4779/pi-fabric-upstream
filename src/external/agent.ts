@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { Value } from "typebox/value";
+import { isFabricBgJobToolV1, type FabricBgJobToolV1 } from "../protocol.js";
 import type { ExternalCommandHandler } from "./bridge.js";
 
 /**
@@ -27,6 +28,8 @@ export const AGENT_ARGV_HELP = [
   "  maxTokens=<n>       positive integer; accepted syntactically but rejected: the SDK",
   "                      exposes no per-session max-tokens option (models.json only)",
   "  name=<label>        job label for lists (job form only)",
+  "  jobTool=<kind>      background-job kind the JobStore dock lists this job under:",
+  "                      bash|powershell|fabric_exec|monitor (default: monitor)",
 ].join("\n");
 
 export const DEFAULT_AGENT_TIMEOUT_MS = 600_000;
@@ -48,6 +51,8 @@ export interface AgentCommandArgs {
   json: boolean;
   schema?: Record<string, unknown>;
   name?: string;
+  /** JobStore registration kind for the job form; default is `monitor`. */
+  jobTool?: FabricBgJobToolV1;
 }
 
 export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
@@ -60,9 +65,14 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
     const key = line.slice(0, separator);
     const value = line.slice(separator + 1);
     if (
-      !["promptFile", "tools", "cwd", "model", "thinking", "timeoutMs", "json", "schemaFile", "maxTokens", "name"].includes(key)
+      !["promptFile", "tools", "cwd", "model", "thinking", "timeoutMs", "json", "schemaFile", "maxTokens", "name", "jobTool"].includes(key)
     ) {
       throw new Error(`unknown agent argument: ${key}\n${AGENT_ARGV_HELP}`);
+    }
+    if (key === "jobTool" && !isFabricBgJobToolV1(value)) {
+      // Refuse-not-guess: the JobStore kind union stays closed; an unknown
+      // kind names the allowed values instead of mimicking one.
+      throw new Error(`jobTool must be one of bash|powershell|fabric_exec|monitor, got: ${value}\n${AGENT_ARGV_HELP}`);
     }
     if (
       key === "thinking" &&
@@ -132,6 +142,7 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
     json: raw.json === "on",
     ...(schema ? { schema } : {}),
     ...(raw.name ? { name: raw.name } : {}),
+    ...(raw.jobTool !== undefined && raw.jobTool !== "" ? { jobTool: raw.jobTool as FabricBgJobToolV1 } : {}),
   };
 };
 
