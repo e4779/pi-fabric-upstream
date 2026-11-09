@@ -137,6 +137,54 @@ describe("append-only shell awareness", () => {
   });
 });
 
+describe("extension-registered job delivery", () => {
+  const beginExternal = (h: ReturnType<typeof harness>, label = "build") =>
+    h.jobs.begin("monitor", `agent ${label}`, { external: true, label, description: "Fix the flaky test" });
+
+  it("announces an external job at registration and delivers its settlement without a spill", async () => {
+    const h = harness(); const job = beginExternal(h);
+    const note = (value: any): string => {
+      expect(value.content[1].text.startsWith(`[${SHELL_AWARENESS_MESSAGE_TYPE}]`)).toBe(true);
+      return value.content[1].text;
+    };
+    const result = h.emit("tool_result", { type: "tool_result", toolCallId: "call", toolName: "fabric_exec", input: {}, content: [{ type: "text", text: "busy" }], isError: false });
+    expect(note(result)).toContain(`Task ${job.id} [completion wakes agent]: "build"`);
+    job.append(Buffer.from("Job build (id): done\nFetch: ai agent result"));
+    await job.finish(0);
+    h.emit("turn_end");
+    expect(h.sendMessage).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      customType: SHELL_MESSAGE_TYPE,
+      content: expect.stringContaining(`Agent job build (${job.id}): done`),
+      details: { ids: [job.id], events: [expect.objectContaining({ kind: "wake", id: job.id, status: "exited", label: "build" })] },
+    }), { deliverAs: "steer", triggerTurn: true });
+  });
+
+  it("delivers a user-stopped external job (killed) and stays quiet for killed local shells", async () => {
+    const h = harness(); h.idle();
+    const external = beginExternal(h, "audit");
+    const local = h.begin(); // spilled shell: a killed one never wakes
+    external.stop();
+    local.stop();
+    await external.finish(0, undefined, "user");
+    await local.finish(null);
+    h.emit("turn_end");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(h.sendMessage).toHaveBeenCalledOnce();
+    const message = h.sendMessage.mock.calls[0]![0];
+    expect(message.details.ids).toEqual([external.id]);
+    expect(message.content).toContain("Agent job audit");
+    expect(message.content).toContain("stopped after");
+    expect(message.content).not.toContain("killed");
+  });
+
+  it("counts a live external job for idle cache warming", () => {
+    const h = harness();
+    beginExternal(h);
+    const idleStop = { action: "stop", continuationProbability: 0.1, missCost: 10, warmCost: 1 } as never;
+    expect(h.emit("cache_warming_decision", idleStop)).toEqual({ action: "warm" });
+  });
+});
+
 describe("idle cache warming while spilled work can wake the owner", () => {
   // Pi's idle decision: 15% continuation, so 0.15 * 0.46 - 0.05 < 0.05 and it stops.
   const idleStop = { type: "cache_warming_decision", action: "stop", continuationProbability: 0.15, missCost: 0.46, warmCost: 0.05 };
