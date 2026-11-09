@@ -501,6 +501,12 @@ export interface FabricExternalConfig {
   expectTool: string;
   /** Directory for the per-session bridge socket; empty = ~/.pi/agent/sock. */
   socketDir: string;
+  /**
+   * Mirror bridge agent jobs into the host JobStore (dock rows, footer
+   * counter, settlement wake through ShellEventInbox). False is the
+   * rollback switch: the bridge registry alone drives visibility again.
+   */
+  agentJobsStore: boolean;
 }
 
 export interface FabricConfig {
@@ -568,7 +574,7 @@ export const maxExecutorMemoryLimitBytes = (
 export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
   fullCodeMode: true,
   surface: "fabric-exec",
-  external: { expectTool: "", socketDir: "" },
+  external: { expectTool: "", socketDir: "", agentJobsStore: true },
   executor: {
     kernel: "typescript",
     pythonRuntime: "monty",
@@ -1157,6 +1163,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
     external: {
       expectTool: stringValue(external.expectTool)?.trim() ?? "",
       socketDir: stringValue(external.socketDir)?.trim() ?? "",
+      agentJobsStore: booleanValue(external.agentJobsStore, DEFAULT_FABRIC_CONFIG.external.agentJobsStore),
     },
     executor: {
       kernel: executorKernel,

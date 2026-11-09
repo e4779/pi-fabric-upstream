@@ -159,6 +159,8 @@ export interface FabricShellWakeEvent {
   seconds: number;
   command: string;
   description?: string;
+  /** Display name of an extension-registered job (additive); absent on shell tasks. */
+  label?: string;
   logPath?: string;
   tail: string;
 }
@@ -178,6 +180,7 @@ export const buildShellWakeEvent = (
   seconds: Math.max(0, Math.round(((job.finishedAt ?? options.now ?? Date.now()) - job.startedAt) / 1_000)),
   command: job.command,
   ...(job.description !== undefined ? { description: job.description } : {}),
+  ...(job.label !== undefined ? { label: job.label } : {}),
   ...(job.logPath !== undefined ? { logPath: job.logPath } : {}),
   tail: options.output ?? "",
 });

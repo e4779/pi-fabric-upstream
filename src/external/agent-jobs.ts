@@ -45,6 +45,7 @@ interface Job {
   lines?: string[];
   partial?: string | undefined;
   json: boolean;
+  prompt: string;
   session?: WorkerSession | undefined;
   timer?: ReturnType<typeof setTimeout>;
   done: Promise<void>;
@@ -64,6 +65,18 @@ export interface JobSettlement {
   name: string;
   state: JobState;
   error?: string;
+}
+
+/** Typed registry view for observers that must not parse the CLI lines. */
+export interface AgentJobEntry {
+  id: string;
+  name: string;
+  state: JobState;
+  error?: string;
+  /** The submitted prompt; consumers bound it themselves before publishing. */
+  prompt: string;
+  submittedAt: number;
+  endedAt?: number;
 }
 
 export class AgentJobs {
@@ -119,6 +132,7 @@ export class AgentJobs {
       state: "running",
       submittedAt: Date.now(),
       json: args.json,
+      prompt: args.prompt,
       session: undefined,
       done,
       settle,
@@ -248,6 +262,21 @@ export class AgentJobs {
     return [...this.#jobs.values()]
       .map((job) => `${job.id} ${job.state} name=${job.name} elapsedMs=${(job.endedAt ?? Date.now()) - job.submittedAt}`)
       .sort();
+  }
+
+  /** Typed snapshot of every job, oldest first; the store mirror's source of truth. */
+  entries(): AgentJobEntry[] {
+    return [...this.#jobs.values()]
+      .map((job) => ({
+        id: job.id,
+        name: job.name,
+        state: job.state,
+        ...(job.error === undefined ? {} : { error: job.error }),
+        prompt: job.prompt,
+        submittedAt: job.submittedAt,
+        ...(job.endedAt === undefined ? {} : { endedAt: job.endedAt }),
+      }))
+      .sort((left, right) => left.submittedAt - right.submittedAt);
   }
 
   #extractPartial(session: WorkerSession): string | undefined {
