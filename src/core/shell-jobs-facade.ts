@@ -83,7 +83,12 @@ export const createFabricBgServiceFacade = (
         // and carried by the finished event's typed wake tail. Provenance is
         // written once into the log, not into model-facing text.
         if (payload.length > 0) job.append(Buffer.from(payload, "utf8"));
-        await job.finish(options?.exitCode ?? 0, "[Completed by owner via notifyCompletion]");
+        // finish() answers whether THIS call performed the terminal transition.
+        // A concurrent finisher (session close, process exit) landing between
+        // the finished check and this call must not be reported as ok:true with
+        // the payload dropped.
+        const finished = await job.finish(options?.exitCode ?? 0, "[Completed by owner via notifyCompletion]");
+        if (!finished) return { ok: false, error: `Background job already finished: ${jobId}` };
         return { ok: true };
       } catch (error) {
         return { ok: false, error: error instanceof Error ? error.message : String(error) };

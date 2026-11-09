@@ -82,10 +82,19 @@ cmd <C>`, written at detach time. With `executor.shellOrphanSweep: true`
 (default off), session start re-reads the stamps and reports this session's
 orphans: dead pid (or a scratch directory whose owning Pi process died),
 non-empty log, newest first, at most five per report. Another session's logs
-are never reported (the stamp is the attribution), and each log is reported
-exactly once: delivering the report writes a durable reap mark next to the log
-(pruned with it), so a restarted session never re-reports the same leftovers and
-cannot self-wake in a loop. The report is one bounded sweep message with the
+are never reported (the stamp is the attribution). Delivering the report writes
+a durable reap mark next to the log (pruned with it), so a restarted session
+never re-reports the same leftovers and cannot self-wake in a loop.
+
+The mark makes each log at-most-once per delivered report, with one window:
+between a sweep finding a log and the delivery that writes its mark, the mark
+does not exist yet, so a concurrent process or a crash-restart chain can report
+the same log a second time. A duplicate stays bounded: same session, stamped
+logs only, at most five per report. A mark write that fails (directory gone,
+permission, disk) is surfaced as telemetry (`pi-fabric:shell:reap-mark:v1` on
+`pi.events`, carrying the task id, log path and error) and logged, and that log
+returns to the next restart's sweep; the report itself was still delivered once
+for that run. The report is one bounded sweep message with the
 untrusted-data preamble; its `details` carry typed orphan records, so no
 consumer parses the text.
 
@@ -477,3 +486,27 @@ keeps its filtering/protection. PowerShell monitors require the host's tracked s
 operations API. The tasks provider is installed with the native Pi provider in full
 code mode (and schema enforce, whose authorization rules still apply), not in
 orchestration-only mode or closed-world managed hosts.
+
+## Extension-facing job service
+
+The host job store behind `pi.bash({background: true})` is published to
+extensions as `pi.events` channels (`pi-fabric:shell-job:register:v1`,
+`pi-fabric:shell-job:subscribe:v1`, `pi-fabric:shell-job:notify-completion:v1`,
+exported from `pi-fabric/protocol`): `registerJob`, `unregister`, `subscribe`,
+`notifyCompletion`. A completion lands as the job's terminal store event and
+reaches the owning session through the same bounded wake channel as any other
+background event, untrusted preamble included.
+
+`notifyCompletion(jobId, payload, options)` carries `options.exitCode` and
+nothing else. There is no status enum on the v1 channel: exit code zero maps to
+the task's `exited` state with the derived `completed` stop reason, and any
+other exit code maps to `failed` with no stop reason. A bridge completion that
+needs a typed terminal cause should deliver an empty payload and let the wake
+event's `stopReason` name the outcome. Until a status field exists on the
+channel, the typed details union must treat `notifyCompletion` input as
+untyped and refuse to guess a terminal state from a bare exit code.
+
+The channel answers `ok:false` when the job is unknown or when another
+finisher (session close, process exit) already performed the terminal
+transition; an owner whose payload could not land then knows to inspect the
+task, never to assume delivery.

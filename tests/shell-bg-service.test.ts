@@ -7,8 +7,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { processAlive, SCRATCH_OWNER_FILE, SCRATCH_SHELL_PREFIX } from "../src/storage/scratch.js";
 import {
   buildShellWakeEvent,
+  FABRIC_SHELL_REAP_MARK_EVENT,
   FabricShellJobStore,
   findShellOrphans,
+  raceShellHang,
   formatShellOwnershipStamp,
   formatShellWakeText,
   markShellOrphanReported,
@@ -19,7 +21,9 @@ import {
   SHELL_WAKE_PREAMBLE,
   SHELL_WAKE_SCHEMA_VERSION,
   type FabricShellJobEvent,
+  type FabricShellReapMarkEventV1,
 } from "../src/core/shell-jobs.js";
+import { createFabricBgServiceFacade } from "../src/core/shell-jobs-facade.js";
 import { parseShellMonitor } from "../src/core/shell-monitor.js";
 import { FabricProgramTasks } from "../src/core/program-tasks.js";
 import { ShellEventInbox, SHELL_MESSAGE_TYPE, SHELL_SWEEP_MESSAGE_TYPE, SHELL_SWEEP_SCHEMA_VERSION } from "../src/core/shell-inbox.js";
@@ -195,6 +199,51 @@ describe("session-scoped orphan sweep", () => {
     cleanups.push(() => void restarted.close());
     expect(restarted.sweepOrphans("mine")).toEqual([]);
     expect(findShellOrphans({ tempRoot, owner: "mine" })).toEqual([]);
+  });
+
+  it("records the reap mark once and names a concurrent mark as already done", () => {
+    const tempRoot = root();
+    const logPath = writeOrphanLog(tempRoot, "aaaaaa", { pid: deadPid(), session: "mine", body: "x\n" });
+    expect(markShellOrphanReported(logPath)).toEqual({ status: "written" });
+    // Another delivery winning the wx write is success, not a failure.
+    expect(markShellOrphanReported(logPath)).toEqual({ status: "already-marked" });
+  });
+
+  it("reports a reap-mark write failure instead of swallowing it", () => {
+    const tempRoot = root();
+    const logPath = writeOrphanLog(tempRoot, "aaaaaa", { pid: deadPid(), session: "mine", body: "x\n" });
+    fs.rmSync(path.dirname(logPath), { recursive: true, force: true });
+    const result = markShellOrphanReported(logPath);
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("ENOENT");
+  });
+
+  it("emits reap-mark telemetry when the mark cannot land", async () => {
+    vi.useFakeTimers();
+    const tempRoot = root();
+    const logPath = writeOrphanLog(tempRoot, "aaaaaa", { pid: deadPid(), session: "mine", body: "build died mid-run\n" });
+    // The scratch dir vanished between sweep and delivery: the write must fail loudly.
+    fs.rmSync(path.dirname(logPath), { recursive: true, force: true });
+    const sendMessage = vi.fn();
+    const marks: FabricShellReapMarkEventV1[] = [];
+    const ctx = { hasUI: false, ui: { notify: vi.fn() }, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
+    const pi = {
+      sendMessage,
+      on: () => () => {},
+      events: { emit: (channel: string, payload: unknown) => { if (channel === FABRIC_SHELL_REAP_MARK_EVENT) marks.push(payload as FabricShellReapMarkEventV1); } },
+    } as unknown as ExtensionAPI;
+    const jobs = new FabricShellJobStore(tempRoot);
+    cleanups.push(() => void jobs.close());
+    const inbox = new ShellEventInbox(pi, ctx, jobs);
+    cleanups.push(() => inbox.close());
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    inbox.reportOrphans([{ id: "aaaaaa", session: "mine", command: "bun run build", logPath, tail: "build died mid-run", mtimeMs: 1 }]);
+    await vi.advanceTimersByTimeAsync(100);
+    warn.mockRestore();
+    // The report itself is still delivered; the failed mark rides telemetry.
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0]![0].customType).toBe(SHELL_SWEEP_MESSAGE_TYPE);
+    expect(marks).toEqual([{ version: 1, taskId: "aaaaaa", logPath, error: expect.stringContaining("ENOENT") }]);
   });
 
   it("prunes a stale reap mark once its log disappears", () => {
@@ -449,5 +498,97 @@ describe("store registry API for tools", () => {
     expect(jobs.prune()).toBe(1);
     expect(jobs.get(keep.id)).toBeUndefined();
     vi.restoreAllMocks();
+  });
+});
+
+describe("typed stops and terminal races", () => {
+  const tempRootFor = (): { jobs: FabricShellJobStore } => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bg-stops-"));
+    cleanups.push(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+    const jobs = new FabricShellJobStore(tempRoot);
+    cleanups.push(() => void jobs.close());
+    return { jobs };
+  };
+  const wakeMonitor = () => parseShellMonitor({ delivery: "wake", timeoutMs: 1000, intervalMs: 1000 })!;
+
+  it("a late monitor deadline cannot latch timed_out onto an already stopped task", async () => {
+    vi.useFakeTimers();
+    const { jobs } = tempRootFor();
+    // A stopper that won the race (a user kill, then a session close naming its stop)
+    // aborts first; the pending monitor deadline fires afterwards.
+    const killed = jobs.begin("bash", "watch CI", { monitor: wakeMonitor() });
+    killed.abort.abort(new Error("Command aborted"));
+    await vi.advanceTimersByTimeAsync(1200);
+    await killed.finish(null, undefined, "session-shutdown");
+    // The old pairing bug produced "timed_out [stopped: session-shutdown]".
+    expect(killed.info()).toMatchObject({ status: "killed", stopReason: "session-shutdown" });
+  });
+
+  it("killWaiting and close stop through typed stop: the deadline is cleared and the stop is named", async () => {
+    vi.useFakeTimers();
+    const { jobs } = tempRootFor();
+    const events: FabricShellJobEvent[] = [];
+    jobs.subscribe(event => events.push(event));
+    const killed = jobs.begin("bash", "watch", { monitor: wakeMonitor() });
+    jobs.killWaiting();
+    expect(killed.abort.signal.aborted).toBe(true);
+    expect(events.at(-1)?.type).toBe("stopping");
+    await vi.advanceTimersByTimeAsync(1200); // the deadline was cleared with the abort
+    await killed.finish(null);
+    expect(killed.info()).toMatchObject({ status: "killed", stopReason: "user" });
+    const closing = jobs.begin("bash", "watch", { monitor: wakeMonitor() });
+    await jobs.close();
+    expect(closing.info()).toMatchObject({ status: "killed", stopReason: "session-shutdown" });
+    expect(closing.info().status).not.toBe("timed_out");
+  });
+
+  it("names a spill-path execution failure as a typed runtime error, never a bare failed", async () => {
+    const { jobs } = tempRootFor();
+    const job = jobs.begin("bash", "spawn fail");
+    job.spill();
+    await job.persistLog();
+    const outcome = await raceShellHang({
+      job,
+      parentSignal: undefined,
+      hangMs: 0,
+      execute: () => Promise.reject(new Error("spawn bash ENOENT")),
+    });
+    expect(outcome.status).toBe("spilled");
+    await vi.waitFor(() => { if (!job.finished) throw new Error("terminal write pending"); });
+    expect(job.info()).toMatchObject({ status: "failed", stopReason: "runtime_error" });
+  });
+
+  it("notifyCompletion answers honestly under a concurrent terminal transition", async () => {
+    // Our delivery wins: close() arriving later must not turn it into a failure.
+    const first = tempRootFor();
+    const won = first.jobs.begin("bash", "bridge");
+    const facade = createFabricBgServiceFacade(() => first.jobs);
+    const delivering = facade.notifyCompletion(won.id, "result payload", { exitCode: 0 });
+    await first.jobs.close();
+    expect(await delivering).toEqual({ ok: true });
+    // Close wins first: the payload cannot land, so the answer is ok:false, never a silent drop.
+    const second = tempRootFor();
+    const lost = second.jobs.begin("bash", "bridge");
+    const closing = second.jobs.close();
+    const raced = await createFabricBgServiceFacade(() => second.jobs).notifyCompletion(lost.id, "result payload", { exitCode: 0 });
+    await closing;
+    expect(raced).toEqual({ ok: false, error: expect.stringContaining("already finished") });
+  });
+
+  it("notifyCompletion trusts finish()'s answer when a finisher wins mid-flight", async () => {
+    const { jobs } = tempRootFor();
+    const facade = createFabricBgServiceFacade(() => jobs);
+    const job = jobs.begin("bash", "bridge");
+    const finish = vi.spyOn(job, "finish");
+    // Simulate a finisher that performs the terminal transition while the facade
+    // sits between its finished check and its own finish call.
+    finish.mockImplementationOnce(async (...args) => {
+      await jobs.close();
+      void args;
+      return false;
+    });
+    const result = await facade.notifyCompletion(job.id, "result payload", { exitCode: 0 });
+    finish.mockRestore();
+    expect(result).toEqual({ ok: false, error: expect.stringContaining("already finished") });
   });
 });

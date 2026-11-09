@@ -121,9 +121,11 @@ export class FabricProgramRun {
   async complete(text: string, success: boolean, stopReason?: FabricSandboxTerminationReason): Promise<void> {
     this.#settled = true;
     const job = this.#job;
-    if (!job || job.finished) return;
+    if (!job) return;
     job.append(Buffer.from(`${text}\n`));
     job.exitCode = success ? 0 : 1;
+    // finish() is its own guard: no finished-check here for a concurrent
+    // finisher (session close) to slip between the check and the terminal write.
     await job.finish(job.exitCode, undefined, stopReason);
   }
 }

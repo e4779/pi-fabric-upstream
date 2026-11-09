@@ -1,5 +1,5 @@
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult, ContextEvent, ExtensionAPI, ExtensionContext, ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
-import { hasWakeObserver, buildShellWakeEvent, markShellOrphanReported, SHELL_WAKE_PREAMBLE, type FabricShellJobEvent, type FabricShellJobInfo, type FabricShellJobStore, type FabricShellOrphan, type FabricShellWakeEvent } from "./shell-jobs.js";
+import { buildShellWakeEvent, FABRIC_SHELL_REAP_MARK_EVENT, hasWakeObserver, markShellOrphanReported, SHELL_WAKE_PREAMBLE, type FabricShellJobEvent, type FabricShellJobInfo, type FabricShellJobStore, type FabricShellOrphan, type FabricShellReapMarkEventV1, type FabricShellWakeEvent } from "./shell-jobs.js";
 
 export const SHELL_MESSAGE_TYPE = "pi-fabric-shell-event";
 export const SHELL_AWARENESS_MESSAGE_TYPE = "pi-fabric-shell-awareness";
@@ -295,7 +295,22 @@ export class ShellEventInbox {
     // The report is out: mark each log durably (next to the log, pruned with it)
     // so no later process in a restart chain re-reports the same orphans. A
     // report queued but never delivered stays unmarked and will resurface.
-    for (const orphan of orphans) markShellOrphanReported(orphan.logPath);
+    for (const orphan of orphans) this.#markReported(orphan);
+  }
+
+  /**
+   * Marks one delivered orphan report and surfaces a failed write as telemetry
+   * instead of silently reverting that log to report-on-every-restart.
+   */
+  #markReported(orphan: FabricShellOrphan): void {
+    const mark = markShellOrphanReported(orphan.logPath);
+    if (mark.status !== "failed") return;
+    const payload: FabricShellReapMarkEventV1 = {
+      version: 1, taskId: orphan.id, logPath: orphan.logPath, error: mark.error ?? "unknown",
+    };
+    try { this.pi.events?.emit(FABRIC_SHELL_REAP_MARK_EVENT, payload); }
+    catch { /* Telemetry cannot break sweep delivery. */ }
+    console.warn(`[pi-fabric] reap mark failed for task ${orphan.id} (${mark.error ?? "unknown"}); its orphan report will resurface after a restart`);
   }
 
   close(): void {

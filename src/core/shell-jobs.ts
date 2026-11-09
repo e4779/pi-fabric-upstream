@@ -226,11 +226,32 @@ export const shellOrphanReported = (logPath: string): boolean => {
   try { return fs.statSync(reapMarkPath(logPath)).isFile(); } catch { return false; }
 };
 
-/** Records a delivered orphan report durably; best-effort, never throws. */
-export const markShellOrphanReported = (logPath: string): void => {
-  try { fs.writeFileSync(reapMarkPath(logPath), `${new Date().toISOString()}\n`, { flag: "wx", mode: 0o600 }); }
-  catch { /* already marked, or the scratch dir is gone */ }
+/** One reap-mark write outcome; `failed` means the report can resurface on a later restart. */
+export type ShellReapMarkResult = { status: "written" | "already-marked" | "failed"; error?: string };
+
+/** Records a delivered orphan report durably; never throws, and names why it did not write. */
+export const markShellOrphanReported = (logPath: string): ShellReapMarkResult => {
+  try {
+    fs.writeFileSync(reapMarkPath(logPath), `${new Date().toISOString()}\n`, { flag: "wx", mode: 0o600 });
+    return { status: "written" };
+  } catch (error) {
+    // Another process's delivery winning the mark is success, not a failure.
+    if ((error as NodeJS.ErrnoException | undefined)?.code === "EEXIST") return { status: "already-marked" };
+    return { status: "failed", error: error instanceof Error ? error.message : String(error) };
+  }
 };
+
+/** `pi.events` channel reporting one reap-mark write failure (telemetry; the mark could not land). */
+export const FABRIC_SHELL_REAP_MARK_EVENT = "pi-fabric:shell:reap-mark:v1";
+
+export interface FabricShellReapMarkEventV1 {
+  version: 1;
+  /** Orphaned task id whose report was delivered without its durable mark. */
+  taskId: string;
+  logPath: string;
+  /** Why the write failed (mkdir/permission/disk), for the log consumer. */
+  error: string;
+}
 
 /** Prunes a marker whose log vanished; markers must not accumulate without their logs. */
 const pruneShellReapMark = (logPath: string): void => {
@@ -383,7 +404,8 @@ export interface FabricShellJobHandle {
   readPid(): Promise<number | undefined>;
   spill(): void;
   whenSpill(): Promise<void>;
-  finish(exitCode?: number | null, footer?: string, stopReason?: FabricShellStopReason): Promise<void>;
+  /** Resolves true when this call performed the terminal transition; false when the job was already finished. */
+  finish(exitCode?: number | null, footer?: string, stopReason?: FabricShellStopReason): Promise<boolean>;
 }
 
 class FabricShellJob implements FabricShellJobHandle {
@@ -442,6 +464,10 @@ class FabricShellJob implements FabricShellJobHandle {
     if (options.monitor) {
       this.#monitor = new ShellMonitor(options.monitor, batch => this.recordMonitorEvent(batch));
       this.#deadline = setTimeout(() => {
+        // A stop that won the race (user, agent, session shutdown) already owns
+        // the terminal state; a late deadline callback must not latch timed_out
+        // next to that stop's name ("timed_out [stopped: session-shutdown]").
+        if (this.finished || this.abort.signal.aborted) return;
         // A caller-set process timeout governs the process; expiry stops watching only.
         if (options.processTimeoutMs !== undefined && !options.observes) {
           this.#endMonitor();
@@ -682,8 +708,8 @@ class FabricShellJob implements FabricShellJobHandle {
     });
   }
 
-  async finish(exitCode?: number | null, footer?: string, stopReason?: FabricShellStopReason): Promise<void> {
-    if (this.finished) return;
+  async finish(exitCode?: number | null, footer?: string, stopReason?: FabricShellStopReason): Promise<boolean> {
+    if (this.finished) return false;
     if (stopReason !== undefined) this.#stopReason ??= stopReason;
     // A fast exit can beat the provider's persistLog continuation after spill.
     const persistence = this.spilled && !this.logPath ? this.persistLog() : undefined;
@@ -716,6 +742,7 @@ class FabricShellJob implements FabricShellJobHandle {
     else { try { fs.rmSync(this.#directory, { recursive: true, force: true }); } catch {} }
     this.#notifyOutput();
     this.onChange("finished", [output, footer?.slice(-1000)].filter(Boolean).join("\n"));
+    return true;
   }
 
   async outputText(maxBytes = 8000): Promise<string> {
@@ -907,9 +934,9 @@ export class FabricShellJobStore {
 
   killWaiting(): number {
     const jobs = this.waiting();
-    for (const job of jobs) {
-      if (!job.abort.signal.aborted) job.abort.abort(fabricControlAbort("Command aborted"));
-    }
+        // Typed stop, not a bare abort: the stop name lands, the monitor deadline is
+        // cleared, so a late deadline callback cannot latch timed_out onto a killed task.
+        for (const job of jobs) job.stop("Command aborted", "user");
     return jobs.length;
   }
 
@@ -921,7 +948,9 @@ export class FabricShellJobStore {
     for (const job of live) {
       // A durable process belongs to its jev-fabric store and outlives this session.
       if (job.durable) job.detach();
-      else if (!job.abort.signal.aborted) job.abort.abort(fabricControlAbort("Fabric session ended"));
+        // Typed stop, not a bare abort: it clears the monitor deadline, so a late
+        // deadline callback cannot latch timed_out next to this stop's name.
+        else job.stop("Fabric session ended", "session-shutdown");
     }
     await Promise.allSettled(live.map((job) => job.finish(null, job.durable
       ? `\n\n[Detached: jev-fabric job ${job.durable.jobId ?? "(starting)"} keeps running outside this session]\n`
@@ -987,13 +1016,16 @@ export const raceShellHang = async <T>(options: {
       job.spill();
       detachParent();
       void execute.then(async (result) => {
-        if (job.finished) return;
+        // finish() is its own guard: no finished-check here for a concurrent
+        // finisher to slip between the check and the terminal write.
         if (result.status === "done") {
           await job.finish(0, `\n\n[Process exited with code ${job.exitCode ?? 0}]\n`);
           return;
         }
         const message = result.error instanceof Error ? result.error.message : String(result.error);
-        await job.finish(null, "\n\n[" + message + "]\n");
+        // A spawn or post-spill execution failure is a typed runtime error,
+        // never a bare failed without a stop reason.
+        await job.finish(null, "\n\n[" + message + "]\n", "runtime_error");
       }).catch((error: unknown) => {
         // A detached job's bookkeeping failure is a log line, never a process crash.
         console.warn(`[pi-fabric] background ${job.tool} task ${job.id} could not record its end: ${error instanceof Error ? error.message : String(error)}`);
