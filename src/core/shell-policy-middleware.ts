@@ -13,7 +13,7 @@ import type {
 
 /**
  * Gate + context guard as reusable execution policy, applicable by ANY
- * execution tool (council synthesis step 2, PR 1; ported from shell-lab
+ * execution tool (council synthesis step 2, PR 1; ported from the lab extension
  * `.pi/extensions/shell.ts:85-203` gate and `:205-288` postProcess — gap-table
  * rows 2-3). Fabric's own `pi.bash` arm runs it so nested `fabric_exec` calls
  * and top-level shell calls pass one gate; external-surface tools can apply
@@ -41,7 +41,9 @@ import type {
  * Fail-open one-liners; no silent transformations.
  */
 
-/** Environment kill switch for the gate half of the policy. */
+/** Environment kill switch for the gate half of the policy. One name across
+ * every surface: the legacy `PI_SHELL_GATE` alias was removed at adoption,
+ * so `PI_FABRIC_SHELL_GATE` is the only switch this fork honors. */
 export const SHELL_POLICY_GATE_KILL_SWITCH = "PI_FABRIC_SHELL_GATE";
 
 const GATE_TIMEOUT_MS = 5_000;
