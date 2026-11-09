@@ -1506,17 +1506,30 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     lock.releaseSessionOwnerLock({ sessionFile });
     lock.sweepSessionOwnerRegistry();
   });
-  pi.on("session_before_switch", async (event) => {
+  pi.on("session_before_switch", async (event, context) => {
     if (!ownerLockEnabled() || !event.targetSessionFile) return;
     const lock = await import("./core/session-owner-lock.js");
     const liveOwners = lock.readSessionOwners(event.targetSessionFile)
       .filter((owner) => owner.alive && owner.pid !== process.pid);
     if (liveOwners.length === 0) return;
-    const owner = liveOwners[0]!;
-    const message = `Session file ${event.targetSessionFile} is live in pid ${owner.pid}`
-      + `${owner.session !== undefined ? ` (session ${owner.session})` : ""}`
-      + ` — switch cancelled (${lock.SESSION_OWNER_FORCE_ENV}=1 to force)`;
-    console.error(`[pi-fabric] ${message}`);
+    const writers = liveOwners
+      .map((owner) => `pid=${owner.pid}${owner.session !== undefined ? ` session=${owner.session}` : ""}`)
+      .join(", ");
+    const message = `Session file ${event.targetSessionFile} already has a live writer (${writers})`;
+    if (process.env[lock.SESSION_OWNER_FORCE_ENV] === "1") {
+      // The switch proceeds: the session_start claim that follows registers
+      // this process as a visible second writer beside the live owner.
+      const forced = `${message} — opening as a second writer (${lock.SESSION_OWNER_FORCE_ENV}=1)`;
+      console.error(`[pi-fabric] ${forced}`);
+      if (context.hasUI) context.ui.notify(forced, "warning");
+      return;
+    }
+    // A refusal is never a silent no-op: the operator gets the named refusal
+    // (owner pid/session, the escape hatch) on screen and on stderr, and the
+    // switch is cancelled through the sanctioned result.
+    const refusal = `${message} — switch refused (${lock.SESSION_OWNER_FORCE_ENV}=1 opens it as a visible second writer)`;
+    console.error(`[pi-fabric] ${refusal}`);
+    if (context.hasUI) context.ui.notify(refusal, "error");
     return { cancel: true };
   });
   pi.on("before_agent_start", async (event, context) => {

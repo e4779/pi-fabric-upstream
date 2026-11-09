@@ -1,7 +1,6 @@
-// Session owner lock: cross-process single-writer guard for session files
-// (PR4 of the sessions roadmap; the P0 double-open incident). All tests
-// run against an isolated registry root; liveness probes are injected so no
-// real foreign process is needed.
+// Session owner lock: cross-process single-writer guard for session files.
+// All tests run against an isolated registry root; liveness probes are
+// injected so no real foreign process is needed.
 import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";

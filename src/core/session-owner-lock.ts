@@ -1,6 +1,6 @@
-// Cross-process single-writer guard for Pi session files (the P0 double-open
-// incident: a second process resumed a session that was live elsewhere and
-// both wrote one file). The host's SessionManager has no locking, and a boot
+// Cross-process single-writer guard for Pi session files. The failure it
+// prevents: a second process resumes a session that is live elsewhere and
+// both processes write one file. The host's SessionManager has no locking, and a boot
 // veto hook does not exist upstream (the sanctioned pre-open veto is only
 // `session_before_switch`), so this registry adds the missing ownership
 // layer beside the file:
