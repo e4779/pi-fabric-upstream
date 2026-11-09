@@ -1816,7 +1816,9 @@ export {
  *
  * 1. A shell-tool result cast (`ShellResult { ok, exitCode, output, timedOut,
  *    aborted, backgrounded?, taskId?, logPath?, pid? }`) maps field-for-field
- *    onto the outcome kinds: `timedOut` -> `timeout`, `backgrounded` ->
+ *    onto the outcome kinds: `timedOut` -> `timeout` (with `aborted` carried
+ *    when the operator stop raced the deadline kill — the deadline is the
+ *    more specific stop and both states stay visible), `backgrounded` ->
  *    `backgrounded` (taskId/logPath/pid carried), `ok: false` -> `error`
  *    (with `aborted` carried so a typed stop stays visible), else `ok`.
  * 2. A blocked ad-hoc result (`{ ok: false, blocked: true, exitCode: null,
@@ -1887,6 +1889,8 @@ export interface FabricToolResultTimeoutV1 extends FabricToolResultCardBaseV1 {
   kind: "timeout";
   /** Exit status observed at the kill, when one was reaped. */
   exitCode?: number | null;
+  /** The run was also aborted mid-timeout (operator stop racing the deadline kill); both states stay visible. */
+  aborted?: boolean;
 }
 
 /** Refused before execution (pre-exec gate, policy veto). */
@@ -2061,8 +2065,14 @@ export const readFabricToolResultCardV1 = (
     }
     case "timeout": {
       const exitCode = take("exitCode", optionalCardExitCode);
+      const aborted = take("aborted", optionalCardBoolean);
       if (!valid) return undefined;
-      return { ...base, kind: "timeout" as const, ...(exitCode !== undefined ? { exitCode } : {}) };
+      return {
+        ...base,
+        kind: "timeout" as const,
+        ...(exitCode !== undefined ? { exitCode } : {}),
+        ...(aborted !== undefined ? { aborted } : {}),
+      };
     }
     case "blocked":
       if (typeof record.reason !== "string") return undefined;
