@@ -304,6 +304,8 @@ interface FabricUiConfig {
   toolDisplay: FabricToolDisplayMode;
   /** Lend the window title to the latest nested call while fabric_exec runs. */
   terminalTitle: boolean;
+  /** Shared result cards for extension tools that opt in via result details. */
+  toolResultCards: boolean;
   updateDebounceMs: number;
   /** Offer decisions shown at this terminal to registered question renderers; absent means off. */
   questionRenderers?: boolean;
@@ -633,6 +635,7 @@ export const DEFAULT_FABRIC_CONFIG: FabricConfig = {
     showAgentToolPreview: true,
     toolDisplay: "compact",
     terminalTitle: true,
+    toolResultCards: true,
     updateDebounceMs: 100,
   },
   compaction: {
@@ -1404,6 +1407,7 @@ export const normalizeFabricConfig = (input: Record<string, unknown>): FabricCon
         DEFAULT_FABRIC_CONFIG.ui.toolDisplay,
       ),
       terminalTitle: booleanValue(ui.terminalTitle, DEFAULT_FABRIC_CONFIG.ui.terminalTitle),
+      toolResultCards: booleanValue(ui.toolResultCards, DEFAULT_FABRIC_CONFIG.ui.toolResultCards),
       ...(ui.questionRenderers === true ? { questionRenderers: true } : {}),
       // Renamed from ui.nestedToolDebounceMs (v3): the window coalesces every
       // live fabric_exec card update — nested calls, progress, agent previews.

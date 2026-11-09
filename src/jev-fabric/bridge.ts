@@ -255,11 +255,16 @@ export class DurableShellBridge {
         await this.#forget(record.taskId);
       },
       async (error: unknown) => {
-        if (job.finished || job.detached.signal.aborted) return;
+        if (job.detached.signal.aborted) return;
         const message = error instanceof Error ? error.message : String(error);
         const stopped = job.abort.signal.aborted;
-        await job.finish(null, `\n\n[${stopped ? "Stopped" : message}]\n`);
-        if (stopped) await this.#forget(record.taskId);
+        // finish() answers whether THIS call performed the terminal transition.
+        // The old finished pre-check could not: a stop landing between the
+        // check and the finish lost the error footer here. The record goes
+        // when this call ended the job, or when a stop did (the stop path has
+        // no cleanup of its own for adopted tasks).
+        const finished = await job.finish(null, `\n\n[${stopped ? "Stopped" : message}]\n`);
+        if (finished || stopped) await this.#forget(record.taskId);
       },
     );
     return job.info();

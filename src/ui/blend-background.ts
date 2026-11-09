@@ -1,8 +1,8 @@
 // Common theme-background blending, lifted out of diff-background.ts so every
 // card family — diff previews, tool result cards — derives backgrounds from
 // theme keys through one path ("color only from a theme key"). The blend math
-// is the fork family's: parse the theme token's SGR (truecolor or 256-index),
-// then mix that RGB into the theme's background token at an intensity.
+// is shared: parse the theme token's SGR (truecolor or 256-index), then mix
+// that RGB into the theme's background token at an intensity.
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { ansi256ToRgb, observedThemeVariant } from "./highlight.js";
 
@@ -100,7 +100,7 @@ export const FALLBACK_SEMANTIC_BG: Record<SemanticBgTone, Record<"dark" | "light
   },
 };
 
-/** The fork's two named blend intensities (diff previews use the same pair). */
+/** The two named blend intensities (diff previews use the same pair). */
 export const BLEND_INTENSITY_SUBTLE = 0.14;
 export const BLEND_INTENSITY_MEDIUM = 0.24;
 

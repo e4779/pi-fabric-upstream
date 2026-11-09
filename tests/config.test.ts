@@ -442,6 +442,12 @@ describe("Fabric configuration", () => {
     expect(normalizeFabricConfig({ ui: { herdrStatus: "off" } }).ui.herdrStatus).toBe(true);
   });
 
+  it("normalizes the tool-result card toggle", () => {
+    expect(DEFAULT_FABRIC_CONFIG.ui.toolResultCards).toBe(true);
+    expect(normalizeFabricConfig({ ui: { toolResultCards: false } }).ui.toolResultCards).toBe(false);
+    expect(normalizeFabricConfig({ ui: { toolResultCards: "no" } }).ui.toolResultCards).toBe(true);
+  });
+
   it("normalizes the window-title toggle", () => {
     expect(DEFAULT_FABRIC_CONFIG.ui.terminalTitle).toBe(true);
     expect(normalizeFabricConfig({ ui: { terminalTitle: false } }).ui.terminalTitle).toBe(false);
