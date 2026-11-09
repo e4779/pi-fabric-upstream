@@ -1,6 +1,6 @@
 import type { Skill } from "@earendil-works/pi-coding-agent";
 
-// Local mirrors of the host skill helpers (pi 0.84.2, core/skills.js and
+// Local mirrors of the host skill helpers (pi core/skills.js and
 // core/agent-session.js). Kept line-for-line identical so prompt output and
 // skill-block parsing behave exactly as the host's, without importing the
 // host package during extension load.
@@ -13,15 +13,26 @@ const escapeXml = (str: string): string =>
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&apos;");
 
-export const formatSkillsForPrompt = (skills: readonly Skill[]): string => {
+/** Names the tool that loads skill files; `indirect` names none, for a reader
+ * that is reachable only through another tool. */
+export type SkillFileReadTool = "read" | "bash" | "indirect";
+
+export const formatSkillsForPrompt = (
+  skills: readonly Skill[],
+  fileReadTool: SkillFileReadTool = "read",
+): string => {
   const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
   if (visibleSkills.length === 0) {
     return "";
   }
   const lines = [
     "\n\nThe following skills provide specialized instructions for specific tasks.",
-    "Use the read tool to load a skill's file when the task matches its description.",
-    "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+    fileReadTool === "read"
+      ? "Use the read tool to load a skill's file when the task matches its description."
+      : fileReadTool === "bash"
+        ? "Use bash to load a skill's file when the task matches its description."
+        : "Load a skill's file when the task matches its description.",
+    "Resolve relative paths against the skill's directory (parent of SKILL.md). Use absolute paths in tool calls.",
     "",
     "<available_skills>",
   ];

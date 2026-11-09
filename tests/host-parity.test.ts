@@ -33,6 +33,9 @@ describe("host parity", () => {
     expect(localFormatSkillsForPrompt(skills)).toBe(formatSkillsForPrompt(skills));
     expect(localFormatSkillsForPrompt([])).toBe(formatSkillsForPrompt([]));
     expect(localFormatSkillsForPrompt(skills.slice(1))).toBe(formatSkillsForPrompt(skills.slice(1)));
+    for (const fileReadTool of ["read", "bash", "indirect"] as const) {
+      expect(localFormatSkillsForPrompt(skills, fileReadTool)).toBe(formatSkillsForPrompt(skills, fileReadTool));
+    }
   });
 
   it("parses skill blocks identically", () => {
