@@ -116,6 +116,7 @@ import { FabricUiController } from "./ui/controller.js";
 import { installFabricEscapeHalt } from "./ui/escape-halt.js";
 import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
 import { registerFabricBgJobService } from "./core/shell-jobs-facade.js";
+import { registerFabricShellPolicyService } from "./core/shell-policy-facade.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
@@ -532,6 +533,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // extension-facing registerJob/unregister/subscribe/notifyCompletion API.
   // Store absence before session initialization answers ok:false honestly.
   const unsubscribeShellJobService = registerFabricBgJobService(pi, () => state.shellJobs);
+
+  // Shell policy facade: the host gate + output budget
+  // published as the extension-facing gate/post/config API over pi.events,
+  // mirroring the PR2 background-job publication. Same middleware semantics
+  // fabric_exec runs; publishing adds no second policy. Session-config absence
+  // answers fail-open; the kill switch stays checked per call.
+  const unsubscribeShellPolicyService = registerFabricShellPolicyService(
+    pi,
+    () => state.bootstrapped ? state.config.executor.shellPolicy : undefined,
+  );
 
   // Synchronous reachability answer so extensions stop guessing whether the
   // model or a fabric_exec program can reach a tool this turn.
@@ -1698,6 +1709,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     unsubscribeQuestionRendererRegistration();
     state.questionRenderers.clear();
     unsubscribeShellJobService();
+    unsubscribeShellPolicyService();
     programRunContext = undefined;
     pendingHandoffs.clear();
     directToolApproval.clear();

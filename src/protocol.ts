@@ -1207,6 +1207,156 @@ export const readFabricShellJobCompletionV1 = (
   };
 };
 
+// ---- shell policy facade (the execution policy as extension API) ----
+//
+// The host shell policy (src/core/shell-policy-middleware.ts) is published here
+// as a typed extension-facing facade: gate / post / config, mirroring the PR2
+// background-job publication. The facade exposes the same bounded retry valve,
+// per-pid offload directory and per-call kill switch fabric_exec itself runs;
+// publishing adds no second policy and changes no fabric_exec behavior. The
+// implementation lives in src/core/shell-policy-facade.ts.
+
+/** `pi.events` channel that asks the host gate about one command. */
+export const FABRIC_SHELL_POLICY_GATE_EVENT = "pi-fabric:shell-policy:gate:v1";
+/** `pi.events` channel that runs one finished outcome through the host output budget. */
+export const FABRIC_SHELL_POLICY_POST_EVENT = "pi-fabric:shell-policy:post:v1";
+/** `pi.events` channel that reports the live policy config surface. */
+export const FABRIC_SHELL_POLICY_CONFIG_EVENT = "pi-fabric:shell-policy:config:v1";
+
+/** Largest finished output an extension may hand the facade over `pi.events`. */
+export const MAX_FABRIC_SHELL_POLICY_OUTCOME_OUTPUT = 262_144;
+
+/** What an extension can probe about the policy without issuing a command. */
+export interface FabricShellPolicyConfigSurfaceV1 {
+  version: 1;
+  /** False before the session config exists: gate never blocks, post passes through. */
+  available: boolean;
+  /** Pre-exec gate half configured on; the kill switch still wins per call. */
+  gate: boolean;
+  /** Post-exec output budget half configured on. */
+  outputBudget: boolean;
+  /** Environment variable whose value `off` disables the gate, checked per call. */
+  killSwitchEnv: string;
+  /** Output bytes past which the budget offloads to `dumpDir`. */
+  offloadBytes: number;
+  /** Dense single-line payloads offload at this lower threshold. */
+  offloadOneLineBytes: number;
+  /** Stable per-process dump directory; a parallel host process never clobbers it. */
+  dumpDir: string;
+}
+
+/** The published shell policy: the middleware contract plus its config surface. */
+export interface FabricShellPolicyFacadeV1 {
+  /** Pre-exec gate. null = the command may run; a block carries model-facing diagnostics. */
+  gate(command: string): FabricExecutionPolicyBlockV1 | null;
+  /** Post-exec context guard: budget the output, point at the whole artifact. */
+  post(command: string, outcome: FabricExecutionPolicyOutcomeV1): FabricExecutionPolicyPostResultV1;
+  /** The live config surface; answers without running or checking any command. */
+  config(): FabricShellPolicyConfigSurfaceV1;
+}
+
+/** Ask the host gate about one command. `respond` receives the block or null. */
+export interface FabricShellPolicyGateRequestV1 {
+  version: 1;
+  command: string;
+  respond?: (block: FabricExecutionPolicyBlockV1 | null) => void;
+}
+
+export const readFabricShellPolicyGateRequestV1 = (
+  value: unknown,
+): FabricShellPolicyGateRequestV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    !boundedString(record.command, MAX_FABRIC_SHELL_JOB_COMMAND) ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    command: record.command,
+    ...(record.respond
+      ? { respond: record.respond as NonNullable<FabricShellPolicyGateRequestV1["respond"]> }
+      : {}),
+  };
+};
+
+const readFabricShellPolicyOutcomeV1 = (
+  value: unknown,
+): FabricExecutionPolicyOutcomeV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const { exitCode } = record as { exitCode?: unknown };
+  if (
+    typeof record.ok !== "boolean" ||
+    !(exitCode === null || (typeof exitCode === "number" && Number.isSafeInteger(exitCode))) ||
+    typeof record.output !== "string" ||
+    record.output.length > MAX_FABRIC_SHELL_POLICY_OUTCOME_OUTPUT
+  ) {
+    return undefined;
+  }
+  return { ok: record.ok, exitCode: exitCode as number | null, output: record.output };
+};
+
+/** Run one finished outcome through the host output budget. */
+export interface FabricShellPolicyPostRequestV1 {
+  version: 1;
+  command: string;
+  outcome: FabricExecutionPolicyOutcomeV1;
+  respond?: (result: FabricExecutionPolicyPostResultV1) => void;
+}
+
+export const readFabricShellPolicyPostRequestV1 = (
+  value: unknown,
+): FabricShellPolicyPostRequestV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const outcome = readFabricShellPolicyOutcomeV1(record.outcome);
+  if (
+    record.version !== 1 ||
+    !boundedString(record.command, MAX_FABRIC_SHELL_JOB_COMMAND) ||
+    !outcome ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    command: record.command,
+    outcome,
+    ...(record.respond
+      ? { respond: record.respond as NonNullable<FabricShellPolicyPostRequestV1["respond"]> }
+      : {}),
+  };
+};
+
+/** Probe the live policy config surface. */
+export interface FabricShellPolicyConfigRequestV1 {
+  version: 1;
+  respond?: (config: FabricShellPolicyConfigSurfaceV1) => void;
+}
+
+export const readFabricShellPolicyConfigRequestV1 = (
+  value: unknown,
+): FabricShellPolicyConfigRequestV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    ...(record.respond
+      ? { respond: record.respond as NonNullable<FabricShellPolicyConfigRequestV1["respond"]> }
+      : {}),
+  };
+};
+
 /** Identifies host-side tool lifecycle events replayed for a nested Fabric call. */
 export const FABRIC_NESTED_TOOL_CALL_ID_PREFIX = "fabric_";
 
