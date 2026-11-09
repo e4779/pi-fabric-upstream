@@ -59,3 +59,11 @@ schemas, guest payloads, or discovery metadata.
 Version 1 is intentionally bash-only. It is trusted extension cooperation, not a
 sandbox or a security boundary. Unrelated overrides and direct `extensions.bash`
 calls retain their original behavior.
+
+## Current policy surface (2026-11-09 update)
+
+The gate and output budget described above are now configured as
+`executor.shellPolicy` (default on) with the kill switch
+`PI_FABRIC_SHELL_GATE=off`, and are published to extensions through the
+shell policy facade (`pi-fabric:shell-policy:*:v1` channels). See
+docs/configuration.md and docs/external-surface.md.
