@@ -598,9 +598,13 @@ export class FabricWidget implements Component, Focusable {
     if (activeAgents.length > 0) parts.push(`${activeAgents.length} running`);
     if (visibleActors.length > 0) parts.push(`${visibleActors.length} actor${visibleActors.length === 1 ? "" : "s"}`);
     const backgroundWork = liveShells.filter(job => !job.observes);
-    const shellCount = backgroundWork.filter(job => job.tool !== "fabric_exec").length;
-    const workflowCount = backgroundWork.length - shellCount;
+    // Extension-registered agent jobs are neither shells nor workflows; the
+    // footer counter names them, the rows list them.
+    const agentCount = backgroundWork.filter(job => job.external === true).length;
+    const shellCount = backgroundWork.filter(job => job.tool !== "fabric_exec" && job.external !== true).length;
+    const workflowCount = backgroundWork.filter(job => job.tool === "fabric_exec").length;
     const observationCount = liveShells.length - backgroundWork.length;
+    if (agentCount) parts.push(`${agentCount} worker${agentCount === 1 ? "" : "s"}`);
     if (shellCount) parts.push(`${shellCount} shell${shellCount === 1 ? "" : "s"}`);
     if (workflowCount) parts.push(`${workflowCount} workflow${workflowCount === 1 ? "" : "s"}`);
     if (observationCount) parts.push(`${observationCount} observation${observationCount === 1 ? "" : "s"}`);
@@ -676,7 +680,9 @@ export class FabricWidget implements Component, Focusable {
 
     // Shells follow participants. Every selectable row names an exact task;
     // Enter opens its detail, with no separate task-list overlay.
-    // The id is the row's name, emphasised like an agent's name.
+    // The id is the row's name, emphasised like an agent's name; an
+    // extension-registered agent job lists under its own name with the
+    // registry's state words (running/done/failed/stopped).
     const shellLine = (job: FabricShellJobInfo, name: string, detail: string | undefined, id: string): string => {
       const status = job.stopping ? "stopping" : job.status;
       const elapsed = formatDuration((job.finishedAt ?? snapshot.now) - job.startedAt) || "0s";
@@ -692,11 +698,24 @@ export class FabricWidget implements Component, Focusable {
         [],
       );
     };
+    const agentJobState = (job: FabricShellJobInfo): string => {
+      if (job.stopping) return "stopping";
+      if (job.finishedAt === undefined) return "running";
+      if (job.status === "exited") return "done";
+      if (job.status === "killed") return "stopped";
+      return job.status;
+    };
     for (const job of listedShells.filter(job => !job.observes)) {
-      const status = job.stopping ? "stopping" : job.status;
-      const label = job.monitor && job.finishedAt === undefined && !job.stopping ? `monitor:${job.monitor.delivery}` : status;
-      rows.push({ id: job.id, kind: "shell", name: safeText(job.description ?? job.command), line: lines.length });
-      lines.push(shellLine(job, job.id.slice(0, 8), label, job.id));
+      const external = job.external === true;
+      const named = external && job.label !== undefined;
+      const name = named ? safeText(job.label!) : job.id.slice(0, 8);
+      const label = external
+        ? agentJobState(job)
+        : job.monitor && job.finishedAt === undefined && !job.stopping
+          ? `monitor:${job.monitor.delivery}`
+          : job.stopping ? "stopping" : job.status;
+      rows.push({ id: job.id, kind: "shell", name: named ? name : safeText(job.description ?? job.command), line: lines.length });
+      lines.push(shellLine(job, name, label, job.id));
       pushObservations("task", job.id);
     }
     // Retain inspectability if a target is no longer in this local view.

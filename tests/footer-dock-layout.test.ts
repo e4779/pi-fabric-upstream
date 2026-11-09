@@ -14,7 +14,7 @@ const controllers: FabricUiController[] = [];
 afterEach(() => { for (const controller of controllers.splice(0)) controller.stop(); vi.useRealTimers(); });
 const lines = (content: string[]): Component => ({ render: () => content, invalidate: () => {} });
 
-const mount = (statusFirst = true) => {
+const mount = (statusFirst = true, agents?: () => unknown[]) => {
   vi.useFakeTimers();
   const terminal = { rows: 16 };
   const editorLines = ["─".repeat(80), ...Array.from({ length: 6 }, (_, i) => `draft ${i}`), "─".repeat(80)];
@@ -40,8 +40,16 @@ const mount = (statusFirst = true) => {
     initialized: true,
     config: { ui: { enabled: true, widget: "always", maxRows: 6, refreshMs: 60000, eventHistory: 80 }, mesh: { enabled: false } },
     activity: { subscribe: () => () => {}, runs: () => [] },
+    shellJobs: {
+      subscribe: () => () => {},
+      list: () => [{
+        id: "agent-dock-0000", tool: "monitor", command: "agent build", label: "build", external: true,
+        description: "Fix the flaky test", status: "running", startedAt: Date.now() - 1_000,
+        eventCount: 0, unread: false, stopping: false,
+      }],
+    },
     agents: {
-      list: () => Array.from({ length: 10 }, (_, i) => ({ id: `agent-${i}`, name: `reviewer-${i}`, status: "running", transport: "process", cwd: "/tmp", model: "openai/gpt-6-astra", task: "Review", startedAt: Date.now(), turns: 0, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } })),
+      list: agents ?? (() => Array.from({ length: 10 }, (_, i) => ({ id: `agent-${i}`, name: `reviewer-${i}`, status: "running", transport: "process", cwd: "/tmp", model: "openai/gpt-6-astra", task: "Review", startedAt: Date.now(), turns: 0, toolCalls: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 } }))),
       subscribeUi: () => () => {},
     },
     actors: { list: () => [], subscribe: () => () => {} }, globalActors: { list: () => [] },
@@ -119,6 +127,22 @@ describe("Fabric dock with native Pi fullscreen layout", () => {
     expect(h.list().render(40)).toEqual([]);
     expect(h.frame(80).join("\n")).toContain(STATUS);
     expect(h.list().render(80)).toHaveLength(2);
+  });
+
+  it("docks agent-job rows beside shell rows inside the available budget, shrinking through zero", () => {
+    const h = mount(true, () => []); h.controller.start(h.context);
+    h.terminal.rows = 30;
+    const text = h.frame().join("\n");
+    expect(text).toContain("build");
+    expect(text).toContain("running");
+    expect(text).toContain(STATUS);
+    const list = h.list();
+    expect(list.render(80)).toHaveLength(3); // spacer + header + agent row inside the dock budget
+    h.terminal.rows = 14;
+    expect(h.frame().join("\n")).toContain(STATUS);
+    expect(list.render(80)).toEqual([]); // zero rows: native footer and transcript keep theirs
+    h.terminal.rows = 30;
+    expect(list.render(80)).toHaveLength(3);
   });
 
   it("reclaims only the rows an external widget or editor gives back", () => {
