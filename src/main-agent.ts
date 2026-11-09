@@ -94,6 +94,25 @@ export const resolveFabricIdentity = (
 const escapeXmlText = (value: string): string =>
   value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
 
+/**
+ * Pi sendMessage options that implement wake-if-idle, queue-if-busy delivery
+ * for fabric agent messages. Pi branches on its own streaming state inside
+ * sendCustomMessage, so one option set covers both recipient states atomically
+ * (no idle probe, no probe race):
+ *
+ * - idle + triggerTurn: pi starts the run at once (the background-task wake
+ *   pattern; deliverAs is ignored while idle).
+ * - turn in flight + deliverAs "followUp": pi holds the message in its
+ *   follow-up queue and drains it, with a continuation run, only when the
+ *   agent would otherwise stop. The follow-up arm never interrupts in-flight
+ *   work, so delivery cannot abort a running executable block.
+ * - triggerTurn false: passive in both states; pi appends the message without
+ *   starting a run (deferred to the end of the turn while one is running).
+ */
+export const agentMessageDeliveryOptions = (
+  triggerTurn: boolean,
+): { deliverAs: "followUp"; triggerTurn: boolean } => ({ deliverAs: "followUp", triggerTurn });
+
 export class MainAgentController implements FabricMainAgentTarget {
   readonly startedAt = Date.now();
 
@@ -164,12 +183,15 @@ export class MainAgentController implements FabricMainAgentTarget {
     if (!message) throw new Error("Main agent message must not be empty");
     const messageId = randomUUID();
     const data = request.data === undefined ? undefined : serializableFeedbackData(request.data);
-    // A connected root is not necessarily working. Routine peer coordination
-    // rides an active turn or waits for the next prompt instead of waking an
-    // idle session into an acknowledgement loop. Child/actor feedback retains
-    // its existing wake behavior, and callers can explicitly request a wake.
-    const peer = request.from.kind === "main" && request.from.id !== this.id;
-    const triggerTurn = request.triggerTurn ?? !peer;
+    // Wake semantics match background-task wakes: an idle recipient starts a
+    // run at once, and a recipient with an in-flight turn never has that work
+    // aborted. The earlier peer-passive default (triggerTurn false) left an
+    // idle session asleep until its next natural turn, and the steer delivery
+    // it fell back to while busy could kill a running executable block
+    // silently. agentMessageDeliveryOptions removes both: pi itself picks the
+    // wake or follow-up queue at delivery time. Explicit triggerTurn: false
+    // keeps passive delivery for callers that ask for it.
+    const triggerTurn = request.triggerTurn ?? true;
     this.pi.sendMessage(
       {
         customType: "pi-fabric-agent-message",
@@ -185,15 +207,13 @@ export class MainAgentController implements FabricMainAgentTarget {
         details: {
           id: messageId,
           from: structuredClone(request.from),
-          delivery: "steer",
+          delivery: "followUp",
           requestedDelivery: request.delivery,
           triggerTurn,
           ...(data === undefined ? {} : { data }),
         },
       },
-      // Incoming agent feedback must not wait for Main to finish its run.
-      // Pi still honors triggerTurn=false (including passive idle delivery).
-      { deliverAs: "steer", triggerTurn },
+      agentMessageDeliveryOptions(triggerTurn),
     );
     notifyAgentFeedback(this.context, request.from.name || request.from.id, message);
     return { queued: true, messageId, routed: "main" };

@@ -12,7 +12,10 @@ const text = "FEEDBACK_AT_TOOL_BOUNDARY_" + "x".repeat(20_000);
 const data = { body: "FULL_STRUCTURED_DATA_" + "y".repeat(20_000) };
 
 describe("Main feedback through the real Pi 1.5 host", () => {
-  it.each(["active", "idle-passive", "idle-active", "peer-active", "peer-idle", "peer-wake"] as const)("delivers once in %s state without user impersonation", async scenario => {
+  it.each([
+    "active", "idle-passive", "idle-active",
+    "peer-active", "peer-idle-passive", "peer-idle-wake", "peer-wake",
+  ] as const)("delivers once in %s state without user impersonation", async scenario => {
     const cwd = await mkdtemp(path.join(os.tmpdir(), "fabric-feedback-sdk-"));
     let main: MainAgentController | undefined;
     const requests: unknown[][] = [], events: string[] = [], errors: unknown[] = [];
@@ -20,10 +23,13 @@ describe("Main feedback through the real Pi 1.5 host", () => {
     const settingsManager = SettingsManager.inMemory({ defaultProjectTrust: "never", compaction: { enabled: false }, retry: { enabled: false } });
     const active = scenario === "active" || scenario === "peer-active";
     const peer = scenario.startsWith("peer-");
+    const passive = scenario === "idle-passive" || scenario === "peer-idle-passive";
+    // Wake semantics: default (undefined) wakes; only an explicit false stays
+    // passive; explicit true pins the wake for the legacy wake-on-default pair.
     const feedback = () => main!.deliverAgent({
       from: peer ? { id: "session:peer", name: "main", kind: "main" } : { id: "child", name: "Reviewer", kind: "agent" },
       message: text, data, delivery: "followUp",
-      ...(!peer ? { triggerTurn: scenario !== "idle-passive" } : scenario === "peer-wake" ? { triggerTurn: true } : {}),
+      ...(passive ? { triggerTurn: false } : !peer || scenario === "peer-wake" ? { triggerTurn: true } : {}),
     });
     const loader = new DefaultResourceLoader({
       cwd, agentDir: cwd, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true,
@@ -69,28 +75,41 @@ describe("Main feedback through the real Pi 1.5 host", () => {
         expect(session.getActiveToolNames()).toEqual(["receive_feedback"]);
         if (active) {
           await session.prompt("Run the fixture tool.");
-          expect(events).toEqual(["request-1", "tool", "request-2", "settled"]);
-          expect(requests).toHaveLength(2);
+          // Queue-if-busy: the feedback lands while receive_feedback executes.
+          // request-2 answers the tool result, so the in-flight block's turn
+          // completes untouched and exactly once; only then does pi drain the
+          // follow-up queue (request-3, same run, one settled event) with the
+          // message. No silent abort, no re-run of the block.
+          expect(events).toEqual(["request-1", "tool", "request-2", "request-3", "settled"]);
+          expect(requests).toHaveLength(3);
+          const toolResults = session.messages.filter(message => message.role === "toolResult");
+          expect(toolResults).toHaveLength(1);
+          expect(JSON.stringify(toolResults[0])).toContain("Tool finished");
+          expect(JSON.stringify(requests[1])).toContain("Tool finished");
+          expect(JSON.stringify(requests[1])).not.toContain(text);
+          expect(JSON.stringify(requests[2])).toContain(text);
         } else {
           feedback();
-          if (scenario === "idle-passive" || scenario === "peer-idle") {
+          if (passive) {
             expect(session.isIdle).toBe(true);
             expect(requests).toHaveLength(0);
             await session.prompt("Read stored feedback.");
           } else {
+            // Idle wake: peer and child feedback start a run at once instead
+            // of waiting for the session's next natural turn.
             await vi.waitFor(() => expect(requests).toHaveLength(1));
             await session.waitForIdle();
           }
           expect(requests).toHaveLength(1);
         }
         // Only original human input traverses input hooks; no duplicate continuation.
-        expect(inputs).toBe(scenario === "idle-active" || scenario === "peer-wake" ? 0 : 1);
+        expect(inputs).toBe(passive || active ? 1 : 0);
         expect(sends).toBe(1);
         expect(JSON.stringify(requests.at(-1))).toContain(text);
         expect(JSON.stringify(requests.at(-1))).toContain(data.body);
         const messages = session.messages.filter(message => message.role === "custom" && message.customType === "pi-fabric-agent-message");
         expect(messages).toHaveLength(1);
-        expect(messages[0]).toMatchObject({ display: false, details: { delivery: "steer", requestedDelivery: "followUp", data } });
+        expect(messages[0]).toMatchObject({ display: false, details: { delivery: "followUp", requestedDelivery: "followUp", data } });
         const entries = session.sessionManager.getEntries().filter(entry => entry.type === "custom_message" && entry.customType === "pi-fabric-agent-message");
         expect(entries).toHaveLength(1);
         expect(entries[0]).toMatchObject({ display: false, details: { data } });

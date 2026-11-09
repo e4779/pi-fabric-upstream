@@ -19,14 +19,14 @@ describe("Main feedback projection", () => {
     const h = setup();
     const message = "First line\n" + "x".repeat(20_000);
     const data = { payload: "private-data".repeat(2000) };
-    const triggerTurn = kind !== "main";
+    const triggerTurn = true;
     const result = h.main.deliverAgent({ from: { ...from, kind }, message, data, delivery: "followUp" });
     expect(h.sendMessage).toHaveBeenCalledOnce();
     expect(h.sendMessage).toHaveBeenCalledWith(expect.objectContaining({
       customType: "pi-fabric-agent-message", display: false,
       content: expect.stringContaining(message),
-      details: { id: result.messageId, from: { ...from, kind }, delivery: "steer", requestedDelivery: "followUp", triggerTurn, data },
-    }), { deliverAs: "steer", triggerTurn });
+      details: { id: result.messageId, from: { ...from, kind }, delivery: "followUp", requestedDelivery: "followUp", triggerTurn, data },
+    }), { deliverAs: "followUp", triggerTurn });
     expect(h.sendMessage.mock.calls[0]![0].content).toContain(data.payload);
     expect(h.notify).toHaveBeenCalledOnce();
     const notice = h.notify.mock.calls[0]![0] as string;
@@ -51,7 +51,7 @@ describe("Main feedback projection", () => {
   it.each([false, true])("preserves passive triggerTurn and is safe with hasUI=%s", hasUI => {
     const h = setup(hasUI);
     h.main.deliverAgent({ from, message: "passive", delivery: "followUp", triggerTurn: false });
-    expect(h.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "steer", triggerTurn: false });
+    expect(h.sendMessage.mock.calls[0]![1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
     expect(h.notify).toHaveBeenCalledTimes(hasUI ? 1 : 0);
   });
 
@@ -88,7 +88,7 @@ describe("Main feedback projection", () => {
     await router.routeMessage("main", "local", { full: "data" }, "followUp");
     await router.acceptControl({ targetId: "session:main", operation: "followUp", message: "remote", triggerTurn: false, data: { peer: true } } as never, { id: "peer", name: "Peer", kind: "main" });
     expect(h.sendMessage.mock.calls.map(call => call[1])).toEqual([
-      { deliverAs: "steer", triggerTurn: true }, { deliverAs: "steer", triggerTurn: false },
+      { deliverAs: "followUp", triggerTurn: true }, { deliverAs: "followUp", triggerTurn: false },
     ]);
     expect(h.notify.mock.calls[1]![0]).toContain("Peer");
     await router.routeMessage("child", "keep explicit queue", undefined, "followUp");

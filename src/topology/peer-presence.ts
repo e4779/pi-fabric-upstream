@@ -166,7 +166,7 @@ export const formatPeerPresenceNotice = (change: PeerPresenceChange, selfCwd?: s
         "Before a wide edit, a branch switch, a reset, or a dependency install, use `agents.peers` " +
         "inside `fabric_exec` to see who is running and `agents.steer` to message one by id. " +
         "Coordinate only with relevant peers that are running or have pending messages, not every connected session. " +
-        "Routine peer messages are passive; use triggerTurn: true only when a peer must act. Do not acknowledge informational updates unless action is needed.",
+        "Peer messages wake a quiet peer at once; a peer running a turn queues them for right after it. Do not acknowledge informational updates unless action is needed.",
     );
   }
   lines.push("</fabric-peers>");
