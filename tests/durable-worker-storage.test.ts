@@ -46,7 +46,7 @@ describe("durable worker exclusive storage (real Node SQLite)", () => {
         'import assert from "node:assert/strict"; import { openDurableWorkerStorage as acquire } from ' +
         JSON.stringify(${JSON.stringify(entry)}) + '; await assert.rejects(acquire(' + JSON.stringify(directory) + '), /locked/);']);
       const id = await owner.storage.mintId();
-      await owner.storage.commit([{ type: 'conversation', value: { id } }], context);
+      await owner.storage.commit([[{ type: 'conversation', value: { id } }]], () => {}, context);
       assert.ok((await readFile(join(directory, 'store/main.jsonl'), 'utf8')).includes('conversation'));
       if (process.platform !== 'win32') {
         for (const [path, mode] of [[directory, 0o700], [join(directory, 'store'), 0o700],
@@ -80,12 +80,12 @@ describe("durable worker exclusive storage (real Node SQLite)", () => {
       };
       syncBuiltinESMExports();
       const owner = await acquire(join(process.cwd(), 'flush'));
-      await owner.storage.commit([{ type: 'conversation', value: { id: await owner.storage.mintId() } }], context);
+      await owner.storage.commit([[{ type: 'conversation', value: { id: await owner.storage.mintId() } }]], () => {}, context);
       assert.ok(flushed.some(path => path.endsWith('main.jsonl')));
       flushed.length = 0;
       const id = await owner.storage.mintId();
-      await owner.storage.commit([{ type: 'document.create', record: { id, kind: 'flush-test', scope: { kind: 'session' } },
-        content: { kind: 'base', version: 1, value: { secret: 'payload' } } }], context);
+      await owner.storage.commit([[{ type: 'document.create', record: { id, kind: 'flush-test', scope: { kind: 'session' } },
+        content: { kind: 'base', version: 1, value: { secret: 'payload' } } }]], () => {}, context);
       const payloadFlush = flushed.findIndex(path => path.endsWith('doc-' + id + '.jsonl'));
       const markerFlush = flushed.findIndex(path => path.endsWith('main.jsonl'));
       assert.ok(payloadFlush >= 0 && markerFlush > payloadFlush, JSON.stringify(flushed));
@@ -108,8 +108,8 @@ describe("durable worker exclusive storage (real Node SQLite)", () => {
       syncBuiltinESMExports();
       const owner = await acquire(join(process.cwd(), 'flush-failure'));
       const writes = [{ type: 'conversation', value: { id: await owner.storage.mintId() } }];
-      await assert.rejects(owner.storage.commit(writes, context), /poisoned/);
-      await assert.rejects(owner.storage.commit(writes, context), /poisoned/);
+      await assert.rejects(owner.storage.commit([writes], () => {}, context), /poisoned/);
+      await assert.rejects(owner.storage.commit([writes], () => {}, context), /poisoned/);
       await owner.storage.close(context);
       await owner.release();
     `);
@@ -181,10 +181,10 @@ describe("durable worker exclusive storage (real Node SQLite)", () => {
     const directory = join(root, "crash");
     const child = spawn(node, ["--input-type=module", "-e", prelude() + `
       const owner = await acquire(${JSON.stringify(directory)});
-      await owner.storage.commit([{ type: 'conversation', value: { id: await owner.storage.mintId() } }], context);
+      await owner.storage.commit([[{ type: 'conversation', value: { id: await owner.storage.mintId() } }]], () => {}, context);
       const docId = await owner.storage.mintId();
-      await owner.storage.commit([{ type: 'document.create', record: { id: docId, kind: 'crash-test', scope: { kind: 'session' } },
-        content: { kind: 'base', version: 1, value: { recovered: true } } }], context);
+      await owner.storage.commit([[{ type: 'document.create', record: { id: docId, kind: 'crash-test', scope: { kind: 'session' } },
+        content: { kind: 'base', version: 1, value: { recovered: true } } }]], () => {}, context);
       // Simulate an interrupted next marker after a fully persisted commit.
       await appendFile(join(${JSON.stringify(directory)}, 'store/main.jsonl'), '{"format":');
       console.log('READY');
