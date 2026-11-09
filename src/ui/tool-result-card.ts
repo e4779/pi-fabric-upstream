@@ -88,8 +88,13 @@ const cardStatusLine = (card: FabricToolResultCardV1, theme: Theme): string => {
     case "error":
       if (card.aborted === true) return theme.fg("warning", `⏹ stopped${suffix}`);
       return theme.fg("error", `✗ exit ${card.exitCode ?? "?"}${suffix}`);
-    case "timeout":
-      return theme.fg("warning", `⏱ timeout${suffix}`);
+    case "timeout": {
+      // A timeout that also raced an abort keeps the deadline as the headline
+      // (the more specific stop) and carries `aborted` beside it — the two
+      // states stay distinguishable instead of collapsing into one bit.
+      const aborted = card.aborted === true ? theme.fg("dim", " · aborted") : "";
+      return theme.fg("warning", `⏱ timeout`) + aborted + (suffix ? theme.fg("warning", suffix) : "");
+    }
     case "blocked":
       return theme.fg("warning", `⊘ blocked${suffix}`);
     case "backgrounded": {

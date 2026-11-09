@@ -441,6 +441,42 @@ describe("v1 union covers the producer shapes", () => {
     expect(fabricToolResultCardTone(card!)).toBe("warning");
   });
 
+  it("keeps a timeout that raced an abort distinguishable from a plain timeout", () => {
+    // The shell-exec race: the deadline kill and the operator abort can both
+    // land on one outcome (timedOut AND aborted true). The timeout kind wins
+    // (the deadline is the more specific stop) and the aborted slot keeps the
+    // second state visible — the card must discriminate the two outcomes.
+    const raced = readFabricToolResultCardV1({
+      schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
+      kind: "timeout",
+      exitCode: null,
+      ms: 30_000,
+      aborted: true,
+      tail: ["partial output"],
+    });
+    const plain = readFabricToolResultCardV1({
+      schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
+      kind: "timeout",
+      exitCode: null,
+      ms: 30_000,
+      tail: ["partial output"],
+    });
+    expect(raced).toMatchObject({ kind: "timeout", aborted: true });
+    expect((plain as { aborted?: boolean }).aborted).toBeUndefined();
+    expect(fabricToolResultCardTone(raced!)).toBe("warning");
+    const racedLine = toolResultCardLines(raced!, { expanded: false }, plainTheme).at(-1);
+    const plainLine = toolResultCardLines(plain!, { expanded: false }, plainTheme).at(-1);
+    expect(racedLine).toBe("⏱ timeout · aborted · 30.0s");
+    expect(plainLine).toBe("⏱ timeout · 30.0s");
+    expect(racedLine).not.toBe(plainLine); // the states stay distinguishable
+    // Refuse-not-guess: a malformed aborted slot rejects the whole card.
+    expect(readFabricToolResultCardV1({
+      schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
+      kind: "timeout",
+      aborted: "yes",
+    })).toBeUndefined();
+  });
+
   it("maps the cast's detached run onto backgrounded with taskId, logPath, pid", () => {
     const card = readFabricToolResultCardV1({
       schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
