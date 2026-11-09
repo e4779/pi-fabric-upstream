@@ -195,11 +195,22 @@ describe("pi-fabric mesh post CLI", () => {
   });
 });
 
+// Resolve the bash interpreter without assuming /bin/bash: honor a BASH
+// override, then ask the always-present /bin/sh to locate bash on PATH
+// (Linux/macOS/BS D hosts), falling back to the historical /bin/bash path.
+const resolveBash = (): string => {
+  const override = process.env.BASH?.trim();
+  if (override) return override;
+  const probe = spawnSync("/bin/sh", ["-c", "command -v bash"], { encoding: "utf8", timeout: 10_000 });
+  const found = probe.status === 0 ? probe.stdout.trim() : "";
+  return found || "/bin/bash";
+};
+
 describe.skipIf(process.platform === "win32")("durable notify script wrapper", () => {
   const run = (script: string): ReturnType<typeof spawnSync> => {
     const file = path.join(tempRoot(), "task.sh");
     fs.writeFileSync(file, script, { mode: 0o600 });
-    return spawnSync("/bin/bash", [file], { encoding: "utf8", timeout: 30_000 });
+    return spawnSync(resolveBash(), [file], { encoding: "utf8", timeout: 30_000 });
   };
 
   it("preserves the task exit code and publishes it through the CLI", async () => {
