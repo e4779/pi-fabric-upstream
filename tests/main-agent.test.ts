@@ -105,12 +105,12 @@ describe("MainAgentController", () => {
         content: expect.stringContaining("inspect &lt;unsafe&gt; &amp; continue"),
         details: expect.objectContaining({
           from: { id: "actor-1", name: "Supervisor", kind: "actor" },
-          delivery: "steer",
+          delivery: "followUp",
           requestedDelivery: "followUp",
           data: { priority: 2 },
         }),
       }),
-      { deliverAs: "steer", triggerTurn: true },
+      { deliverAs: "followUp", triggerTurn: true },
     );
 
     const longMessage = "x".repeat(20_000);
@@ -133,28 +133,46 @@ describe("MainAgentController", () => {
       triggerTurn: false,
     });
     expect(sendMessage.mock.calls.at(-1)?.[1]).toEqual({
-      deliverAs: "steer",
+      deliverAs: "followUp",
       triggerTurn: false,
     });
   });
 
-  it.each(["steer", "followUp"] as const)("keeps peer %s passive by default and honors explicit wake choices", delivery => {
+  it.each(["steer", "followUp"] as const)("wakes by default for %s delivery and honors explicit wake and passive choices", delivery => {
     const sendMessage = vi.fn();
     const controller = new MainAgentController({ sendMessage } as unknown as ExtensionAPI, "session:root", true, "/tmp/project");
     const from = { id: "session:peer", name: "main", kind: "main" as const };
-    for (const triggerTurn of [undefined, false, true]) {
+    for (const triggerTurn of [undefined, true]) {
       controller.deliverAgent({ from, message: "Progress update", delivery, ...(triggerTurn === undefined ? {} : { triggerTurn }) });
-      expect(sendMessage.mock.calls.at(-1)?.[1]).toEqual({ deliverAs: "steer", triggerTurn: triggerTurn ?? false });
-      expect(sendMessage.mock.calls.at(-1)?.[0].details.triggerTurn).toBe(triggerTurn ?? false);
+      expect(sendMessage.mock.calls.at(-1)?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
+      expect(sendMessage.mock.calls.at(-1)?.[0].details.triggerTurn).toBe(true);
     }
+    controller.deliverAgent({ from, message: "Progress update", delivery, triggerTurn: false });
+    expect(sendMessage.mock.calls.at(-1)?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+    expect(sendMessage.mock.calls.at(-1)?.[0].details.triggerTurn).toBe(false);
     for (const source of [
       { id: "child", name: "worker", kind: "agent" as const },
       { id: "actor", name: "reviewer", kind: "actor" as const },
       { id: "session:root", name: "main", kind: "main" as const },
     ]) {
       controller.deliverAgent({ from: source, message: "Action needed", delivery });
-      expect(sendMessage.mock.calls.at(-1)?.[1]).toEqual({ deliverAs: "steer", triggerTurn: true });
+      expect(sendMessage.mock.calls.at(-1)?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
     }
+  });
+
+  it("records the requested delivery and the followUp queue in message details", () => {
+    const sendMessage = vi.fn();
+    const controller = new MainAgentController({ sendMessage } as unknown as ExtensionAPI, "session:root", true, "/tmp/project");
+    controller.deliverAgent({
+      from: { id: "session:peer", name: "main", kind: "main" },
+      message: "hand off",
+      delivery: "steer",
+    });
+    expect(sendMessage.mock.calls.at(-1)?.[0].details).toMatchObject({
+      delivery: "followUp",
+      requestedDelivery: "steer",
+      triggerTurn: true,
+    });
   });
 
   it("rejects direct delivery from a process that does not own Main", () => {
@@ -197,6 +215,91 @@ describe("MainAgentController", () => {
     ).toThrow(/owned by another/);
   });
 });
+
+  // Faithful mirror of pi-coding-agent 1.5 sendCustomMessage (core/agent-session.js):
+  // the arm a custom message takes, given the recipient's live session state.
+  type DeliveryArm = "nextTurn" | "followUpQueue" | "steer" | "startRun" | "deferredStart" | "deferredAppend" | "append";
+  const piDeliveryArm = (
+    options: { deliverAs?: string; triggerTurn?: boolean },
+    state: { streaming: boolean; settling?: boolean },
+  ): DeliveryArm => {
+    if (options.deliverAs === "nextTurn") return "nextTurn";
+    if (state.streaming && options.triggerTurn !== false) {
+      return options.deliverAs === "followUp" ? "followUpQueue" : "steer";
+    }
+    if (options.triggerTurn) return state.settling === true ? "deferredStart" : "startRun";
+    if (state.streaming) return "deferredAppend";
+    return "append";
+  };
+
+  it.each([undefined, false, true] as const)("wakes an idle recipient (triggerTurn=%s)", triggerTurn => {
+    const sendMessage = vi.fn();
+    const controller = new MainAgentController({ sendMessage } as unknown as ExtensionAPI, "session:root", true, "/tmp/project");
+    controller.deliverAgent({
+      from: { id: "session:peer", name: "main", kind: "main" },
+      message: "wake up",
+      delivery: "followUp",
+      ...(triggerTurn === undefined ? {} : { triggerTurn }),
+    });
+    const options = sendMessage.mock.calls.at(-1)?.[1];
+    expect(piDeliveryArm(options, { streaming: false })).toBe(triggerTurn === false ? "append" : "startRun");
+    if (triggerTurn !== false) {
+      // Idle wake means a run starts with the message as its input: the
+      // recipient does not wait for a natural turn to see peer traffic.
+      expect(options).toMatchObject({ triggerTurn: true });
+    }
+  });
+
+  it("queues behind an in-flight executable block and never aborts it", () => {
+    const sendMessage = vi.fn();
+    const controller = new MainAgentController({ sendMessage } as unknown as ExtensionAPI, "session:root", true, "/tmp/project");
+    const events: string[] = ["block-start"];
+    // The peer message lands while the recipient's executable block runs.
+    controller.deliverAgent({
+      from: { id: "session:peer", name: "main", kind: "main" },
+      message: "when you can",
+      delivery: "steer",
+    });
+    const options = sendMessage.mock.calls.at(-1)?.[1];
+    expect(piDeliveryArm(options, { streaming: true })).toBe("followUpQueue");
+    // Pi drains follow-ups only when the run would otherwise stop, so the
+    // in-flight block always finishes untouched and delivery rides the
+    // continuation after it.
+    events.push("block-end", "tool-result: block result", "drain-followUp: message");
+    expect(events).toEqual([
+      "block-start",
+      "block-end",
+      "tool-result: block result",
+      "drain-followUp: message",
+    ]);
+  });
+
+  it("never selects the steer arm for any recipient state or wake choice (no-abort invariant)", () => {
+    const sendMessage = vi.fn();
+    const controller = new MainAgentController({ sendMessage } as unknown as ExtensionAPI, "session:root", true, "/tmp/project");
+    const senders = [
+      { id: "session:peer", name: "main", kind: "main" as const },
+      { id: "child", name: "worker", kind: "agent" as const },
+      { id: "actor", name: "reviewer", kind: "actor" as const },
+    ] as const;
+    for (const from of senders) {
+      for (const triggerTurn of [undefined, false, true] as const) {
+        controller.deliverAgent({
+          from,
+          message: "invariant",
+          delivery: "followUp",
+          ...(triggerTurn === undefined ? {} : { triggerTurn }),
+        });
+        const options = sendMessage.mock.calls.at(-1)?.[1];
+        expect(options?.deliverAs).toBe("followUp");
+        for (const streaming of [false, true]) {
+          for (const settling of [false, true]) {
+            expect(piDeliveryArm(options, { streaming, settling })).not.toBe("steer");
+          }
+        }
+      }
+    }
+  });
 
 describe("MainAgentController.switchModel", () => {
   const buildContext = (found: unknown): ExtensionContext =>
