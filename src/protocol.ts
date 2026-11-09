@@ -2,6 +2,7 @@ import type { FabricActionPolicyHookV1 } from "./core/action-policy-hooks.js";
 import type {
   FabricShellJobEvent,
   FabricShellJobInfo,
+  FabricShellStopReason,
 } from "./core/shell-jobs.js";
 import type {
   BashOperations,
@@ -1018,6 +1019,7 @@ export const FABRIC_SHELL_JOB_NOTIFY_EVENT = "pi-fabric:shell-job:notify-complet
 export type {
   FabricShellJobEvent,
   FabricShellJobInfo,
+  FabricShellStopReason,
 } from "./core/shell-jobs.js";
 
 export type FabricShellJobRegistrationOptionsV1 = {
@@ -1061,7 +1063,7 @@ export interface FabricBgServiceFacadeV1 {
   notifyCompletion(
     jobId: string,
     payload: string,
-    options?: { exitCode?: number },
+    options?: { exitCode?: number | null; stopReason?: FabricShellStopReason },
   ): Promise<FabricShellJobCompletionResultV1>;
 }
 
@@ -1077,6 +1079,19 @@ const MAX_FABRIC_SHELL_JOB_ID = 256;
 
 const boundedString = (value: unknown, max: number): value is string =>
   typeof value === "string" && value.length > 0 && value.length <= max;
+
+/** Terminal causes a completion may carry; anything else refuses the payload. */
+const FABRIC_SHELL_COMPLETION_STOP_REASONS: ReadonlySet<string> = new Set([
+  "completed",
+  "runtime_error",
+  "timed_out",
+  "aborted",
+  "user",
+  "agent",
+  "monitor-deadline",
+  "session-shutdown",
+  "branch-abandoned",
+]);
 
 const readRegistrationOptionsV1 = (
   record: Record<string, unknown>,
@@ -1175,8 +1190,19 @@ export interface FabricShellJobCompletionV1 {
   jobId: string;
   /** Retained as the job's terminal tail; delivered as untrusted task output, never instructions. */
   payload: string;
-  /** `0` (the default) maps to status `exited`; any other integer maps to `failed`. */
-  exitCode?: number;
+  /**
+   * `0` (the default) maps to status `exited`; any other integer maps to
+   * `failed`; `null` records a run that ended without an exit code (a kill
+   * leaves none) and maps to `failed`.
+   */
+  exitCode?: number | null;
+  /**
+   * Typed cause of the terminal state, carried unchanged by the finished
+   * event's typed wake (`stopReason`) so a deadline death is never a bare
+   * `failed`. An unknown value refuses the whole completion; omitted derives
+   * `completed` (exit 0) or `runtime_error`.
+   */
+  stopReason?: FabricShellStopReason;
   respond?: (result: FabricShellJobCompletionResultV1) => void;
 }
 
@@ -1185,13 +1211,14 @@ export const readFabricShellJobCompletionV1 = (
 ): FabricShellJobCompletionV1 | undefined => {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const record = value as Record<string, unknown>;
-  const { exitCode } = record as { exitCode?: unknown };
+  const { exitCode, stopReason } = record as { exitCode?: unknown; stopReason?: unknown };
   if (
     record.version !== 1 ||
     !boundedString(record.jobId, MAX_FABRIC_SHELL_JOB_ID) ||
     typeof record.payload !== "string" ||
     record.payload.length > MAX_FABRIC_SHELL_JOB_PAYLOAD ||
-    (exitCode !== undefined && !(typeof exitCode === "number" && Number.isSafeInteger(exitCode))) ||
+    (exitCode !== undefined && !(exitCode === null || (typeof exitCode === "number" && Number.isSafeInteger(exitCode)))) ||
+    (stopReason !== undefined && (typeof stopReason !== "string" || !FABRIC_SHELL_COMPLETION_STOP_REASONS.has(stopReason))) ||
     (record.respond !== undefined && typeof record.respond !== "function")
   ) {
     return undefined;
@@ -1200,7 +1227,8 @@ export const readFabricShellJobCompletionV1 = (
     version: 1,
     jobId: record.jobId,
     payload: record.payload,
-    ...(exitCode !== undefined ? { exitCode: exitCode as number } : {}),
+    ...(exitCode !== undefined ? { exitCode: exitCode as number | null } : {}),
+    ...(stopReason !== undefined ? { stopReason: stopReason as FabricShellStopReason } : {}),
     ...(record.respond
       ? { respond: record.respond as NonNullable<FabricShellJobCompletionV1["respond"]> }
       : {}),
@@ -1798,9 +1826,9 @@ export {
  *    field names (`exit`, `out`, `id`, `paths`), so the prose channel can
  *    adopt the union later without renaming or breaking its payloads.
  *
- * The background facade is deliberately outside this contract:
- * `notifyCompletion` is UNTYPED input by decision — it carries `{ exitCode }`
- * only, and its payload is an untyped terminal tail string. The union
+ * The background facade sits deliberately outside this render contract: a
+ * `notifyCompletion` carries `{ exitCode, stopReason }` as typed input to the
+ * wake channel, and its payload is an untyped terminal tail string. The union
  * inherits exactly what the facade does not carry; a completion never
  * manufactures a card kind of its own.
  */

@@ -43,6 +43,12 @@ export const createFabricBgServiceFacade = (
       const store = resolveStore();
       if (!store) throw unavailable();
       const job = store.begin(tool, command, options);
+      // The register channel's contract is background work: the job runs
+      // outside the current turn and its completion must wake the session.
+      // Spilling is the store's own marker for exactly that; without it the
+      // inbox would drop the finished event and the documented single
+      // sanctioned delivery channel would never fire for facade jobs.
+      job.spill();
       return { ok: true, jobId: job.id, info: job.info() };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -83,11 +89,17 @@ export const createFabricBgServiceFacade = (
         // and carried by the finished event's typed wake tail. Provenance is
         // written once into the log, not into model-facing text.
         if (payload.length > 0) job.append(Buffer.from(payload, "utf8"));
+        // The owner names why the run ended; knowing only the exit code, 0
+        // completes and anything else is a runtime failure — the typed wake
+        // never carries an untyped stop. `null` records a run that ended
+        // without an exit code (a kill leaves none).
+        const exitCode = options?.exitCode === undefined ? 0 : options.exitCode;
+        const stopReason = options?.stopReason ?? (exitCode === 0 ? "completed" : "runtime_error");
         // finish() answers whether THIS call performed the terminal transition.
         // A concurrent finisher (session close, process exit) landing between
         // the finished check and this call must not be reported as ok:true with
         // the payload dropped.
-        const finished = await job.finish(options?.exitCode ?? 0, "[Completed by owner via notifyCompletion]");
+        const finished = await job.finish(exitCode, "[Completed by owner via notifyCompletion]", stopReason);
         if (!finished) return { ok: false, error: `Background job already finished: ${jobId}` };
         return { ok: true };
       } catch (error) {
@@ -133,7 +145,10 @@ export const registerFabricBgJobService = (
   const offNotify = pi.events.on(FABRIC_SHELL_JOB_NOTIFY_EVENT, (value: unknown) => {
     const completion = readFabricShellJobCompletionV1(value);
     if (!completion) throw new Error("Invalid Pi Fabric background job completion");
-    const options = completion.exitCode === undefined ? {} : { exitCode: completion.exitCode };
+    const options = {
+      ...(completion.exitCode !== undefined ? { exitCode: completion.exitCode } : {}),
+      ...(completion.stopReason !== undefined ? { stopReason: completion.stopReason } : {}),
+    };
     void service
       .notifyCompletion(completion.jobId, completion.payload, options)
       .then((result) => completion.respond?.(result));

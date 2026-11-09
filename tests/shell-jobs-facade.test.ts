@@ -1,10 +1,11 @@
-import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import type { FabricShellJobEvent } from "../src/core/shell-jobs.js";
+import { ShellEventInbox, SHELL_MESSAGE_TYPE } from "../src/core/shell-inbox.js";
 import {
   createFabricBgServiceFacade,
   registerFabricBgJobService,
@@ -52,7 +53,10 @@ describe("fabric bg service facade (registerJob/unregister/subscribe/notifyCompl
     if (!result.ok) return;
     expect(result.info.command).toBe("bun run build");
     expect(result.info.description).toBe("build");
-    expect(result.info.status).toBe("running");
+    // The register channel's contract is background work: the job is spilled
+    // at registration so its completion wakes through the session inbox.
+    expect(result.info.status).toBe("spilled");
+    expect(result.info.spilledAt).toBeDefined();
     expect(store.get(result.jobId)).toBeDefined();
     // The facade wraps the store's own handle: no second registry exists.
     expect(store.list()).toHaveLength(1);
@@ -140,6 +144,67 @@ describe("fabric bg service facade (registerJob/unregister/subscribe/notifyCompl
     const finished = events.find((event) => event.type === "finished");
     expect(finished?.job.status).toBe("failed");
     expect(finished?.job.exitCode).toBe(3);
+  });
+
+  it("notifyCompletion derives a typed stop reason from the exit code when the owner names none", async () => {
+    const store = new FabricShellJobStore(tempRoot());
+    const service = createFabricBgServiceFacade(() => store);
+    const ok = service.registerJob("bash", "clean");
+    const crash = service.registerJob("bash", "dirty");
+    if (!ok.ok || !crash.ok) throw new Error("registration failed");
+    await service.notifyCompletion(ok.jobId, "done");
+    await service.notifyCompletion(crash.jobId, "boom", { exitCode: 3 });
+    expect(store.get(ok.jobId)?.info()).toMatchObject({ status: "exited", stopReason: "completed" });
+    expect(store.get(crash.jobId)?.info()).toMatchObject({ status: "failed", stopReason: "runtime_error" });
+  });
+
+  it("notifyCompletion carries a typed stop reason beside a missing exit code", async () => {
+    const store = new FabricShellJobStore(tempRoot());
+    const service = createFabricBgServiceFacade(() => store);
+    const job = service.registerJob("bash", "watch CI");
+    if (!job.ok) throw new Error("registration failed");
+    const events: FabricShellJobEvent[] = [];
+    store.subscribe((event) => events.push(event));
+    await service.notifyCompletion(job.jobId, "deadline killed it", { exitCode: null, stopReason: "timed_out" });
+    const finished = events.find((event) => event.type === "finished");
+    // No exit code is invented for a kill (null = ended without one), and the
+    // typed wake names the cause instead of leaving a bare `failed`.
+    expect(finished?.job.status).toBe("failed");
+    expect(finished?.job.exitCode).toBeNull();
+    expect(finished?.job.stopReason).toBe("timed_out");
+  });
+
+  it("registerJob plus notifyCompletion delivers the typed wake through the session inbox", async () => {
+    vi.useFakeTimers();
+    const store = new FabricShellJobStore(tempRoot());
+    const sendMessage = vi.fn();
+    const ctx = { hasUI: false, ui: { notify: vi.fn() }, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
+    const pi = { sendMessage, on: () => () => {} } as unknown as ExtensionAPI;
+    const inbox = new ShellEventInbox(pi, ctx, store);
+    cleanups.push(
+      () => inbox.close(),
+      () => void store.close(),
+      () => vi.useRealTimers(),
+    );
+    const service = createFabricBgServiceFacade(() => store);
+    const job = service.registerJob("bash", "bun run build", { ownerId: "sess-facade" });
+    expect(job.ok).toBe(true);
+    if (!job.ok) return;
+    await expect(service.notifyCompletion(job.jobId, "build done", { exitCode: 0 })).resolves.toEqual({ ok: true });
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    const message = sendMessage.mock.calls[0]![0];
+    expect(message.customType).toBe(SHELL_MESSAGE_TYPE);
+    expect(message.details.ids).toEqual([job.jobId]);
+    expect(message.details.events[0]).toMatchObject({
+      schemaVersion: 1,
+      kind: "wake",
+      id: job.jobId,
+      status: "exited",
+      exitCode: 0,
+      stopReason: "completed",
+    });
+    expect(message.content).toContain("not human input");
   });
 
   it("notifyCompletion refuses unknown and already-finished jobs", async () => {
@@ -333,5 +398,18 @@ describe("fabric bg service protocol readers", () => {
     expect(readFabricShellJobCompletionV1({ ...valid, jobId: "" })).toBeUndefined();
     expect(readFabricShellJobCompletionV1({ version: 1, jobId: "j" })).toBeUndefined();
     expect(readFabricShellJobCompletionV1({ ...valid, payload: 42 })).toBeUndefined();
+  });
+
+  it("accepts a typed stop reason and a null exit code; unknown reasons refuse the completion", () => {
+    const valid = { version: 1, jobId: "j", payload: "done" };
+    // `null` records a run that ended without an exit code (a kill leaves none).
+    expect(readFabricShellJobCompletionV1({ ...valid, exitCode: null })).toEqual({ ...valid, exitCode: null });
+    expect(readFabricShellJobCompletionV1({ ...valid, exitCode: null, stopReason: "timed_out" }))
+      .toEqual({ ...valid, exitCode: null, stopReason: "timed_out" });
+    expect(readFabricShellJobCompletionV1({ ...valid, stopReason: "user" }))
+      .toEqual({ ...valid, stopReason: "user" });
+    // Refuse-not-guess: an unknown terminal cause rejects the whole payload.
+    expect(readFabricShellJobCompletionV1({ ...valid, stopReason: "exploded" })).toBeUndefined();
+    expect(readFabricShellJobCompletionV1({ ...valid, stopReason: 7 })).toBeUndefined();
   });
 });
