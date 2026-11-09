@@ -25,7 +25,12 @@ const started = () => {
 };
 afterEach(async () => { await Promise.all(providers.splice(0).map(value => value.close())); });
 
-describe("file memory worker ownership", () => {
+// bun:test is not a supported runner for this file: its vitest shim lacks
+// advanceTimersByTimeAsync (idle test fails) and terminating a worker parked
+// in Atomics.wait spins the event loop forever (zombie factory, 2026-11-09).
+// CI runs vitest; skip under the bun harness so ad-hoc `bun test` cannot hang.
+const bunHarness = !!process.versions.bun && (globalThis as { __vitest_worker__?: unknown }).__vitest_worker__ === undefined;
+describe.skipIf(bunHarness)("file memory worker ownership", () => {
   it("uses one worker for a FIFO burst and forwards progress", async () => {
     const memory = provider();
     const context = invocation();
