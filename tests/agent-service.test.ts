@@ -12,6 +12,23 @@ const deferred = <T>() => {
   return {promise, resolve, reject};
 };
 const usage = {input: 1, output: 2, cacheRead: 0, cacheWrite: 0, cost: 0};
+const DEFAULT_WAIT_MS = process.env.CI ? 10_000 : 2_000;
+// vi.waitFor is unavailable under bun test; poll like tests/actor-manager.test.ts does.
+const waitFor = async (assertion: () => void, timeoutMs = DEFAULT_WAIT_MS): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    try { assertion(); return; } catch (error) { if (Date.now() >= deadline) throw error; }
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+};
+// bun test's expect(p).rejects matcher deadlocks when stored and awaited after more
+// async work; capture the rejection with a plain promise and assert on it instead.
+interface RejectionCapture {settled: Promise<unknown>; error: unknown}
+const captureRejection = <T>(promise: Promise<T>): RejectionCapture => {
+  const capture: RejectionCapture = {settled: Promise.resolve(), error: undefined};
+  capture.settled = promise.catch((error: unknown) => {capture.error = error;});
+  return capture;
+};
 const context = {signal: undefined} as FabricInvocationContext;
 const services: AgentService[] = [];
 const service = (port: AgentExecutionPort, options: Partial<ConstructorParameters<typeof AgentService>[0]> = {}) => {
@@ -69,12 +86,13 @@ describe("hosted Fabric agent service", () => {
     const client = createAgentServiceClient(dispatch);
     const provider = createAgentsProvider(client);
     const handle = await client.spawn({task: "single child"});
-    await vi.waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
     const controller = new AbortController();
     const waiting = provider.invoke(method, {id: handle.id}, {...context, signal: controller.signal});
-    const cancelled = expect(waiting).rejects.toThrow();
+    const cancelled = captureRejection(waiting);
     controller.abort();
-    await cancelled;
+    await cancelled.settled;
+    expect(cancelled.error).toBeInstanceOf(Error);
     expect(await client.status(handle.id)).toMatchObject({status: "running"});
     const foreign = createAgentServiceHandler(instance, "foreign");
     await expect(foreign(method, {id: handle.id})).rejects.toThrow("Unknown agent caller");
@@ -116,7 +134,7 @@ describe("hosted Fabric agent service", () => {
     const instance = service({prepare, execute: async () => ({status: "completed"})}, {maxConcurrent: 9});
     const operations = Array.from({length: 9}, (_, index) => instance.run("root", {task: String(index)}));
     const all = Promise.allSettled(operations);
-    await vi.waitFor(() => expect(prepare).toHaveBeenCalledTimes(9));
+    await waitFor(() => expect(prepare).toHaveBeenCalledTimes(9));
     expect(instance.snapshot().starts).toBe(0);
     gate.resolve();
     const results = await all;
@@ -155,7 +173,7 @@ describe("hosted Fabric agent service", () => {
     const host = hanging();
     const instance = service(host.port);
     const handle = await instance.spawn("root", {task: "background"});
-    await vi.waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
     const controller = new AbortController();
     const waiter = instance.wait("root", handle.id, controller.signal);
     controller.abort();
@@ -171,11 +189,11 @@ describe("hosted Fabric agent service", () => {
     const stop = vi.fn(async () => stopAck.promise);
     const instance = service({...host.port, stop});
     const parent = await instance.spawn("root", {task: "parent"});
-    await vi.waitFor(() => expect(host.requests.has(parent.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(parent.id)).toBe(true));
     const child = await instance.spawn(parent.id, {task: "child"});
-    await vi.waitFor(() => expect(host.requests.has(child.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(child.id)).toBe(true));
     const stopped = instance.stop("root", parent.id);
-    await vi.waitFor(() => expect(stop).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(stop).toHaveBeenCalledTimes(2));
     expect(host.port.cleanup).not.toHaveBeenCalled();
     stopAck.resolve();
     expect(await stopped).toMatchObject({status: "stopped"});
@@ -229,7 +247,7 @@ describe("hosted Fabric agent service", () => {
     const host = hanging();
     const original = service(host.port);
     const handle = await original.spawn("root", {task: "running"});
-    await vi.waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
     const saved = original.snapshot();
     const execute = vi.fn();
     const restored = service({execute}, {snapshot: saved});
@@ -249,7 +267,7 @@ describe("hosted Fabric agent service", () => {
     }, resume: async () => ({status: "completed"})});
     const paused = await instance.run("root", {task: "pause"});
     const first = instance.resume("root", paused.id);
-    await vi.waitFor(() => expect(instance.snapshot().starts).toBe(1));
+    await waitFor(() => expect(instance.snapshot().starts).toBe(1));
     await expect(instance.resume("root", paused.id)).rejects.toThrow("idle paused");
     gate.resolve();
     await expect(first).rejects.toThrow("denied resume");
@@ -275,11 +293,13 @@ describe("hosted Fabric agent service", () => {
     expect((await provider.list({}, context)).map((descriptor) => descriptor.name).sort()).toEqual(["join", "list", "run", "spawn", "status", "stop", "wait"]);
     expect(prepare).not.toHaveBeenCalled();
     const pending = instance.spawn("root", {task: "pending"});
-    const rejected = expect(pending).rejects.toThrow("aborted");
-    await vi.waitFor(() => expect(prepare).toHaveBeenCalledOnce());
+    const rejected = captureRejection(pending);
+    await waitFor(() => expect(prepare).toHaveBeenCalledOnce());
     const close = instance.close();
     gate.resolve();
-    await rejected; await close;
+    await rejected.settled; await close;
+    expect(rejected.error).toBeInstanceOf(Error);
+    expect((rejected.error as Error).message).toContain("aborted");
     expect(instance.snapshot().starts).toBe(0);
     expect(execute).not.toHaveBeenCalled();
   });
@@ -288,7 +308,7 @@ describe("hosted Fabric agent service", () => {
     const host = hanging();
     const instance = service(host.port);
     const handle = await instance.spawn("root", {task: "approval"});
-    await vi.waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
     await host.requests.get(handle.id)!.emit({type: "checkpoint", checkpoint: {approval: "private"}});
     await instance.close();
     expect(await instance.wait("root", handle.id)).toMatchObject({status: "paused"});
@@ -331,17 +351,19 @@ describe("hosted Fabric agent service", () => {
     const steer = vi.fn(async () => {});
     const instance = service({...host.port, compact, steer});
     const handle = await instance.spawn("root", {task: "controlled"});
-    await vi.waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
     expect(await instance.steer("root", handle.id, "update")).toMatchObject({status: "running"});
     expect(steer).toHaveBeenCalledWith(expect.objectContaining({id: handle.id, message: "update"}));
     const control = instance.compact("root", handle.id, "preserve decisions");
-    const rejected = expect(control).rejects.toThrow("Stale agent control acknowledgment");
-    await vi.waitFor(() => expect(compact).toHaveBeenCalledOnce());
+    const rejected = captureRejection(control);
+    await waitFor(() => expect(compact).toHaveBeenCalledOnce());
     const stopped = instance.stop("root", handle.id);
-    await vi.waitFor(() => expect(host.requests.get(handle.id)!.signal.aborted).toBe(true));
+    await waitFor(() => expect(host.requests.get(handle.id)!.signal.aborted).toBe(true));
     expect(host.port.cleanup).not.toHaveBeenCalled();
     ack.resolve();
-    await rejected;
+    await rejected.settled;
+    expect(rejected.error).toBeInstanceOf(Error);
+    expect((rejected.error as Error).message).toContain("Stale agent control acknowledgment");
     expect(await stopped).toMatchObject({status: "stopped"});
     expect(host.port.cleanup).toHaveBeenCalledOnce();
   });
@@ -362,7 +384,7 @@ describe("hosted Fabric agent service", () => {
     const host = hanging();
     const instance = service({...host.port, stop: async () => {throw new Error("stop ack failed");}});
     const child = await instance.spawn("root", {task: "stop failure"});
-    await vi.waitFor(() => expect(host.requests.has(child.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(child.id)).toBe(true));
     await expect(instance.stop("root", child.id)).rejects.toThrow("Agent stop failed");
     expect(host.port.cleanup).toHaveBeenCalledOnce();
     expect(await instance.wait("root", child.id)).toMatchObject({status: "stopped"});
@@ -385,7 +407,7 @@ describe("hosted Fabric agent service", () => {
     let drained = false;
     const drain = instance.drain().then(() => {drained = true;});
     gate.resolve();
-    await vi.waitFor(() => expect(instance.snapshot().records).toHaveLength(2));
+    await waitFor(() => expect(instance.snapshot().records).toHaveLength(2));
     expect(drained).toBe(false);
     expect(instance.snapshot().records[0]!.record.status).toBe("completed");
     leaf.resolve();
@@ -462,7 +484,7 @@ describe("hosted Fabric agent service", () => {
     };
     const instance = service({...host.port, followUp}, {topology});
     const handle = await instance.spawn("root", {task: "child"});
-    await vi.waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
+    await waitFor(() => expect(host.requests.has(handle.id)).toBe(true));
     expect(await instance.followUp("root", handle.id, "keep going")).toMatchObject({id: handle.id, status: "running"});
     expect(followUp).toHaveBeenCalledWith(expect.objectContaining({id: handle.id, message: "keep going"}));
     const client = createAgentServiceClient(createAgentServiceHandler(instance, "root"), instance.capabilities);
