@@ -1,9 +1,8 @@
 // The shared tool-result card: the render side of the typed details contract
 // (protocol.ts FabricToolResultCardV1). Any registered tool that fills its
-// result `details` with a v1 card gets fork-quality rendering — semantic
-// tones, a theme-blended background, collapsed preview with an expand hint —
+// result `details` with a v1 card gets host-quality rendering - semantic
+// tones, a theme-blended background, collapsed preview with an expand hint -
 // through the normal renderResult pipeline, without ANSI of its own.
-// Reference card: shell-lab shell-prose.ts buildCardLines/buildCardBgFn.
 import type {
   AgentToolResult,
   Theme,
@@ -14,7 +13,12 @@ import type {
 import { Text } from "@earendil-works/pi-tui";
 import type { Component } from "@earendil-works/pi-tui";
 import { PI_CORE_TOOL_NAMES } from "../core/pi-tools.js";
-import { readFabricToolResultCardV1, type FabricToolResultCardV1 } from "../protocol.js";
+import {
+  FABRIC_RENDER_CARD_EVENT,
+  readFabricToolResultCardContractV1,
+  type FabricRenderCardEventV1,
+  type FabricToolResultCardV1,
+} from "../protocol.js";
 import {
   applyPaddedBackground,
   blendSemanticBackground,
@@ -24,14 +28,21 @@ import {
 } from "./blend-background.js";
 import { expandHint, safeTerminalText } from "./fabric-render.js";
 
-/** Tail lines shown on the collapsed card (reference: preview 3). */
+/** Tail lines shown on the collapsed card. */
 export const TOOL_RESULT_CARD_PREVIEW_LINES = 3;
-/** Line cap for the expanded card body (fork renderResult bodies cap at 200). */
+/** Line cap for the expanded card body (renderResult bodies cap at 200). */
 export const TOOL_RESULT_CARD_EXPAND_MAX_LINES = 200;
 /** Lines of plain text a non-card result previews when collapsed. */
 export const TOOL_RESULT_TEXT_FALLBACK_PREVIEW_LINES = 12;
 
-/** Blend intensity per tone: success rests, failure alerts (fork diff pair). */
+/** Environment off switch for the shared card renderer (`=off` disables the resolver). */
+export const TOOL_RESULT_CARDS_ENV = "PI_FABRIC_TOOL_RESULT_CARDS";
+
+/** True when the env switch turns the shared card renderer off. */
+export const toolResultCardsEnvOff = (env: NodeJS.ProcessEnv = process.env): boolean =>
+  env[TOOL_RESULT_CARDS_ENV] === "off";
+
+/** Blend intensity per tone: success rests, failure alerts (the diff pair). */
 export const TOOL_RESULT_CARD_BG_INTENSITY: Record<SemanticBgTone, number> = {
   success: BLEND_INTENSITY_SUBTLE,
   error: BLEND_INTENSITY_MEDIUM,
@@ -42,7 +53,7 @@ export const TOOL_RESULT_CARD_BG_INTENSITY: Record<SemanticBgTone, number> = {
 const countLabel = (count: number, singular: string): string =>
   `${count} ${singular}${count === 1 ? "" : "s"}`;
 
-const formatCardMs = (ms: number | undefined): string | undefined => {
+const formatCardMs = (ms: unknown): string | undefined => {
   if (typeof ms !== "number" || !Number.isFinite(ms) || ms < 0) return undefined;
   return ms < 1_000 ? `${Math.round(ms)}ms` : `${(ms / 1_000).toFixed(1)}s`;
 };
@@ -53,22 +64,29 @@ export const fabricToolResultCardTone = (card: FabricToolResultCardV1): Semantic
     case "ok":
       return "success";
     case "error":
-      return "error";
+      return card.aborted === true ? "warning" : "error";
     case "timeout":
     case "blocked":
       return "warning";
     case "backgrounded":
+    case "img":
+    case "bg":
       return "neutral";
+    case "sh":
+      if (card.timedOut === true) return "warning";
+      return card.exit === 0 ? "success" : "error";
   }
 };
 
 const cardStatusLine = (card: FabricToolResultCardV1, theme: Theme): string => {
-  const duration = formatCardMs(card.ms);
+  const ms = "ms" in card ? card.ms : undefined;
+  const duration = formatCardMs(ms);
   const suffix = duration ? ` · ${duration}` : "";
   switch (card.kind) {
     case "ok":
       return theme.fg("success", `✓ exit ${card.exitCode ?? 0}${suffix}`);
     case "error":
+      if (card.aborted === true) return theme.fg("warning", `⏹ stopped${suffix}`);
       return theme.fg("error", `✗ exit ${card.exitCode ?? "?"}${suffix}`);
     case "timeout":
       return theme.fg("warning", `⏱ timeout${suffix}`);
@@ -78,8 +96,31 @@ const cardStatusLine = (card: FabricToolResultCardV1, theme: Theme): string => {
       const pid = typeof card.pid === "number" ? theme.fg("dim", ` · pid ${card.pid}`) : "";
       return theme.fg("accent", `● background ${card.taskId}${suffix}`) + pid;
     }
+    case "sh": {
+      if (card.timedOut === true) return theme.fg("warning", `⏱ timeout${suffix}`);
+      const exit = typeof card.exit === "number" ? card.exit : null;
+      if (exit === 0) return theme.fg("success", `✓ exit 0${suffix}`);
+      return theme.fg("error", `✗ exit ${exit ?? "?"}${suffix}`);
+    }
+    case "img":
+      return theme.fg("dim", `● img ${card.paths.join(", ")}`);
+    case "bg": {
+      const pid = typeof card.pid === "number" ? theme.fg("dim", ` · pid ${card.pid}`) : "";
+      return theme.fg("accent", `● bg ${card.id}${suffix}`) + pid;
+    }
   }
 };
+
+const cardCommand = (card: FabricToolResultCardV1): string | undefined =>
+  card.kind === "sh" || card.kind === "bg" ? card.cmd : "cmd" in card ? card.cmd : undefined;
+
+const cardOutput = (card: FabricToolResultCardV1): string | undefined =>
+  card.kind === "sh" ? card.out : "output" in card ? card.output : undefined;
+
+const cardLogPath = (card: FabricToolResultCardV1): string | undefined =>
+  card.kind === "backgrounded" || card.kind === "bg"
+    ? card.logPath
+    : "logPath" in card ? card.logPath : undefined;
 
 /**
  * The card's transcript lines, pure and theme-injected:
@@ -88,8 +129,9 @@ const cardStatusLine = (card: FabricToolResultCardV1, theme: Theme): string => {
  *   [2+]  blank + output tail preview (or the full body when expanded), with a
  *         dim `… +N lines · ctrl-o to expand` hint while collapsed
  *   [last] the outcome line, under the output
- * Blocked cards preview the refusal reason instead of output; backgrounded
- * cards carry the log path handle line.
+ * Blocked cards preview the refusal reason; `img` cards render one dim path
+ * line; `bg` cards are the detached marker (handle + log path, full command
+ * on expand).
  */
 export const toolResultCardLines = (
   card: FabricToolResultCardV1,
@@ -97,10 +139,12 @@ export const toolResultCardLines = (
   theme: Theme,
 ): string[] => {
   const lines: string[] = [];
-  const title = card.title?.trim();
+  if (card.kind === "img") return [cardStatusLine(card, theme)];
+
+  const title = "title" in card && typeof card.title === "string" ? card.title.trim() : undefined;
   if (title) lines.push(theme.fg("accent", safeTerminalText(title)));
 
-  const commandLines = typeof card.cmd === "string" ? card.cmd.split("\n") : [];
+  const commandLines = cardCommand(card)?.split("\n") ?? [];
   if (commandLines.length > 0) {
     let command = theme.fg("dim", "❯ ") + theme.bold(safeTerminalText(commandLines[0] ?? "") || " ");
     if (commandLines.length > 1) {
@@ -109,12 +153,25 @@ export const toolResultCardLines = (
     lines.push(command);
   }
 
-  const outputLines = typeof card.output === "string" && card.output !== ""
-    ? safeTerminalText(card.output).split("\n")
+  const outputLines = cardOutput(card) ? safeTerminalText(cardOutput(card)!).split("\n") : [];
+  const tail = "tail" in card && Array.isArray(card.tail)
+    ? card.tail.map((line) => safeTerminalText(line))
     : [];
-  const tail = Array.isArray(card.tail) ? card.tail.map((line) => safeTerminalText(line)) : [];
-  if (card.kind === "backgrounded" && typeof card.logPath === "string") {
-    lines.push(theme.fg("dim", `log ${safeTerminalText(card.logPath)}`));
+  const logPath = cardLogPath(card);
+  if (logPath !== undefined) lines.push(theme.fg("dim", `log ${safeTerminalText(logPath)}`));
+
+  if (card.kind === "bg") {
+    // The detached marker: collapsed it stays a handle (command, log, id); the
+    // full command body shows on expand.
+    if (options.expanded && commandLines.length > 0) {
+      lines.push("");
+      const shown = commandLines.slice(0, TOOL_RESULT_CARD_EXPAND_MAX_LINES);
+      for (const line of shown) lines.push(theme.fg("toolOutput", safeTerminalText(line) || " "));
+      const hidden = commandLines.length - shown.length;
+      if (hidden > 0) lines.push(theme.fg("dim", `… +${hidden} lines`));
+    }
+    lines.push(cardStatusLine(card, theme));
+    return lines;
   }
 
   if (card.kind === "blocked") {
@@ -131,7 +188,7 @@ export const toolResultCardLines = (
       }
     }
   } else {
-    const total = typeof card.totalLines === "number" && card.totalLines >= 0
+    const total = "totalLines" in card && typeof card.totalLines === "number" && card.totalLines >= 0
       ? card.totalLines
       : outputLines.length || tail.length;
     if (options.expanded) {
@@ -139,7 +196,7 @@ export const toolResultCardLines = (
         .slice(0, TOOL_RESULT_CARD_EXPAND_MAX_LINES);
       if (full.length > 0) {
         lines.push("");
-        // Output stays toolOutput-fg: dim-on-tint reads washed out (reference).
+        // Output stays toolOutput-fg: dim-on-tint reads washed out.
         for (const line of full) lines.push(theme.fg("toolOutput", line || " "));
       }
     } else {
@@ -211,13 +268,52 @@ export const renderToolResultTextFallback = (
   return new Text(text, 0, 0);
 };
 
-const renderSchemaCardResult: NonNullable<ToolRenderers["renderResult"]> = (
+/** Options for the shared card renderer resolver. */
+export interface FabricToolResultCardRendererOptions {
+  /**
+   * Master switch, consulted per resolve. Default: the env switch only
+   * (`PI_FABRIC_TOOL_RESULT_CARDS=off`); the host composes its config key in.
+   */
+  enabled?: () => boolean;
+  /** Telemetry sink: one line per refused card contract or legacy fallback. */
+  emit?: (event: FabricRenderCardEventV1) => void;
+}
+
+/** The one context field the fallback telemetry needs, kept structural so the
+ * resolver stays loadable on hosts that never hand a render context. */
+interface CardRenderCallContext {
+  toolCallId?: unknown;
+}
+
+const renderSchemaCardResult = (
+  toolName: string,
+  emit: ((event: FabricRenderCardEventV1) => void) | undefined,
+  reported: Set<string>,
+) =>
+(
   result: AgentToolResult<unknown>,
   options: ToolRenderResultOptions,
   theme: Theme,
+  context?: CardRenderCallContext,
 ): Component => {
-  const card = readFabricToolResultCardV1(result?.details);
-  if (card) return renderFabricToolResultCard(card, options, theme);
+  const read = readFabricToolResultCardContractV1(result?.details);
+  if (read.contract && "card" in read) return renderFabricToolResultCard(read.card, options, theme);
+  const toolCallId = typeof context?.toolCallId === "string" ? context.toolCallId : "";
+  const reportedKey = `${toolName}:${toolCallId}`;
+  if (!reported.has(reportedKey)) {
+    reported.add(reportedKey);
+    const event: FabricRenderCardEventV1 = read.contract
+      ? { version: 1, tool: toolName, outcome: "refused", reason: read.reason, toolCallId }
+      : { version: 1, tool: toolName, outcome: "fallback", toolCallId };
+    try {
+      emit?.(event);
+      if (read.contract) {
+        console.warn(`[pi-fabric] tool-result card refused for ${toolName} (${read.reason}); rendered as plain text`);
+      }
+    } catch {
+      // Telemetry cannot break rendering.
+    }
+  }
   return renderToolResultTextFallback(result ?? {}, options, theme);
 };
 
@@ -229,15 +325,26 @@ const RESERVED_RESULT_RENDERER_TOOLS: ReadonlySet<string> = new Set([...PI_CORE_
  * `registerToolRenderer` resolver: tools that draw their own results (directly
  * or through built-ins and MCP) keep them; every other registered tool gains a
  * renderResult that reads a v1 card from its result details. A tool opting in
- * is one schema-bearing `details` object away — no ANSI, no custom message
- * channel, no transcript surgery.
+ * is one schema-bearing `details` object away. `enabled` false hands the next
+ * resolver back untouched; every refusal and legacy fallback emits exactly one
+ * telemetry line per tool call.
  */
-export const createFabricToolResultCardRenderer = (): ToolRendererResolver =>
-  (toolName, next) => {
+export const createFabricToolResultCardRenderer = (
+  options: FabricToolResultCardRendererOptions = {},
+): ToolRendererResolver => {
+  const enabled = options.enabled ?? (() => !toolResultCardsEnvOff());
+  const reported = new Set<string>(); // one telemetry line per tool call, per resolver
+  return (toolName, next) => {
+    if (!enabled()) return next();
     if (toolName.startsWith("mcp__") || RESERVED_RESULT_RENDERER_TOOLS.has(toolName)) {
       return next();
     }
     const base = next();
     if (base?.renderResult) return base;
-    return { ...base, renderResult: renderSchemaCardResult };
+    const renderResult = renderSchemaCardResult(toolName, options.emit, reported);
+    return { ...base, renderResult };
   };
+};
+
+export { FABRIC_RENDER_CARD_EVENT };
+export type { ToolRenderers };

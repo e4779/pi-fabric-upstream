@@ -1782,6 +1782,27 @@ export {
  * preview with an expand hint — through the normal `renderResult` pipeline,
  * without encoding a single ANSI sequence of its own. Unversioned or future
  * payloads are refused, never guessed at.
+ *
+ * The v1 union covers every producer shape that exists today, so adopting the
+ * contract is adding `schemaVersion: 1` and nothing else:
+ *
+ * 1. A shell-tool result cast (`ShellResult { ok, exitCode, output, timedOut,
+ *    aborted, backgrounded?, taskId?, logPath?, pid? }`) maps field-for-field
+ *    onto the outcome kinds: `timedOut` -> `timeout`, `backgrounded` ->
+ *    `backgrounded` (taskId/logPath/pid carried), `ok: false` -> `error`
+ *    (with `aborted` carried so a typed stop stays visible), else `ok`.
+ * 2. A blocked ad-hoc result (`{ ok: false, blocked: true, exitCode: null,
+ *    output: <refusal text>, timedOut: false, aborted: false }`) maps onto
+ *    `blocked` with `reason` carrying the refusal text.
+ * 3. The prose kinds `sh` / `img` / `bg` are union members under their own
+ *    field names (`exit`, `out`, `id`, `paths`), so the prose channel can
+ *    adopt the union later without renaming or breaking its payloads.
+ *
+ * The background facade is deliberately outside this contract:
+ * `notifyCompletion` is UNTYPED input by decision — it carries `{ exitCode }`
+ * only, and its payload is an untyped terminal tail string. The union
+ * inherits exactly what the facade does not carry; a completion never
+ * manufactures a card kind of its own.
  */
 export const FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION = 1;
 
@@ -1791,7 +1812,10 @@ export type FabricToolResultCardKind =
   | "error"
   | "timeout"
   | "blocked"
-  | "backgrounded";
+  | "backgrounded"
+  | "sh"
+  | "img"
+  | "bg";
 
 /** Fields every v1 card may carry; the `kind` member decides the required ones. */
 export interface FabricToolResultCardBaseV1 {
@@ -1826,6 +1850,8 @@ export interface FabricToolResultErrorV1 extends FabricToolResultCardBaseV1 {
   exitCode?: number | null;
   /** One-line error summary; shown when the output carries none. */
   error?: string;
+  /** The run was stopped before exit (typed stop, abort); a shell-tool cast carries it. */
+  aborted?: boolean;
 }
 
 /** Ran past its deadline and was stopped. */
@@ -1853,13 +1879,62 @@ export interface FabricToolResultBackgroundedV1 extends FabricToolResultCardBase
   output?: string;
 }
 
+/**
+ * A prose `sh` block result, under the prose field names (adoption adds
+ * `schemaVersion: 1` to the existing payload; nothing else renames).
+ */
+export interface FabricToolResultShCardV1 {
+  schemaVersion: typeof FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION;
+  kind: "sh";
+  /** The executed block; multi-line allowed. */
+  cmd: string;
+  /** Process exit status; null when none was reaped. */
+  exit?: number | null;
+  /** Wall-clock runtime in milliseconds. */
+  ms?: number;
+  /** Ran past its deadline and was stopped. */
+  timedOut?: boolean;
+  /** Last lines of the bounded output. */
+  tail?: string[];
+  /** Full bounded output; the expanded view renders this. */
+  out?: string;
+  /** Total lines of the bounded output; drives the collapsed expand hint. */
+  totalLines?: number;
+  title?: string;
+}
+
+/** A delivered image set (the `img` marker payload). */
+export interface FabricToolResultImgCardV1 {
+  schemaVersion: typeof FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION;
+  kind: "img";
+  /** Delivered image paths; at least one. */
+  paths: string[];
+}
+
+/** A detached block (the `bg` marker payload). */
+export interface FabricToolResultBgCardV1 {
+  schemaVersion: typeof FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION;
+  kind: "bg";
+  /** Host job id the wake channel reports against. */
+  id: string;
+  /** The detached command. */
+  cmd: string;
+  /** Log file backing the detached output. */
+  logPath: string;
+  /** Detached process id, when known. */
+  pid?: number;
+}
+
 /** The v1 card union: one discriminated object per outcome. */
 export type FabricToolResultCardV1 =
   | FabricToolResultOkV1
   | FabricToolResultErrorV1
   | FabricToolResultTimeoutV1
   | FabricToolResultBlockedV1
-  | FabricToolResultBackgroundedV1;
+  | FabricToolResultBackgroundedV1
+  | FabricToolResultShCardV1
+  | FabricToolResultImgCardV1
+  | FabricToolResultBgCardV1;
 
 const FABRIC_TOOL_RESULT_CARD_KINDS: ReadonlySet<string> = new Set<FabricToolResultCardKind>([
   "ok",
@@ -1867,6 +1942,9 @@ const FABRIC_TOOL_RESULT_CARD_KINDS: ReadonlySet<string> = new Set<FabricToolRes
   "timeout",
   "blocked",
   "backgrounded",
+  "sh",
+  "img",
+  "bg",
 ]);
 
 const optionalCardString = (value: unknown): string | undefined =>
@@ -1887,6 +1965,9 @@ const optionalCardExitCode = (
   value: unknown,
 ): number | null | undefined =>
   value === null ? null : optionalCardInteger(value);
+
+const optionalCardBoolean = (value: unknown): boolean | undefined =>
+  typeof value === "boolean" ? value : undefined;
 
 /**
  * Strict v1 reader for tool_result `details`: accepts only a complete,
@@ -1940,12 +2021,14 @@ export const readFabricToolResultCardV1 = (
     case "error": {
       const exitCode = take("exitCode", optionalCardExitCode);
       const error = take("error", optionalCardString);
+      const aborted = take("aborted", optionalCardBoolean);
       if (!valid) return undefined;
       return {
         ...base,
         kind: "error" as const,
         ...(exitCode !== undefined ? { exitCode } : {}),
         ...(error !== undefined ? { error } : {}),
+        ...(aborted !== undefined ? { aborted } : {}),
       };
     }
     case "timeout": {
@@ -1967,6 +2050,96 @@ export const readFabricToolResultCardV1 = (
         ...(pid !== undefined ? { pid } : {}),
       };
     }
+    case "sh": {
+      const exit = take("exit", optionalCardExitCode);
+      const ms = take("ms", optionalCardNumber);
+      const timedOut = take("timedOut", optionalCardBoolean);
+      const tail = take("tail", optionalCardStringArray);
+      const out = take("out", optionalCardString);
+      const totalLines = take("totalLines", optionalCardInteger);
+      const title = take("title", optionalCardString);
+      if (!valid) return undefined;
+      if (typeof record.cmd !== "string") return undefined;
+      return {
+        schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
+        kind: "sh" as const,
+        cmd: record.cmd,
+        ...(exit !== undefined ? { exit } : {}),
+        ...(ms !== undefined ? { ms } : {}),
+        ...(timedOut !== undefined ? { timedOut } : {}),
+        ...(tail !== undefined ? { tail } : {}),
+        ...(out !== undefined ? { out } : {}),
+        ...(totalLines !== undefined ? { totalLines } : {}),
+        ...(title !== undefined ? { title } : {}),
+      };
+    }
+    case "img": {
+      const paths = optionalCardStringArray(record.paths);
+      if (paths === undefined || paths.length === 0) return undefined;
+      return { schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION, kind: "img" as const, paths };
+    }
+    case "bg": {
+      const pid = take("pid", optionalCardInteger);
+      if (!valid) return undefined;
+      if (typeof record.id !== "string" || typeof record.cmd !== "string"
+        || typeof record.logPath !== "string") return undefined;
+      return {
+        schemaVersion: FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION,
+        kind: "bg" as const,
+        id: record.id,
+        cmd: record.cmd,
+        logPath: record.logPath,
+        ...(pid !== undefined ? { pid } : {}),
+      };
+    }
   }
   return undefined;
 };
+
+/**
+ * How a `details` payload relates to the v1 card contract, telemetry-grade:
+ * `legacy` details claim no contract at all (plain-text preview, one fallback
+ * line), a claimed contract either reads as a {@link FabricToolResultCardV1}
+ * or is refused with the field-level reason. The renderer never guesses.
+ */
+export type FabricToolResultCardReadV1 =
+  | { contract: false }
+  | { contract: true; card: FabricToolResultCardV1 }
+  | { contract: true; refused: true; reason: string };
+
+export const readFabricToolResultCardContractV1 = (
+  value: unknown,
+): FabricToolResultCardReadV1 => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return { contract: false };
+  if ((value as Record<string, unknown>).schemaVersion === undefined) return { contract: false };
+  const card = readFabricToolResultCardV1(value);
+  if (card) return { contract: true, card };
+  const version = (value as Record<string, unknown>).schemaVersion;
+  const reason = version !== FABRIC_TOOL_RESULT_CARD_SCHEMA_VERSION
+    ? `schemaVersion ${typeof version === "object" ? "unsupported" : String(version)}`
+    : contractRefusalReason(value);
+  return { contract: true, refused: true, reason };
+};
+
+const contractRefusalReason = (value: unknown): string => {
+  const record = value as Record<string, unknown>;
+  if (typeof record.kind !== "string" || !FABRIC_TOOL_RESULT_CARD_KINDS.has(record.kind)) {
+    return `kind ${typeof record.kind === "string" ? `"${record.kind}"` : String(typeof record.kind)}`;
+  }
+  return "malformed field";
+};
+
+/** `pi.events` channel reporting one render-contract refusal or legacy fallback (telemetry). */
+export const FABRIC_RENDER_CARD_EVENT = "pi-fabric:render:card:v1";
+
+export interface FabricRenderCardEventV1 {
+  version: 1;
+  /** The tool whose result took the non-card path. */
+  tool: string;
+  /** refused = a card contract was claimed and rejected; fallback = no contract claimed. */
+  outcome: "refused" | "fallback";
+  /** Field-level refusal reason; absent on a plain legacy fallback. */
+  reason?: string;
+  /** The render call the line belongs to; one line per tool call. */
+  toolCallId?: string;
+}

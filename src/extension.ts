@@ -120,7 +120,11 @@ import { registerFabricShellPolicyService } from "./core/shell-policy-facade.js"
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
-import { createFabricToolResultCardRenderer } from "./ui/tool-result-card.js";
+import {
+  createFabricToolResultCardRenderer,
+  toolResultCardsEnvOff,
+  FABRIC_RENDER_CARD_EVENT,
+} from "./ui/tool-result-card.js";
 import { FabricTerminalTitle, installTerminalTitle } from "./ui/terminal-title.js";
 import { formatFabricValue } from "./ui/structured.js";
 import { truncateMiddle } from "./util.js";
@@ -684,8 +688,23 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
   // The typed tool_result render contract: schema-bearing details from ANY
   // tool render through the shared card; everything else keeps its own path.
   // Optional-call: hosts on older Pi SDKs without tool renderers keep the
-  // native result rendering instead of failing to load Fabric.
-  pi.registerToolRenderer?.(createFabricToolResultCardRenderer());
+  // native result rendering instead of failing to load Fabric. The off
+  // switches are `ui.toolResultCards: false` and PI_FABRIC_TOOL_RESULT_CARDS=off;
+  // every refusal and legacy fallback emits one pi-fabric:render:card:v1 line.
+  pi.registerToolRenderer?.(
+    createFabricToolResultCardRenderer({
+      enabled: () => {
+        if (toolResultCardsEnvOff()) return false;
+        const ui = state.bootstrapped ? state.config.ui : DEFAULT_FABRIC_CONFIG.ui;
+        return ui.enabled && ui.toolResultCards;
+      },
+      emit: (event) => {
+        try { pi.events?.emit(FABRIC_RENDER_CARD_EVENT, event); } catch {
+          // Telemetry cannot break rendering.
+        }
+      },
+    }),
+  );
   pi.registerTool(fabricTool);
   // Detached worker jobs; bridge-scope lifetime, aborted with the session.
   // Completion inbox: a bounded digest steers the session per terminal job
