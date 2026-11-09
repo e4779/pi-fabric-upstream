@@ -401,7 +401,7 @@ describe("createFabricToolResultCardRenderer", () => {
 });
 
 
-// ---- Producer-shape conformance (charter C3): the union must carry every
+// ---- Producer-shape conformance: the union must carry every
 // producer shape that exists today, so adoption is adding schemaVersion: 1.
 
 describe("v1 union covers the producer shapes", () => {
