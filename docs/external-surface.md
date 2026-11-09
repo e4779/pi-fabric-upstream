@@ -59,3 +59,20 @@ on first use, not at activation.
 (injected session fakes), and the socket protocol end-to-end through a real
 unix socket. The reference consumer is the shell-lab `ai` wrapper
 (recall/agent/llm/vcc with automatic socket-vs-standalone tier selection).
+
+## Published extension APIs (2026-11-09)
+
+Beside the three doors above, the engine now publishes typed services on
+`pi.events` (extension-reachable from any loaded extension):
+
+- Shell policy facade: `pi-fabric:shell-policy:gate|post|config:v1` - the
+  pre-exec gate and output budget as one policy (see docs/configuration.md,
+  executor.shellPolicy; kill switch PI_FABRIC_SHELL_GATE).
+- Background job service: registerJob/unregister/subscribe/notifyCompletion -
+  the host JobStore with typed wake events carrying stopReason (see
+  docs/background-tasks.md).
+- Tool-result card contract: a versioned details union any tool can adopt;
+  the renderer refuses rather than guesses and emits
+  `pi-fabric:render:card:v1` telemetry on every refusal/fallback (see
+  docs/tool-result-card.md; opt-out: ui.toolResultCards /
+  PI_FABRIC_TOOL_RESULT_CARDS=off).
