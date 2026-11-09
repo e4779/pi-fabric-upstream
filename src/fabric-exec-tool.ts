@@ -1143,11 +1143,14 @@ export const createFabricExecTool = (
             const text = finished.content
               .map((part) => (part.type === "text" ? part.text : "[image omitted]"))
               .join("\n");
-            await program!.complete(text, !finished.isError);
+            // The runtime's typed terminationReason must reach the wake event:
+            // a wall-deadline death (timed_out) is not a bare runtime failure.
+            await program!.complete(text, !finished.isError, result.terminationReason);
           },
           (error: unknown) => program!.complete(
             `Runtime error: ${error instanceof Error ? error.message : String(error)}`,
             false,
+            "runtime_error",
           ),
         ).catch(() => undefined);
         return {

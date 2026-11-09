@@ -115,6 +115,7 @@ import type { AgentToolResultMessage } from "./agents/types.js";
 import { FabricUiController } from "./ui/controller.js";
 import { installFabricEscapeHalt } from "./ui/escape-halt.js";
 import { installFabricShellHangKeys } from "./ui/shell-hang-keys.js";
+import { registerFabricBgJobService } from "./core/shell-jobs-facade.js";
 import { FabricToolDisplayController } from "./ui/tool-display.js";
 import { configureHighlighting } from "./ui/highlight.js";
 import { registerHandoffCompletionRenderer } from "./ui/handoff-completion.js";
@@ -526,6 +527,11 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       registration.respond?.({ ok: true, unregister });
     },
   );
+
+  // Background job service (charter PR2): the host JobStore published as the
+  // extension-facing registerJob/unregister/subscribe/notifyCompletion API.
+  // Store absence before session initialization answers ok:false honestly.
+  const unsubscribeShellJobService = registerFabricBgJobService(pi, () => state.shellJobs);
 
   // Synchronous reachability answer so extensions stop guessing whether the
   // model or a fabric_exec program can reach a tool this turn.
@@ -1691,6 +1697,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     state.actionPolicyHooks.clear();
     unsubscribeQuestionRendererRegistration();
     state.questionRenderers.clear();
+    unsubscribeShellJobService();
     programRunContext = undefined;
     pendingHandoffs.clear();
     directToolApproval.clear();

@@ -83,7 +83,9 @@ cmd <C>`, written at detach time. With `executor.shellOrphanSweep: true`
 orphans: dead pid (or a scratch directory whose owning Pi process died),
 non-empty log, newest first, at most five per report. Another session's logs
 are never reported (the stamp is the attribution), and each log is reported
-once per process. The report is one bounded sweep message with the
+exactly once: delivering the report writes a durable reap mark next to the log
+(pruned with it), so a restarted session never re-reports the same leftovers and
+cannot self-wake in a loop. The report is one bounded sweep message with the
 untrusted-data preamble; its `details` carry typed orphan records, so no
 consumer parses the text.
 

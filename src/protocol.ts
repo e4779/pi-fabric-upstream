@@ -1,5 +1,9 @@
 import type { FabricActionPolicyHookV1 } from "./core/action-policy-hooks.js";
 import type {
+  FabricShellJobEvent,
+  FabricShellJobInfo,
+} from "./core/shell-jobs.js";
+import type {
   BashOperations,
   BashToolOptions,
   CompactionResult,
@@ -991,6 +995,215 @@ export const readFabricQuestionRendererRegistrationV1 = (
     name: record.name,
     render: record.render as FabricQuestionRendererV1,
     ...(record.respond ? { respond: record.respond as NonNullable<FabricQuestionRendererRegistrationV1["respond"]> } : {}),
+  };
+};
+
+// ---- background job service (charter PR2: the host JobStore as extension API) ----
+//
+// The host background-job store (src/core/shell-jobs.ts) is published here as
+// a typed extension-facing facade: registerJob / unregister / subscribe /
+// notifyCompletion. Delivery stays on the single sanctioned channel: a
+// completion emitted through the store reaches ShellEventInbox, which renders
+// the typed wake event behind the untrusted preamble and steers it into the
+// session. These events are the protocol shapes; the implementation lives in
+// src/core/shell-jobs-facade.ts.
+
+/** `pi.events` channel that registers a background job (`registerJob`). */
+export const FABRIC_SHELL_JOB_REGISTER_EVENT = "pi-fabric:shell-job:register:v1";
+/** `pi.events` channel that subscribes one listener to one job's lifecycle events. */
+export const FABRIC_SHELL_JOB_SUBSCRIBE_EVENT = "pi-fabric:shell-job:subscribe:v1";
+/** `pi.events` channel that delivers an owner's completion for one job (`notifyCompletion`). */
+export const FABRIC_SHELL_JOB_NOTIFY_EVENT = "pi-fabric:shell-job:notify-completion:v1";
+
+export type {
+  FabricShellJobEvent,
+  FabricShellJobInfo,
+} from "./core/shell-jobs.js";
+
+export type FabricShellJobRegistrationOptionsV1 = {
+  /** Stable job ID; omit for a random one. */
+  id?: string;
+  cwd?: string;
+  /** Owning session or agent id, stamped into the durable log header. */
+  ownerId?: string;
+  description?: string;
+};
+
+export type FabricShellJobRegistrationResultV1 =
+  | { ok: true; jobId: string; info: FabricShellJobInfo }
+  | { ok: false; error: string };
+
+export type FabricShellJobCompletionResultV1 =
+  | { ok: true }
+  | { ok: false; error: string };
+
+/**
+ * The charter extension-facing background-job API: thin, typed wrappers over
+ * the host `FabricShellJobStore` (no second store, no second delivery channel).
+ */
+export interface FabricBgServiceFacadeV1 {
+  registerJob(
+    tool: FabricBgJobToolV1,
+    command: string,
+    options?: FabricShellJobRegistrationOptionsV1,
+  ): FabricShellJobRegistrationResultV1;
+  /** Backward-compatible alias for `registerJob`, kept within this PR. */
+  begin(
+    tool: FabricBgJobToolV1,
+    command: string,
+    options?: FabricShellJobRegistrationOptionsV1,
+  ): FabricShellJobRegistrationResultV1;
+  /** Drops tracking without stopping any live work; later events for the id are silenced. */
+  unregister(jobId: string): boolean;
+  /** Receives this job's store events (started/spilled/monitor/finished/...); returns the unsubscribe fn. */
+  subscribe(jobId: string, listener: (event: FabricShellJobEvent) => void): () => void;
+  /** Owner's terminal delivery: the payload becomes the job's retained tail and rides the one wake channel. */
+  notifyCompletion(
+    jobId: string,
+    payload: string,
+    options?: { exitCode?: number },
+  ): Promise<FabricShellJobCompletionResultV1>;
+}
+
+/** Host shell tools plus the program/monitor backgrounds an extension may register. */
+export type FabricBgJobToolV1 = "bash" | "powershell" | "fabric_exec" | "monitor";
+
+export const isFabricBgJobToolV1 = (value: unknown): value is FabricBgJobToolV1 =>
+  value === "bash" || value === "powershell" || value === "fabric_exec" || value === "monitor";
+
+export const MAX_FABRIC_SHELL_JOB_COMMAND = 16_384;
+export const MAX_FABRIC_SHELL_JOB_PAYLOAD = 65_536;
+const MAX_FABRIC_SHELL_JOB_ID = 256;
+
+const boundedString = (value: unknown, max: number): value is string =>
+  typeof value === "string" && value.length > 0 && value.length <= max;
+
+const readRegistrationOptionsV1 = (
+  record: Record<string, unknown>,
+): FabricShellJobRegistrationOptionsV1 | undefined => {
+  const { id, cwd, ownerId, description } = record as {
+    id?: unknown; cwd?: unknown; ownerId?: unknown; description?: unknown;
+  };
+  const bounded = (value: unknown): value is string | undefined =>
+    value === undefined || boundedString(value, MAX_FABRIC_SHELL_JOB_ID);
+  const described = (value: unknown): value is string | undefined =>
+    value === undefined || boundedString(value, MAX_FABRIC_SHELL_JOB_COMMAND);
+  if (!bounded(id) || !bounded(cwd) || !bounded(ownerId) || !described(description)) return undefined;
+  return {
+    ...(id !== undefined ? { id } : {}),
+    ...(cwd !== undefined ? { cwd } : {}),
+    ...(ownerId !== undefined ? { ownerId } : {}),
+    ...(description !== undefined ? { description } : {}),
+  };
+};
+
+/** Register one background job. `respond` receives the job id or the failure reason. */
+export interface FabricShellJobRegistrationV1 {
+  version: 1;
+  tool: FabricBgJobToolV1;
+  command: string;
+  options?: FabricShellJobRegistrationOptionsV1;
+  respond?: (result: FabricShellJobRegistrationResultV1) => void;
+}
+
+export const readFabricShellJobRegistrationV1 = (
+  value: unknown,
+): FabricShellJobRegistrationV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    !isFabricBgJobToolV1(record.tool) ||
+    !boundedString(record.command, MAX_FABRIC_SHELL_JOB_COMMAND) ||
+    (record.options !== undefined && (typeof record.options !== "object" || record.options === null)) ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  let options: FabricShellJobRegistrationOptionsV1 | undefined;
+  if (record.options !== undefined) {
+    options = readRegistrationOptionsV1(record.options as Record<string, unknown>);
+    if (!options) return undefined;
+  }
+  return {
+    version: 1,
+    tool: record.tool,
+    command: record.command,
+    ...(options ? { options } : {}),
+    ...(record.respond
+      ? { respond: record.respond as NonNullable<FabricShellJobRegistrationV1["respond"]> }
+      : {}),
+  };
+};
+
+/** Subscribe one listener to one job's lifecycle events. `respond` receives the unsubscribe fn. */
+export interface FabricShellJobSubscriptionV1 {
+  version: 1;
+  jobId: string;
+  listener: (event: FabricShellJobEvent) => void;
+  respond?: (
+    result: { ok: true; unsubscribe: () => void } | { ok: false; error: string },
+  ) => void;
+}
+
+export const readFabricShellJobSubscriptionV1 = (
+  value: unknown,
+): FabricShellJobSubscriptionV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.version !== 1 ||
+    !boundedString(record.jobId, MAX_FABRIC_SHELL_JOB_ID) ||
+    typeof record.listener !== "function" ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    jobId: record.jobId,
+    listener: record.listener as FabricShellJobSubscriptionV1["listener"],
+    ...(record.respond
+      ? { respond: record.respond as NonNullable<FabricShellJobSubscriptionV1["respond"]> }
+      : {}),
+  };
+};
+
+/** Deliver an owner's completion for one job through the single wake channel. */
+export interface FabricShellJobCompletionV1 {
+  version: 1;
+  jobId: string;
+  /** Retained as the job's terminal tail; delivered as untrusted task output, never instructions. */
+  payload: string;
+  /** `0` (the default) maps to status `exited`; any other integer maps to `failed`. */
+  exitCode?: number;
+  respond?: (result: FabricShellJobCompletionResultV1) => void;
+}
+
+export const readFabricShellJobCompletionV1 = (
+  value: unknown,
+): FabricShellJobCompletionV1 | undefined => {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const { exitCode } = record as { exitCode?: unknown };
+  if (
+    record.version !== 1 ||
+    !boundedString(record.jobId, MAX_FABRIC_SHELL_JOB_ID) ||
+    typeof record.payload !== "string" ||
+    record.payload.length > MAX_FABRIC_SHELL_JOB_PAYLOAD ||
+    (exitCode !== undefined && !(typeof exitCode === "number" && Number.isSafeInteger(exitCode))) ||
+    (record.respond !== undefined && typeof record.respond !== "function")
+  ) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    jobId: record.jobId,
+    payload: record.payload,
+    ...(exitCode !== undefined ? { exitCode: exitCode as number } : {}),
+    ...(record.respond
+      ? { respond: record.respond as NonNullable<FabricShellJobCompletionV1["respond"]> }
+      : {}),
   };
 };
 

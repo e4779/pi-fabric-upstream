@@ -277,7 +277,11 @@ export class FabricRuntimeState {
   #herdrStatusLoad: Promise<void> | undefined;
   #herdrStatusWanted = false;
   #shellInbox: ShellEventInbox | undefined;
-  /** Orphan logs already reported by this process; initialize() rebuilds the store but must not re-report them. */
+  /**
+   * Orphan logs queued by this process; initialize() rebuilds the store but must
+   * not re-queue them. Cross-restart dedup is the durable reap mark written next
+   * to each log when the sweep message is delivered (see shell-jobs.ts).
+   */
   readonly #reportedOrphanLogs = new Set<string>();
   #shellTiming: FabricShellTimingBridge | undefined;
   #actors: ActorDirectory | undefined;
@@ -721,7 +725,8 @@ export class FabricRuntimeState {
     if (!this.#managedHost && (this.#config.fullCodeMode || enforceSchema)) {
       this.#shellInbox = new ShellEventInbox(this.pi, context, this.shellJobs);
       // Session-scoped orphan sweep (opt-in): report only this session's dead
-      // detached-task logs, each once per process even across reloads.
+      // detached-task logs, each exactly once — the delivery writes a durable
+      // reap mark next to the log, so a restarted session never re-reports it.
       if (this.#config.executor.shellOrphanSweep) {
         const orphans = this.#shellJobs.sweepOrphans(context.sessionManager?.getSessionId?.(), {
           exclude: this.#reportedOrphanLogs,

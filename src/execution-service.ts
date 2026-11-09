@@ -154,6 +154,8 @@ export interface FabricExecutionResult {
   usage?: Usage;
   /** Stop outcomes for owned provider participants after cancellation or timeout. */
   ownedWork?: ProviderParticipantStopOutcome[];
+  /** The sandbox runtime's typed termination reason; absent when execute rethrew an infrastructure error. */
+  terminationReason?: FabricSandboxTerminationReason;
 }
 
 interface FabricExecutionPartial {
@@ -1533,6 +1535,7 @@ export class FabricExecutionService {
       : [];
     return {
       success: succeeded,
+      terminationReason: sandboxResult.terminationReason,
       kernel: python ? "python" : "typescript",
       value: (sanitizedValue.value as { value: unknown }).value,
       logs: [...sandboxResult.logs, ...nestedLogs, ...imageArtifacts].map(sanitizeFabricMediaText),

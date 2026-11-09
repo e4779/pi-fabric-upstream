@@ -1,4 +1,5 @@
 import type { FabricShellJobHandle, FabricShellJobStore } from "./shell-jobs.js";
+import type { FabricSandboxTerminationReason } from "../runtime/kernel.js";
 
 type ProgramJob = FabricShellJobHandle & { stop(reason?: string): boolean };
 
@@ -112,14 +113,18 @@ export class FabricProgramRun {
     return { detached: false, value: first.value };
   }
 
-  /** Records the program's final model-facing text and ends the task. */
-  async complete(text: string, success: boolean): Promise<void> {
+  /**
+   * Records the program's final model-facing text and ends the task. The
+   * runtime's typed `terminationReason` rides along so the wake event names a
+   * wall-deadline death (`timed_out`) instead of a bare `failed`.
+   */
+  async complete(text: string, success: boolean, stopReason?: FabricSandboxTerminationReason): Promise<void> {
     this.#settled = true;
     const job = this.#job;
     if (!job || job.finished) return;
     job.append(Buffer.from(`${text}\n`));
     job.exitCode = success ? 0 : 1;
-    await job.finish(job.exitCode);
+    await job.finish(job.exitCode, undefined, stopReason);
   }
 }
 

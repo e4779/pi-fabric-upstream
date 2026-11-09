@@ -292,6 +292,7 @@ describe("shell event delivery", () => {
     await vi.advanceTimersByTimeAsync(100);
     expect(h.sendMessage).toHaveBeenCalledOnce();
     expect(h.sendMessage.mock.calls[0]![0].content).toContain("timed_out");
+    expect(h.sendMessage.mock.calls[0]![0].details.events![0]).toMatchObject({ status: "timed_out", stopReason: "monitor-deadline" });
     await vi.advanceTimersByTimeAsync(60000);
     expect(h.sendMessage).toHaveBeenCalledOnce(); expect(h.jobs.live()).toEqual([]);
   });
@@ -355,6 +356,18 @@ describe("shell event delivery", () => {
     expect(h.sendMessage).not.toHaveBeenCalled();
     h.emit("input");
     expect(h.emit("before_agent_start").message.details.ids).toEqual([build.id]);
+  });
+  it("names session-side stops so a stop is never indistinguishable", async () => {
+    const h = harness();
+    const watch = h.begin("wake");
+    h.emit("turn_end", { message: { stopReason: "aborted" } });
+    expect(watch.abort.signal.aborted).toBe(true);
+    await watch.finish(null);
+    expect(watch.info()).toMatchObject({ status: "killed", stopReason: "agent" });
+    const observer = h.jobs.begin("bash", "obs", { observes: { kind: "task", id: "t1" } });
+    observer.spill();
+    h.emit("session_tree");
+    expect(observer.info().stopReason).toBe("branch-abandoned");
   });
   it("discards future events from an abandoned branch and removes hooks on close", async () => {
     const h = harness(); const job = h.begin(); h.emit("session_tree"); await job.finish(0);

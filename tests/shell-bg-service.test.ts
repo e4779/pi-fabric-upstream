@@ -11,13 +11,16 @@ import {
   findShellOrphans,
   formatShellOwnershipStamp,
   formatShellWakeText,
+  markShellOrphanReported,
   parseShellOwnershipStamp,
   SHELL_ORPHAN_CAP,
   SHELL_ORPHAN_TAIL_BYTES,
+  SHELL_REAP_MARK_FILE,
   SHELL_WAKE_PREAMBLE,
   SHELL_WAKE_SCHEMA_VERSION,
   type FabricShellJobEvent,
 } from "../src/core/shell-jobs.js";
+import { parseShellMonitor } from "../src/core/shell-monitor.js";
 import { FabricProgramTasks } from "../src/core/program-tasks.js";
 import { ShellEventInbox, SHELL_MESSAGE_TYPE, SHELL_SWEEP_MESSAGE_TYPE, SHELL_SWEEP_SCHEMA_VERSION } from "../src/core/shell-inbox.js";
 
@@ -169,6 +172,41 @@ describe("session-scoped orphan sweep", () => {
     expect(orphans[0]!.command).toBe("tracked");
     await job.finish(0);
   });
+
+  it("reports an orphan exactly once across a simulated restart: delivery writes a durable reap mark", async () => {
+    vi.useFakeTimers();
+    const tempRoot = root();
+    const logPath = writeOrphanLog(tempRoot, "aaaaaa", { pid: deadPid(), session: "mine", body: "build died mid-run\n" });
+    const sendMessage = vi.fn();
+    const ctx = { hasUI: false, ui: { notify: vi.fn() }, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
+    const pi = { sendMessage, on: () => () => {} } as unknown as ExtensionAPI;
+    // First process: session start sweeps, the inbox delivers, and delivery marks the log durably.
+    const first = new FabricShellJobStore(tempRoot);
+    const firstInbox = new ShellEventInbox(pi, ctx, first);
+    firstInbox.reportOrphans(first.sweepOrphans("mine"));
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    expect(sendMessage.mock.calls[0]![0].customType).toBe(SHELL_SWEEP_MESSAGE_TYPE);
+    firstInbox.close();
+    await first.close();
+    expect(fs.existsSync(path.join(path.dirname(logPath), SHELL_REAP_MARK_FILE))).toBe(true);
+    // A restarted session (fresh store, fresh process memory) sees nothing left to report.
+    const restarted = new FabricShellJobStore(tempRoot);
+    cleanups.push(() => void restarted.close());
+    expect(restarted.sweepOrphans("mine")).toEqual([]);
+    expect(findShellOrphans({ tempRoot, owner: "mine" })).toEqual([]);
+  });
+
+  it("prunes a stale reap mark once its log disappears", () => {
+    const tempRoot = root();
+    const logPath = writeOrphanLog(tempRoot, "aaaaaa", { pid: deadPid(), session: "mine", body: "soon gone\n" });
+    markShellOrphanReported(logPath);
+    expect(findShellOrphans({ tempRoot, owner: "mine" })).toEqual([]);
+    fs.rmSync(logPath);
+    // The next scan finds a dir whose log is gone and must not leave the mark behind.
+    expect(findShellOrphans({ tempRoot, owner: "mine" })).toEqual([]);
+    expect(fs.existsSync(path.join(path.dirname(logPath), SHELL_REAP_MARK_FILE))).toBe(false);
+  });
 });
 
 describe("typed wake with untrusted preamble", () => {
@@ -196,6 +234,45 @@ describe("typed wake with untrusted preamble", () => {
     expect(text.endsWith("Tail:\nCI failed")).toBe(true);
     const monitorText = formatShellWakeText(buildShellWakeEvent(finishedInfo, { kind: "monitor", output: "state 3" }));
     expect(monitorText).toContain(`Task ${job.id}: monitor event after`);
+  });
+
+  it("carries typed stop reasons: named stops, monitor deadlines, derived completions", async () => {
+    vi.useFakeTimers();
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bg-stops-"));
+    cleanups.push(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
+    const jobs = new FabricShellJobStore(tempRoot);
+    cleanups.push(() => void jobs.close());
+    // A user stop is named `user`; the caller can name the stopper explicitly.
+    const stopped = jobs.begin("bash", "build");
+    stopped.spill();
+    jobs.stop(stopped.id);
+    await stopped.finish(null);
+    expect(stopped.info()).toMatchObject({ status: "killed", stopReason: "user" });
+    const agent = jobs.begin("bash", "watch");
+    agent.spill();
+    jobs.stop(agent.id, "agent");
+    await agent.finish(null);
+    expect(agent.info()).toMatchObject({ status: "killed", stopReason: "agent" });
+    // A monitor deadline is `monitor-deadline`, never a bare timeout.
+    const monitor = jobs.begin("bash", "watch", { monitor: parseShellMonitor({ delivery: "wake", timeoutMs: 1000, intervalMs: 1000 })! });
+    monitor.spill();
+    await vi.advanceTimersByTimeAsync(1200);
+    expect(monitor.abort.signal.aborted).toBe(true);
+    await monitor.finish(null);
+    expect(monitor.info()).toMatchObject({ status: "timed_out", stopReason: "monitor-deadline" });
+    // A clean completion derives `completed`; the wake text names a stop when the event carries one.
+    const done = jobs.begin("bash", "ok");
+    await done.finish(0);
+    expect(done.info()).toMatchObject({ status: "exited", stopReason: "completed" });
+    const event = buildShellWakeEvent(jobs.list().find(entry => entry.id === stopped.id)!);
+    expect(event.stopReason).toBe("user");
+    const text = formatShellWakeText(event);
+    expect(text).toContain(`Task ${stopped.id}: killed after`);
+    expect(text).toContain("[stopped: user]");
+    // Session shutdown names its own stop for tasks it must cancel.
+    const closing = jobs.begin("bash", "long");
+    await jobs.close();
+    expect(closing.info()).toMatchObject({ status: "killed", stopReason: "session-shutdown" });
   });
 
   it("carries typed wake events in the delivered message details", async () => {
@@ -292,6 +369,44 @@ describe("zero-action program hang race", () => {
     expect(outcome).toEqual({ detached: false, value: "done" });
     expect(jobs.list()).toEqual([]);
     expect(run.job).toBeUndefined();
+  });
+
+  it("names a wall-deadline death in the wake details instead of a bare failed", async () => {
+    vi.useFakeTimers();
+    const { jobs } = tempRootFor();
+    const sendMessage = vi.fn();
+    const ctx = { hasUI: false, ui: { notify: vi.fn() }, isIdle: () => true, hasPendingMessages: () => false } as unknown as ExtensionContext;
+    const pi = { sendMessage, on: () => () => {} } as unknown as ExtensionAPI;
+    const inbox = new ShellEventInbox(pi, ctx, jobs);
+    cleanups.push(() => inbox.close());
+    const tasks = new FabricProgramTasks();
+    const run = tasks.begin({ code: "await longWork()", jobs: () => jobs, ownerId: "sess-deadline", hangMs: 40 });
+    const raced = run.race(pending());
+    await vi.advanceTimersByTimeAsync(60);
+    const outcome = await raced;
+    if (!outcome.detached) throw new Error("expected the hang timer to detach the program");
+    // The runtime hit its wall deadline: its typed terminationReason must reach the wake event.
+    await run.complete("Deadline exceeded", false, "timed_out");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sendMessage).toHaveBeenCalledOnce();
+    const message = sendMessage.mock.calls[0]![0];
+    expect(message.customType).toBe(SHELL_MESSAGE_TYPE);
+    expect(message.details.events![0]).toMatchObject({
+      schemaVersion: SHELL_WAKE_SCHEMA_VERSION, kind: "wake", id: outcome.job.id,
+      status: "failed", exitCode: 1, stopReason: "timed_out",
+    });
+    expect(message.content).toContain(`Background fabric_exec program ${outcome.job.id}: failed [stopped: timed_out]`);
+    // A plain runtime failure stays honest and distinct from the deadline death.
+    const crash = tasks.begin({ code: "await boom()", jobs: () => jobs, ownerId: "sess-deadline" });
+    const crashRace = crash.race(pending());
+    crash.detach("requested");
+    await crashRace;
+    await crash.complete("ReferenceError: boom is not defined", false, "runtime_error");
+    await vi.advanceTimersByTimeAsync(100);
+    expect(sendMessage).toHaveBeenCalledTimes(2);
+    const failed = sendMessage.mock.calls[1]![0];
+    expect(failed.details.events![0]).toMatchObject({ status: "failed", stopReason: "runtime_error" });
+    expect(failed.content).not.toContain("[stopped:");
   });
 
   it("stays in the foreground without a hangMs (upstream default)", async () => {

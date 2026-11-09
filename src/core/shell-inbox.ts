@@ -1,5 +1,5 @@
 import type { CacheWarmingDecisionEvent, CacheWarmingDecisionEventResult, ContextEvent, ExtensionAPI, ExtensionContext, ToolResultEvent, ToolResultEventResult } from "@earendil-works/pi-coding-agent";
-import { hasWakeObserver, buildShellWakeEvent, SHELL_WAKE_PREAMBLE, type FabricShellJobEvent, type FabricShellJobInfo, type FabricShellJobStore, type FabricShellOrphan, type FabricShellWakeEvent } from "./shell-jobs.js";
+import { hasWakeObserver, buildShellWakeEvent, markShellOrphanReported, SHELL_WAKE_PREAMBLE, type FabricShellJobEvent, type FabricShellJobInfo, type FabricShellJobStore, type FabricShellOrphan, type FabricShellWakeEvent } from "./shell-jobs.js";
 
 export const SHELL_MESSAGE_TYPE = "pi-fabric-shell-event";
 export const SHELL_AWARENESS_MESSAGE_TYPE = "pi-fabric-shell-awareness";
@@ -13,6 +13,14 @@ type Message = { customType: string; content: string; display: boolean; details:
 /** A detached program's result is its whole answer; a shell's tail is a pointer to its log. */
 const outputLimit = (job: FabricShellJobInfo): number => job.tool === "fabric_exec" ? 8000 : 2000;
 const clean = (text: string): string => text.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+/** Machine-readable stop reason, echoed next to a status that alone would mislabel it (a wall-deadline `failed` is not a runtime failure). */
+const stopTag = (job: FabricShellJobInfo): string => {
+  const stop = job.stopReason;
+  if (stop === undefined) return "";
+  if ((job.status === "exited" && stop === "completed") || (job.status === "failed" && stop === "runtime_error") ||
+    (job.status === "killed" && stop === "user") || (job.status === "timed_out" && stop === "monitor-deadline")) return "";
+  return ` [stopped: ${stop}]`;
+};
 /** Pi's own refresh threshold (`CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS`); not exported by the host. */
 const CACHE_WARMING_MINIMUM_EXPECTED_SAVINGS = 0.05;
 /** Task rows per awareness note; the rest are counted. */
@@ -107,7 +115,7 @@ export class ShellEventInbox {
       // Old-frontier jobs can finish, but must not wake a different branch.
       for (const job of jobs.live()) this.#ignored.add(job.id);
       this.#pending.clear();
-      for (const job of jobs.live()) if (job.options.observes) job.stop("Observation branch abandoned");
+      for (const job of jobs.live()) if (job.options.observes) job.stop("Observation branch abandoned", "branch-abandoned");
     });
   }
 
@@ -178,7 +186,7 @@ export class ShellEventInbox {
   }
 
   #stopMonitors(): void {
-    for (const job of this.jobs.live()) if (job.monitorActive) job.stop("Owning agent interrupted or failed");
+    for (const job of this.jobs.live()) if (job.monitorActive) job.stop("Owning agent interrupted or failed", "agent");
   }
 
   #accept(event: FabricShellJobEvent): void {
@@ -240,9 +248,9 @@ export class ShellEventInbox {
         const seconds = Math.max(0, Math.round(((job.finishedAt ?? Date.now()) - job.startedAt) / 1000));
         if (job.tool === "fabric_exec") {
           const outcome = job.status === "exited" ? "succeeded" : job.status;
-          return `Background fabric_exec program ${job.id}: ${outcome} after ${seconds}s\nProgram: ${clean(job.description ?? "unnamed").slice(0, 240)}\nLog: ${clean(job.logPath ?? "not available").slice(0, 500)}\nResult (progress lines, then the program's own output):\n${summary.slice(-outputLimit(job))}`;
+          return `Background fabric_exec program ${job.id}: ${outcome}${stopTag(job)} after ${seconds}s\nProgram: ${clean(job.description ?? "unnamed").slice(0, 240)}\nLog: ${clean(job.logPath ?? "not available").slice(0, 500)}\nResult (progress lines, then the program's own output):\n${summary.slice(-outputLimit(job))}`;
         }
-        return `Task ${job.id}: ${type === "monitor" ? "monitor event" : job.status} after ${seconds}s${job.exitCode !== undefined ? ` (exit ${job.exitCode})` : ""}\nCommand: ${clean(job.description ?? job.command).slice(0, 240)}\nLog: ${clean(job.logPath ?? "not available").slice(0, 500)}\n${summary.slice(-1500)}`;
+        return `Task ${job.id}: ${type === "monitor" ? "monitor event" : job.status}${stopTag(job)} after ${seconds}s${job.exitCode !== undefined ? ` (exit ${job.exitCode})` : ""}\nCommand: ${clean(job.description ?? job.command).slice(0, 240)}\nLog: ${clean(job.logPath ?? "not available").slice(0, 500)}\n${summary.slice(-1500)}`;
       }),
     ].join("\n\n");
     deliver({
@@ -284,6 +292,10 @@ export class ShellEventInbox {
       display: false,
       details: { schemaVersion: SHELL_SWEEP_SCHEMA_VERSION, kind: "orphan-sweep", orphans },
     });
+    // The report is out: mark each log durably (next to the log, pruned with it)
+    // so no later process in a restart chain re-reports the same orphans. A
+    // report queued but never delivered stays unmarked and will resurface.
+    for (const orphan of orphans) markShellOrphanReported(orphan.logPath);
   }
 
   close(): void {
