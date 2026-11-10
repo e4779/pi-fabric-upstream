@@ -57,8 +57,8 @@ on first use, not at activation.
 
 `tests/external-*.test.ts` cover the parsers, renderers, the job state machine
 (injected session fakes), and the socket protocol end-to-end through a real
-unix socket. The reference consumer is the shell-lab `ai` wrapper
-(recall/agent/llm/vcc with automatic socket-vs-standalone tier selection).
+unix socket. The reference consumer is the `ai` wrapper
+(recall/agent/llm/vcc/peers/peer with automatic socket-vs-standalone tier selection).
 
 ## Published extension APIs (2026-11-09)
 
