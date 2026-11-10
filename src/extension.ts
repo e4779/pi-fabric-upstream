@@ -743,6 +743,16 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
       }
       return;
     }
+    // The widget rows carry worker info when mounted; the one-line segment
+    // stays for the collapsed state only (no duplication).
+    if (fabricUi.widgetMounted) {
+      try {
+        context?.ui?.setStatus?.(JOBS_STATUS_KEY, undefined);
+      } catch {
+        /* UI optional */
+      }
+      return;
+    }
     const names = running.slice(0, 3).join(",") + (running.length > 3 ? ` +${running.length - 3}` : "");
     try {
       context?.ui?.setStatus?.(JOBS_STATUS_KEY, `workers: ${running.length} (${names})`);

@@ -138,6 +138,12 @@ export class FabricUiController {
     this.#schedulePoll();
   }
 
+  /** True while the below-editor jobs widget is mounted (the rows carry the
+   * info; extension footer segments can stay quiet instead of duplicating). */
+  get widgetMounted(): boolean {
+    return this.#widgetMounted;
+  }
+
   stop(): void {
     this.#epoch++;
     this.#closeTasks?.();
