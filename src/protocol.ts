@@ -999,7 +999,7 @@ export const readFabricQuestionRendererRegistrationV1 = (
   };
 };
 
-// ---- background job service (charter PR2: the host JobStore as extension API) ----
+// ---- background job service: the host JobStore as extension API ----
 //
 // The host background-job store (src/core/shell-jobs.ts) is published here as
 // a typed extension-facing facade: registerJob / unregister / subscribe /
@@ -1042,7 +1042,7 @@ export type FabricShellJobCompletionResultV1 =
   | { ok: false; error: string };
 
 /**
- * The charter extension-facing background-job API: thin, typed wrappers over
+ * The extension-facing background-job API: thin, typed wrappers over
  * the host `FabricShellJobStore` (no second store, no second delivery channel).
  */
 export interface FabricBgServiceFacadeV1 {

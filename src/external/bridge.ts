@@ -170,7 +170,7 @@ export function startExternalBridge(options: {
     socket.on("data", (chunk: string) => {
       // Accumulate and split on complete lines only: a TCP/socket write can
       // be split anywhere, and a naive per-chunk split turns one argv
-      // element into two silently wrong ones (council finding #1).
+      // element into two silently wrong ones.
       buffer += chunk;
       if (Buffer.byteLength(buffer, "utf8") > MAX_MESSAGE_BYTES) {
         socket.end(`ERR message exceeds ${MAX_MESSAGE_BYTES} bytes\n`, () => socket.destroy());
@@ -221,7 +221,7 @@ export function startExternalBridge(options: {
   };
 
   // An unhandled 'error' (EADDRINUSE, EMFILE, EACCES) takes down the whole
-  // host process, not just the bridge (council finding #2): degrade to a
+  // host process, not just the bridge: degrade to a
   // logged, closed bridge instead.
   server.on("error", (error) => {
     options.log?.(`fabric external bridge error: ${error.message}`);

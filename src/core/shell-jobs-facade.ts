@@ -16,7 +16,7 @@ import {
 import type { FabricShellJobEvent, FabricShellJobStore } from "./shell-jobs.js";
 
 /**
- * Extension-facing publication of the host background-job store (charter PR2).
+ * Extension-facing publication of the host background-job store.
  * Every method is a thin wrapper over the one `FabricShellJobStore` this
  * session already runs — no second store, no second delivery channel. A
  * `notifyCompletion` lands as the job's terminal store event, so it reaches
@@ -57,8 +57,8 @@ export const createFabricBgServiceFacade = (
 
   return {
     registerJob: register,
-    // Backward-compatible alias within this PR: the store's own method is
-    // named `begin`; the charter API name is `registerJob`.
+    // Alias: the store's own method is named `begin`; the extension-facing
+    // API name is `registerJob`.
     begin: register,
 
     unregister: (jobId) => {

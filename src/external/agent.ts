@@ -36,7 +36,7 @@ export const AGENT_ARGV_HELP = [
 export const DEFAULT_AGENT_TIMEOUT_MS = 600_000;
 
 /**
- * What an agent gets when the `tools=` key is absent (HOM-28): a read-only
+ * What an agent gets when the `tools=` key is absent: a read-only
  * quartet, so a multi-step brief keeps a worker that can look around instead
  * of a tool-less completion. An explicit `tools=` line still pins the exact
  * set (`tools=` empty = none); `+name`/`-name` entries adjust relative to

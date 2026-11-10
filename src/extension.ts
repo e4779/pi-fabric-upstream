@@ -539,7 +539,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     },
   );
 
-  // Background job service (charter PR2): the host JobStore published as the
+  // Background job service: the host JobStore published as the
   // extension-facing registerJob/unregister/subscribe/notifyCompletion API.
   // Store absence before session initialization answers ok:false honestly.
   const unsubscribeShellJobService = registerFabricBgJobService(pi, () => state.shellJobs);

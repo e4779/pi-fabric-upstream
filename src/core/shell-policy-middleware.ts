@@ -13,9 +13,7 @@ import type {
 
 /**
  * Gate + context guard as reusable execution policy, applicable by ANY
- * execution tool (council synthesis step 2, PR 1; ported from the lab extension
- * `.pi/extensions/shell.ts:85-203` gate and `:205-288` postProcess — gap-table
- * rows 2-3). Fabric's own `pi.bash` arm runs it so nested `fabric_exec` calls
+ * execution tool. Fabric's own `pi.bash` arm runs it so nested `fabric_exec` calls
  * and top-level shell calls pass one gate; external-surface tools can apply
  * the same `FabricExecutionPolicyMiddlewareV1` contract and stay uniform.
  *
