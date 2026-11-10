@@ -1177,7 +1177,21 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
     await restoreBorrowedInPlaceMain(state.prewalk, pi, context);
     refreshCodePreviewSettings();
     applyFabricMode(context);
-    if (state.shouldEagerlyActivate(context)) await state.ensure(context);
+    // surface=external: the footer dock is the product. Without the runtime
+    // there is no FabricShellJobStore for the bridge to register jobs into
+    // (the facade and the agent-jobs mirror both resolve it through
+    // state.shellJobs), and the activation hook - the only caller of
+    // FabricUiController.start, hence of the below-editor widget mount -
+    // never runs, so contour-style sessions show no rows even while bridge
+    // jobs run. shouldEagerlyActivate covers external only when mesh is on;
+    // a trusted TUI session activates the engine regardless. fabric-exec
+    // keeps its existing eager gates untouched.
+    if (
+      state.shouldEagerlyActivate(context) ||
+      (externalSurface() && context.mode === "tui" && context.isProjectTrusted())
+    ) {
+      await state.ensure(context);
+    }
   });
 
   // Branch changes move the leaf: emitted echoes and spent reminder budget

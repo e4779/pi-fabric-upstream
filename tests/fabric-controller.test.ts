@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { FabricActivityRun } from "../src/activity/types.js";
 import { FabricActivityStore } from "../src/activity/store.js";
 import { ActorStoreReadError } from "../src/actors/store-read.js";
+import { FabricShellJobStore } from "../src/core/shell-jobs.js";
 import type { FabricState } from "../src/fabric-state.js";
 import { FabricUiController } from "../src/ui/controller.js";
 import type { FabricDashboard } from "../src/ui/dashboard.js";
@@ -929,6 +930,118 @@ describe("FabricUiController widget arrow entry", () => {
       expect(focused()).toBe(editor);
     } finally {
       controller.stop();
+    }
+  });
+});
+
+describe("FabricUiController external-surface footer mount", () => {
+  /**
+   * surface=external, mesh off: the state the contour-style host presents.
+   * Jobs arrive exactly the way the extension-facing facade registers them -
+   * store.begin(..., { external: true, label }) - and the widget mounts from
+   * the shell-store subscription, not from a fabric_exec run.
+   */
+  const externalMount = (mode: "tui" | "rpc" = "tui") => {
+    vi.useFakeTimers();
+    const jobs = new FabricShellJobStore();
+    const state = stubState();
+    state.config.ui.widget = "auto";
+    state.config.ui.refreshMs = 100;
+    state.config.ui.maxRows = 6;
+    // External engine sessions list bridge jobs and mesh actors, not local actors.
+    vi.mocked(state.actors.list).mockReturnValue([] as never);
+    Object.assign(state, { shellJobs: jobs });
+    const tui = {
+      requestRender: vi.fn(),
+      terminal: { rows: 40 },
+      setFocus: vi.fn(),
+      getFocusedComponent: () => undefined,
+    } as unknown as TUI;
+    let current: unknown;
+    const setWidget = vi.fn((_key: string, content: unknown) => {
+      current = typeof content === "function"
+        ? (content as (t: TUI, theme: Theme) => unknown)(tui, theme)
+        : content;
+    });
+    const context = {
+      mode,
+      ui: { notify: vi.fn(), setWidget },
+    } as unknown as ExtensionContext;
+    const controller = new FabricUiController(state);
+    controller.start(context);
+    const widget = () =>
+      current instanceof FabricWidget ? (current as FabricWidget) : undefined;
+    return {
+      jobs, controller, context, setWidget, widget,
+      register: (overrides: Partial<Parameters<FabricShellJobStore["begin"]>[2]> = {}) =>
+        jobs.begin("monitor", "agent review", {
+          id: "agent-job-1",
+          label: "review",
+          description: "Review the diff",
+          external: true,
+          ...overrides,
+        }),
+      cleanup: async () => {
+        controller.stop();
+        jobs.close();
+        vi.useRealTimers();
+      },
+    };
+  };
+
+  it("mounts the below-editor widget for external jobs and collapses when idle", async () => {
+    const h = externalMount();
+    try {
+      // Idle start: auto mode keeps the footer collapsed with nothing to list.
+      await vi.advanceTimersByTimeAsync(200);
+      expect(h.setWidget).not.toHaveBeenCalled();
+      // The facade-style registration is the only trigger - no fabric_exec run exists.
+      const job = h.register();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(h.setWidget).toHaveBeenCalledWith("pi-fabric", expect.any(Function), { placement: "belowEditor" });
+      const lines = h.widget()!.render(120).join("\n");
+      expect(lines).toContain("review");
+      expect(lines).toContain("running");
+      // One worker row beside nothing else: the agent job is the dock's row.
+      expect(lines).toContain("1 worker");
+      // Settled work is retained briefly, then the widget auto-collapses.
+      await job.finish(0);
+      await vi.advanceTimersByTimeAsync(200);
+      expect(h.widget()!.render(120).join("\n")).toContain("done");
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(h.setWidget).toHaveBeenLastCalledWith("pi-fabric", undefined);
+      expect(h.widget()).toBeUndefined();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("keeps the widget unmounted outside TUI mode even with running external jobs", async () => {
+    const h = externalMount("rpc");
+    try {
+      h.register();
+      await vi.advanceTimersByTimeAsync(200);
+      expect(h.setWidget).not.toHaveBeenCalled();
+      expect(h.widget()).toBeUndefined();
+    } finally {
+      await h.cleanup();
+    }
+  });
+
+  it("opens the tasks overlay from an external worker row", async () => {
+    const h = externalMount();
+    const openTasks = vi.spyOn(h.controller, "openTasks").mockResolvedValue();
+    try {
+      h.register();
+      await vi.advanceTimersByTimeAsync(200);
+      const widget = h.widget()!;
+      const lines = widget.render(120);
+      expect(lines.some((line) => line.includes("review"))).toBe(true);
+      widget.handleInput("\r");
+      await Promise.resolve();
+      expect(openTasks).toHaveBeenCalledWith(h.context, "agent-job-1");
+    } finally {
+      await h.cleanup();
     }
   });
 });
