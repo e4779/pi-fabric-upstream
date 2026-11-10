@@ -159,7 +159,7 @@
     "@shikijs/themes": "4.4.3",
     "cross-spawn": "^7.0.6",
     "diff": "^9.0.0",
-    "mcporter": "^0.12.3",
+    "mcporter": "^0.17.0",
     "pi-fabric-worker-sdk": "npm:@earendil-works/pi-coding-agent@1.5.0",
     "quickjs-emscripten-core": "^0.32.0",
     "shiki": "4.4.3",
