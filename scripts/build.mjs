@@ -31,6 +31,8 @@ const primaryEntryPoints = [
   "src/assessment.ts",
   // Public `pi-fabric/scope`; also the extension's first-use scope parser.
   "src/scope.ts",
+  // Public `pi-fabric/highlight`; the shiki highlighter for extension UI.
+  "src/highlight.ts",
   "src/protocol.ts",
   "src/worker.ts",
   // Full Pi-compatible durable process host; never in extension registration.

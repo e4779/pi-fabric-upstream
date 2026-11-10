@@ -21,6 +21,7 @@ const stable = [
   "jev.js",
   "protocol.js",
   "scope.js",
+  "highlight.js",
   "core/provider-operations.js",
   "worker.js",
   "durable/worker.js",
