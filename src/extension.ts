@@ -10,6 +10,7 @@ import { createAgentCommand } from "./external/agent.js";
 import { AgentJobs, createAgentJobsCommand, type JobSettlement } from "./external/agent-jobs.js";
 import { createAgentJobsStoreMirror, externalJobsFooter } from "./external/agent-jobs-store.js";
 import { createRecallCommand } from "./external/recall.js";
+import { createExpandCommand } from "./external/expand.js";
 import { readFileSync } from "node:fs";
 import { createVccCommand, parseVccSession, type VccLiveSource } from "./external/vcc.js";
 import type { MemoryProviderContext } from "./memory/request-context.js";
@@ -864,6 +865,7 @@ return async function piFabric(pi: ExtensionAPI, options: { managedHost?: Fabric
           createAgentJobsCommand(externalAgentJobs),
           createAgentCommand(),
           createRecallCommand(externalMemoryContext),
+          createExpandCommand(externalMemoryContext),
           createVccCommand(vccSource),
           createPeerControlCommand({
             peerInfos: () => state.peerInfos(),

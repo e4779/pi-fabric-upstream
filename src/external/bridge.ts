@@ -69,6 +69,7 @@ const helpLines = (hasCommands: boolean): string[] => [
         "  agent           worker: promptFile=… blocks; submit/status/wait/",
         "                  result/stop/steer/follow/list/models run it detached",
         "  recall          search session memory (query=<terms> …)",
+        "  expand          digest→full entry read (id=<8hex> | session=… idx=…)",
         "  vcc             session file views: summary/branch/entries/entry",
         "  peers           parallel sessions in this project (label, status)",
         "  peer            steer/follow <label|id> textFile=<path>, stop",

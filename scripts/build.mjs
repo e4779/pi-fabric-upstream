@@ -71,6 +71,8 @@ const lazyEntryPoints = [
   "src/memory/history-paging.ts",
   // External-bridge recall engine; loaded at the first recall command.
   "src/memory/recall-service.ts",
+  // External-bridge expand engine; loaded at the first expand/show command.
+  "src/memory/expand-service.ts",
   "src/memory/request-cache.ts",
   "src/memory/fs-source.ts",
   "src/providers/memory-provider.ts",
