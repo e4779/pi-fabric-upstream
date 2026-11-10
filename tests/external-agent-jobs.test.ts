@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentJobs, createAgentJobsCommand } from "../src/external/agent-jobs.js";
+import { AgentJobs, createAgentJobsCommand, type JobSettlement } from "../src/external/agent-jobs.js";
 import type { AgentCommandArgs, WorkerSession } from "../src/external/agent.js";
 import { composeCommands, startExternalBridge, type ExternalBridgeHandle } from "../src/external/bridge.js";
 
@@ -130,6 +130,61 @@ describe("AgentJobs state machine", () => {
       await vi.advanceTimersByTimeAsync(1_100);
       expect(jobs.status(id)).toContain("state=failed");
       expect(jobs.status(id)).toContain("error=timeout 1000ms");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("timeout settles exactly once and result() keeps partial text", async () => {
+    vi.useFakeTimers();
+    try {
+      const settlements: JobSettlement[] = [];
+      const fake = fakeSession();
+      const jobs = new AgentJobs(async () => fake.session, 64, (settlement) => settlements.push(settlement));
+      const id = jobs.submit(args({ timeoutMs: 1_000, name: "timeout-once" }));
+      await vi.advanceTimersByTimeAsync(0); // flush spawn+prompt microtasks
+      vi.advanceTimersByTime(1_100); // fire the timeout synchronously: the settled job must already carry partial text
+      const result = await jobs.result(id);
+      expect(result.ok).toBe(false);
+      expect(result.lines[0]).toContain("timeout 1000ms");
+      expect(result.lines).toContain("partial before abort");
+      await vi.advanceTimersByTimeAsync(0); // let the aborted run loop reach its finally
+      await jobs.wait(id);
+      expect(settlements.filter((settlement) => settlement.id === id).map((settlement) => settlement.state)).toEqual([
+        "failed",
+      ]);
+      expect(fake.controller.disposed).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("timeout with a hanging abort() still records partial from state.messages", async () => {
+    vi.useFakeTimers();
+    try {
+      const settlements: JobSettlement[] = [];
+      let disposed = false;
+      const session: WorkerSession = {
+        prompt: () => new Promise<void>(() => undefined), // never settles
+        steer: () => "queued",
+        followUp: () => "queued",
+        abort: () => new Promise<void>(() => undefined), // hangs: the run loop stays parked forever
+        dispose: () => {
+          disposed = true;
+        },
+        state: { messages: [{ role: "assistant", content: [{ type: "text", text: "streamed partial so far" }] }] },
+      };
+      const jobs = new AgentJobs(async () => session, 64, (settlement) => settlements.push(settlement));
+      const id = jobs.submit(args({ timeoutMs: 500, name: "hang" }));
+      await vi.advanceTimersByTimeAsync(600); // timeout fires; abort() never unwinds the run loop
+      const result = await jobs.result(id);
+      expect(result.ok).toBe(false);
+      expect(result.lines).toContain("streamed partial so far");
+      expect(settlements.filter((settlement) => settlement.id === id).length).toBe(1);
+      expect(disposed).toBe(false); // the bounded grace has not elapsed yet
+      await vi.advanceTimersByTimeAsync(1_000); // grace elapses: the session is disposed anyway
+      expect(disposed).toBe(true);
+      expect(jobs.status(id)).toContain("state=failed");
     } finally {
       vi.useRealTimers();
     }

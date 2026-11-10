@@ -50,9 +50,17 @@ interface Job {
   jobTool?: import("../protocol.js").FabricBgJobToolV1;
   session?: WorkerSession | undefined;
   timer?: ReturnType<typeof setTimeout>;
+  /** Bounded disposal backstop when a hanging abort() parks the run loop forever. */
+  abortGrace?: ReturnType<typeof setTimeout>;
+  /** True once the session cleanup (dispose) ran, from the run loop or the timeout grace. */
+  finalized?: boolean;
+  /** True once #terminal has notified observers — onSettle fires exactly once per job. */
+  notified: boolean;
   done: Promise<void>;
   settle: () => void;
 }
+
+const ABORT_GRACE_MS = 1_000;
 
 const readTextFile = (label: string, path: string): string => {
   try {
@@ -97,6 +105,8 @@ export class AgentJobs {
 
   #terminal(job: Job): void {
     job.settle();
+    if (job.notified) return; // timeout settle + run-loop finally must notify exactly once
+    job.notified = true;
     if (this.onSettle !== undefined) {
       try {
         this.onSettle({
@@ -139,6 +149,7 @@ export class AgentJobs {
       prompt: args.prompt,
       ...(args.jobTool !== undefined ? { jobTool: args.jobTool } : {}),
       session: undefined,
+      notified: false,
       done,
       settle,
     };
@@ -148,7 +159,17 @@ export class AgentJobs {
       if (job.state !== "running") return;
       job.error = `timeout ${args.timeoutMs}ms`;
       job.state = "failed";
-      if (job.session !== undefined) void Promise.resolve(job.session.abort()).catch(() => undefined);
+      const live = job.session;
+      if (live !== undefined) {
+        void Promise.resolve(live.abort()).catch(() => undefined);
+        job.partial ??= this.#extractPartial(live); // before settle: abort may never unwind the run loop
+        job.abortGrace = setTimeout(() => {
+          if (job.finalized) return;
+          job.finalized = true; // a hanging abort() must not leak the session forever
+          live.dispose();
+        }, ABORT_GRACE_MS);
+      }
+      job.endedAt ??= Date.now();
       this.#terminal(job);
     }, args.timeoutMs);
     void (async () => {
@@ -184,10 +205,14 @@ export class AgentJobs {
         }
       } finally {
         clearTimeout(timer);
-        job.endedAt = Date.now();
+        if (job.abortGrace !== undefined) clearTimeout(job.abortGrace);
+        job.endedAt ??= Date.now();
         job.partial ??= this.#extractPartial(live); // before dispose: state may empty
-        live.dispose();
-        this.#terminal(job);
+        if (!job.finalized) {
+          job.finalized = true;
+          live.dispose();
+        }
+        this.#terminal(job); // guarded: at most one settlement per job
       }
     })();
     return id;
@@ -307,6 +332,7 @@ export class AgentJobs {
   close(): void {
     for (const job of this.#jobs.values()) {
       if (job.timer !== undefined) clearTimeout(job.timer);
+      if (job.abortGrace !== undefined) clearTimeout(job.abortGrace);
       if (job.state === "running" && job.session !== undefined) {
         job.state = "stopped";
         void Promise.resolve(job.session.abort()).catch(() => undefined);
