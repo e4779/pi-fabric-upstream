@@ -16,7 +16,8 @@ import type { ExternalCommandHandler } from "./bridge.js";
 export const AGENT_ARGV_HELP = [
   "agent arguments (key=value lines after the command):",
   "  promptFile=<path>   required; file with the full worker prompt",
-  "  tools=a,b,c         tool names; empty line pair (tools=) means none",
+  "  tools=a,b,c         omitted = read-only default (read,grep,find,ls);",
+  "                      `tools=` empty = none; +name/-name modifiers still work",
   "  cwd=<path>          working directory (default: host cwd)",
   "  model=<provider/id> override the configured default model; any key",
   "                      listed by `agent models` works, custom providers included",
@@ -33,6 +34,40 @@ export const AGENT_ARGV_HELP = [
 ].join("\n");
 
 export const DEFAULT_AGENT_TIMEOUT_MS = 600_000;
+
+/**
+ * What an agent gets when the `tools=` key is absent (HOM-28): a read-only
+ * quartet, so a multi-step brief keeps a worker that can look around instead
+ * of a tool-less completion. An explicit `tools=` line still pins the exact
+ * set (`tools=` empty = none); `+name`/`-name` entries adjust relative to
+ * this default (or to the plain names, when any are given).
+ */
+export const DEFAULT_AGENT_TOOLS: readonly string[] = ["read", "grep", "find", "ls"];
+
+/**
+ * Tri-state `tools=` parse: absent key -> the read-only default quartet;
+ * `tools=` empty -> none; a list pins it exactly. `+name` adds and `-name`
+ * removes — relative to the plain names when any are given, otherwise to
+ * the default quartet (the same relative-selector convention inherited
+ * child allowlists use, see docs/agents.md).
+ */
+const parseTools = (raw: string | undefined): string[] => {
+  if (raw === undefined) return [...DEFAULT_AGENT_TOOLS]; // absent key: read-only default
+  if (raw === "") return []; // explicit `tools=`: none
+  const tokens = raw.split(",").map((token) => token.trim()).filter(Boolean);
+  const plain = tokens.filter((token) => !token.startsWith("+") && !token.startsWith("-"));
+  const tools = plain.length > 0 ? [...plain] : [...DEFAULT_AGENT_TOOLS];
+  for (const token of tokens) {
+    const name = token.slice(1);
+    if (token.startsWith("+")) {
+      if (name !== "" && !tools.includes(name)) tools.push(name);
+    } else if (token.startsWith("-")) {
+      const at = tools.indexOf(name);
+      if (at >= 0) tools.splice(at, 1);
+    }
+  }
+  return tools;
+};
 
 const WORKER_SYSTEM_PROMPT = [
   "You are a bounded worker agent invoked programmatically by an orchestrator.",
@@ -134,7 +169,7 @@ export const parseAgentArgv = (lines: readonly string[]): AgentCommandArgs => {
   }
   return {
     prompt,
-    tools: raw.tools === undefined ? [] : raw.tools.split(",").map(t => t.trim()).filter(Boolean),
+    tools: parseTools(raw.tools),
     ...(raw.cwd ? { cwd: raw.cwd } : {}),
     ...(raw.model ? { model: raw.model } : {}),
     ...(raw.thinking ? { thinking: raw.thinking } : {}),
@@ -357,11 +392,29 @@ export const workerResultLines = async (
   return [JSON.stringify(value)];
 };
 
-export const runAgent = async (args: AgentCommandArgs): Promise<{ ok: boolean; lines: string[] }> => {
-  const session = await createWorkerSession(args);
+export const runAgent = async (
+  args: AgentCommandArgs,
+  spawn: (args: AgentCommandArgs) => Promise<WorkerSession> = createWorkerSession,
+): Promise<{ ok: boolean; lines: string[] }> => {
+  let session: WorkerSession;
+  try {
+    session = await spawn(args);
+  } catch (error) {
+    // Same shape as agent-jobs' spawn-fail handling: a spawn-time failure —
+    // a static-catalog model pin without credentials ("No API key for
+    // provider: x" class) — surfaces immediately instead of hanging under
+    // the timeout bound, which only arms after the session exists.
+    throw new Error(`agent spawn failed: ${error instanceof Error ? error.message : String(error)}`);
+  }
   const id = randomUUID();
   let timedOut = false;
   let messages: readonly unknown[] = [];
+  const abortHead = (source: readonly unknown[]): string => {
+    // Salvage the partial assistant text (first ~200 chars, one line) while
+    // the session messages are still readable — before dispose clears them.
+    const partial = finalAssistantText(source);
+    return partial === null ? "" : `; partial: ${partial.slice(0, 200).replace(/\s+/g, " ")}`;
+  };
   const timer = setTimeout(() => {
     timedOut = true;
     void session.abort();
@@ -370,12 +423,15 @@ export const runAgent = async (args: AgentCommandArgs): Promise<{ ok: boolean; l
     await session.prompt(args.prompt);
     messages = session.state.messages;
   } catch (error) {
+    if (timedOut) {
+      throw new Error(`agent run aborted: timeout ${args.timeoutMs}ms${abortHead(session.state.messages)}`);
+    }
     throw new Error(`agent run failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     clearTimeout(timer);
     session.dispose();
   }
-  if (timedOut) throw new Error(`agent run aborted: timeout ${args.timeoutMs}ms`);
+  if (timedOut) throw new Error(`agent run aborted: timeout ${args.timeoutMs}ms${abortHead(messages)}`);
   return { ok: true, lines: [`id=${id}`, ...(await workerResultLines(args.json, messages, args.schema))] };
 };
 
