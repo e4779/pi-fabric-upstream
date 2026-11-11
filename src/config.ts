@@ -486,11 +486,6 @@ export interface FabricThinkingConfig {
   bounds: FabricThinkingBounds;
 }
 
-export interface FabricExternalConfig {
-  /** Warn when this tool is not registered — a hint, not a coupling. */
-  expectTool: string;
-  /** Directory for the per-session bridge socket; empty = ~/.pi/agent/sock. */
-  socketDir: string;
 export interface FabricSessionsConfig {
   /** Opt-in single-writer guard for session files (cross-process owner registry). */
   ownerLock: boolean;
