@@ -1,6 +1,6 @@
 {
   "name": "@e4779/pi-recall",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "description": "Engine-free session memory: BM25-ranked recall over raw pi session JSONL, full-entry expand, session catalog, integrity refusal. CLI pi-recall + deferred pi tools (memory_recall/expand/sessions). Published from the pi-fabric fork; offered upstream.",
   "bin": {

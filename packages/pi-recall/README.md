@@ -44,8 +44,7 @@ index **writes** at an isolated tree; never at a live index you don't own).
 
 `pi.extensions: ["./extensions/memory.ts"]` registers tools
 `memory_recall` / `memory_expand` / `memory_sessions` via `registerTool`
-(exposure `deferred`: callable through `ctx.executeTool` — e.g. the pi-sh-tool
-bridge of a shell contour — but not declared to the model by default),
+(exposure `deferred`: callable through `ctx.executeTool` — e.g. a shell contour bridge
 mirroring the fork's provider semantics (argument normalization, shared
 request cache, ambiguous-session response mapping). The engine's live-branch
 hook (unflushed live-session entries) is fork-side by design; here the
