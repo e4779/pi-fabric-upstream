@@ -28,10 +28,12 @@ Default matches any term (OR); `--phrase` = adjacency, `--regex` = pattern,
 probe a cold session with one rare literal term first. Page with
 `--limit`/`--offset` (the output names the next offset).
 
-## Both doors
+## Tool door
 
-The CLI always works. From bus children also:
-`pbus call memory_recall '{"query":"..."}'`
+The package also registers deferred tools `memory_recall` / `memory_expand`
+/ `memory_sessions`. How you reach them depends on the host contour (a
+bridge, the model surface, a wrapper CLI); the CLI above always works
+regardless.
 
 ## Hygiene
 

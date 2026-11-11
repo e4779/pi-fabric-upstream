@@ -45,8 +45,7 @@ index **writes** at an isolated tree; never at a live index you don't own).
 `pi.extensions: ["./extensions/memory.ts"]` registers tools
 `memory_recall` / `memory_expand` / `memory_sessions` via `registerTool`
 (exposure `deferred`: callable through `ctx.executeTool` — e.g. the pi-sh-tool
-bridge `pit call memory_recall --query=... | toonq` — but not declared to the
-model),
+bridge of a shell contour — but not declared to the model by default),
 mirroring the fork's provider semantics (argument normalization, shared
 request cache, ambiguous-session response mapping). The engine's live-branch
 hook (unflushed live-session entries) is fork-side by design; here the
@@ -80,6 +79,6 @@ and the worker-thread offload (`worker-provider` / `file-worker`).
 
 Typecheck resolves the peers through local symlinks
 (`node_modules/@earendil-works/pi-coding-agent` and `node_modules/typebox` →
-the global bun install, the same convention as pi-sh-tool on this machine);
+the global bun install);
 re-link after a fresh clone. At runtime `pi -e .` resolves them through pi's
 own user-package store.
